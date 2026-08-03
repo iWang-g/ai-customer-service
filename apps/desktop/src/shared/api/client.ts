@@ -1,0 +1,736 @@
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.DEV ? '/api/v1' : 'http://127.0.0.1:8001/api/v1')
+).replace(/\/$/, '');
+const SESSION_STORAGE_KEY = 'ai-customer-service.auth';
+const KNOWLEDGE_BASE_URL = (
+  import.meta.env.VITE_KB_BASE_URL ||
+  (import.meta.env.DEV ? '/kb-api/api/v1' : 'http://127.0.0.1:8010/api/v1')
+).replace(/\/$/, '');
+
+export interface ApiUser {
+  id: string;
+  username: string;
+  display_name: string;
+  role: string;
+  is_active: boolean;
+  last_login_at: string | null;
+}
+
+export interface AuthSession {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  expires_in: number;
+  refresh_expires_in: number;
+  user: ApiUser;
+}
+
+export interface ApiConversation {
+  id: string;
+  user_id: string;
+  platform_account_id: string | null;
+  platform_code: string;
+  platform_name: string | null;
+  shop_name: string | null;
+  external_conversation_id: string | null;
+  customer_name: string | null;
+  title: string | null;
+  latest_message_text: string | null;
+  latest_message_at: string | null;
+  unread_count: number;
+  status: string;
+  metadata_json: Record<string, unknown>;
+}
+
+export interface ApiMessage {
+  id: string;
+  conversation_id: string;
+  user_id: string;
+  platform_code: string;
+  platform_message_id: string | null;
+  sender_role: string;
+  sender_name: string | null;
+  content: string;
+  message_status: string;
+  source: string;
+  raw_payload: Record<string, unknown>;
+  platform_sent_at: string | null;
+  observed_at: string | null;
+  snapshot_id: string | null;
+  snapshot_sequence: number | null;
+  time_group_index: number | null;
+  has_explicit_time: boolean | null;
+  time_label: string | null;
+  sent_at: string;
+}
+
+export interface AiConfig {
+  provider: 'deepseek';
+  base_url: string;
+  model: 'deepseek-chat' | 'deepseek-reasoner';
+  api_key_masked: string;
+  enabled: boolean;
+  temperature: number;
+  updated_at: string | null;
+}
+
+export interface AiConfigInput {
+  provider: 'deepseek';
+  base_url: string;
+  model: 'deepseek-chat' | 'deepseek-reasoner';
+  api_key: string;
+  enabled: boolean;
+  temperature: number;
+}
+
+export interface AiConfigTestResult {
+  ok: boolean;
+  provider: string;
+  model: string;
+  message: string;
+}
+
+export interface EmailConfig {
+  enabled: boolean;
+  provider: 'qq' | 'gmail' | 'custom';
+  sender_email: string;
+  sender_email_masked: string;
+  smtp_host: string;
+  smtp_port: number;
+  security: 'ssl' | 'starttls' | 'none';
+  auth_code_saved: boolean;
+  updated_at: string | null;
+}
+
+export interface EmailConfigInput {
+  enabled: boolean;
+  provider: 'qq' | 'gmail' | 'custom';
+  sender_email: string;
+  smtp_host: string;
+  smtp_port: number;
+  security: 'ssl' | 'starttls' | 'none';
+  auth_code: string;
+}
+
+export interface EmailTemplate {
+  id: string;
+  template_key: string;
+  name: string;
+  scene: string;
+  aliases: string[];
+  subject: string;
+  body: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export type EmailTemplateInput = Omit<EmailTemplate, 'id' | 'created_at' | 'updated_at'>;
+
+export interface EmailTestResult {
+  ok: boolean;
+  message: string;
+  message_id: string;
+  elapsed_ms: number;
+}
+
+export interface UserSettings {
+  auto_reply_enabled: boolean;
+  updated_at: string | null;
+}
+
+export interface UserSettingsInput {
+  auto_reply_enabled: boolean;
+}
+
+export interface DashboardAnalytics {
+  start_date: string;
+  end_date: string;
+  metrics: {
+    message_count: number;
+    independent_reception_rate: number;
+    average_response_seconds: number | null;
+  };
+  traffic: Array<{ label: string; count: number }>;
+  categories: Array<{
+    type: 'qa_category' | 'document_retrieval';
+    category_id: string | null;
+    name: string;
+    count: number;
+    percentage: number;
+  }>;
+  updated_at: string;
+}
+
+export interface TestReplyMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  media?: Array<{ type: string; url?: string }>;
+}
+
+export interface TestReplyResult {
+  decision: string;
+  text: string;
+  media: Array<{ type: string; url?: string }>;
+  intent: Record<string, unknown>;
+  action_plan: Record<string, unknown>;
+  confidence: number;
+  risk_flags: string[];
+  qa_match: Record<string, unknown> | null;
+  retrieval: Array<Record<string, unknown>>;
+  model_calls: Record<string, string>;
+  provider: string;
+  trace_id: string;
+  task_ids: string[];
+}
+
+export interface KnowledgeBaseSummary {
+  id: string;
+  name: string;
+  kind: 'qa' | 'product' | 'tone';
+  persona: string;
+  enabled: boolean;
+  item_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  base_id: string;
+  title: string;
+  original_filename: string;
+  file_type: string;
+  file_size: number;
+  status: string;
+  chunk_count: number;
+  error_message: string;
+  created_at: string;
+  updated_at: string;
+  duplicate?: boolean;
+}
+
+export interface QaEntry {
+  id: string;
+  base_id: string;
+  category_id: string;
+  category: string;
+  question: string;
+  keywords: string[];
+  answer: string;
+  image_url: string;
+  weight: number;
+  call_count: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface QaEntryInput {
+  category_id: string;
+  category: string;
+  question: string;
+  keywords: string[];
+  answer: string;
+  image_url: string;
+  weight: number;
+  enabled: boolean;
+}
+
+export interface QaCategory {
+  id: string;
+  base_id: string;
+  name: string;
+  is_builtin: boolean;
+  sort_order: number;
+  item_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface QaEntryPage {
+  items: QaEntry[];
+  total: number;
+  page: number;
+  page_size: number;
+  pages: number;
+}
+
+export interface RobotPlatformScope {
+  platform_code: string;
+  platform_account_id: string | null;
+  all_accounts: boolean;
+}
+
+export interface ApiRobot {
+  id: string;
+  user_id: string;
+  name: string;
+  status: 'online' | 'offline';
+  enabled: boolean;
+  config_json: Record<string, unknown>;
+  qa_knowledge_base_ids: string[];
+  product_knowledge_base_ids: string[];
+  tone_knowledge_base_id: string | null;
+  platform_scopes: RobotPlatformScope[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RobotInput {
+  name: string;
+  enabled?: boolean;
+  status?: 'online' | 'offline';
+  config_json?: Record<string, unknown>;
+  qa_knowledge_base_ids?: string[];
+  product_knowledge_base_ids?: string[];
+  tone_knowledge_base_id?: string | null;
+  platform_scopes?: RobotPlatformScope[];
+}
+
+export interface PlatformAccount {
+  id: string;
+  platform_code: string;
+  platform_name: string;
+  account_name: string;
+  account_alias: string | null;
+  local_account_id: string | null;
+  login_status: string;
+  is_active: boolean;
+}
+
+interface PageResponse<T> {
+  items: T[];
+  meta: { total: number; limit: number; offset: number };
+}
+
+export interface RealtimeEvent {
+  type: string;
+  message?: ApiMessage;
+  [key: string]: unknown;
+}
+
+function formatErrorDetail(detail: unknown): string {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        if (typeof item === 'object' && item && 'msg' in item) return String(item.msg);
+        return String(item);
+      })
+      .join('；');
+  }
+  return '请求失败，请稍后重试';
+}
+
+async function parseError(response: Response): Promise<Error> {
+  try {
+    const payload = (await response.json()) as { detail?: unknown };
+    return new Error(formatErrorDetail(payload.detail));
+  } catch {
+    return new Error(`请求失败 (${response.status})`);
+  }
+}
+
+export function getStoredSession(): AuthSession | null {
+  try {
+    const value = localStorage.getItem(SESSION_STORAGE_KEY);
+    return value ? (JSON.parse(value) as AuthSession) : null;
+  } catch {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+    return null;
+  }
+}
+
+export function storeSession(session: AuthSession): void {
+  localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+}
+
+export function clearStoredSession(): void {
+  localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
+async function refreshSession(): Promise<AuthSession | null> {
+  const current = getStoredSession();
+  if (!current?.refresh_token) return null;
+  try {
+    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: current.refresh_token }),
+    });
+    if (!response.ok) {
+      clearStoredSession();
+      return null;
+    }
+    const refreshed = (await response.json()) as AuthSession;
+    storeSession(refreshed);
+    return refreshed;
+  } catch {
+    return null;
+  }
+}
+
+async function apiRequest<T>(
+  path: string,
+  init: RequestInit = {},
+  requireAuth = true,
+  retryAfterRefresh = true,
+): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (init.body) headers.set('Content-Type', 'application/json');
+  if (requireAuth) {
+    const session = getStoredSession();
+    if (!session) throw new Error('登录状态已失效，请重新登录');
+    headers.set('Authorization', `Bearer ${session.access_token}`);
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+  } catch {
+    throw new Error('无法连接业务服务，请确认后端已在 8001 端口启动');
+  }
+
+  if (response.status === 401 && requireAuth && retryAfterRefresh) {
+    const refreshed = await refreshSession();
+    if (refreshed) return apiRequest<T>(path, init, true, false);
+  }
+  if (!response.ok) throw await parseError(response);
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
+}
+
+async function knowledgeRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
+  let response: Response;
+  try {
+    response = await fetch(`${KNOWLEDGE_BASE_URL}${path}`, { ...init, headers });
+  } catch {
+    throw new Error('无法连接知识库服务，请确认 8010 端口已启动');
+  }
+  if (!response.ok) throw await parseError(response);
+  return (await response.json()) as T;
+}
+
+export function login(username: string, password: string): Promise<AuthSession> {
+  return apiRequest<AuthSession>(
+    '/auth/login',
+    { method: 'POST', body: JSON.stringify({ username, password }) },
+    false,
+  );
+}
+
+export function register(username: string, displayName: string, password: string): Promise<AuthSession> {
+  return apiRequest<AuthSession>(
+    '/auth/register',
+    { method: 'POST', body: JSON.stringify({ username, display_name: displayName, password }) },
+    false,
+  );
+}
+
+export function getCurrentUser(): Promise<ApiUser> {
+  return apiRequest<ApiUser>('/auth/me');
+}
+
+export function logout(): Promise<{ message: string }> {
+  return apiRequest<{ message: string }>('/auth/logout', { method: 'POST' });
+}
+
+export function getAiConfig(): Promise<AiConfig> {
+  return apiRequest<AiConfig>('/ai-config');
+}
+
+export function saveAiConfig(input: AiConfigInput): Promise<AiConfig> {
+  return apiRequest<AiConfig>('/ai-config', { method: 'PUT', body: JSON.stringify(input) });
+}
+
+export function testAiConfig(input: AiConfigInput): Promise<AiConfigTestResult> {
+  return apiRequest<AiConfigTestResult>('/ai-config/test', { method: 'POST', body: JSON.stringify(input) });
+}
+
+export function testSavedAiConfig(): Promise<AiConfigTestResult> {
+  return apiRequest<AiConfigTestResult>('/ai-config/test-saved', { method: 'POST' });
+}
+
+export function getUserSettings(): Promise<UserSettings> {
+  return apiRequest<UserSettings>('/settings');
+}
+
+export function saveUserSettings(input: UserSettingsInput): Promise<UserSettings> {
+  return apiRequest<UserSettings>('/settings', { method: 'PUT', body: JSON.stringify(input) });
+}
+
+export function getDashboardAnalytics(startDate: string, endDate: string): Promise<DashboardAnalytics> {
+  const query = new URLSearchParams({
+    start_date: startDate,
+    end_date: endDate,
+    timezone: 'Asia/Shanghai',
+  });
+  return apiRequest<DashboardAnalytics>(`/analytics/dashboard?${query}`);
+}
+
+export function getEmailConfig(): Promise<EmailConfig> {
+  return apiRequest<EmailConfig>('/email/config');
+}
+
+export function saveEmailConfig(input: EmailConfigInput): Promise<EmailConfig> {
+  return apiRequest<EmailConfig>('/email/config', { method: 'PUT', body: JSON.stringify(input) });
+}
+
+export function testEmailConfig(toEmail: string, templateId?: string): Promise<EmailTestResult> {
+  return apiRequest<EmailTestResult>('/email/test', {
+    method: 'POST',
+    body: JSON.stringify({ to_email: toEmail, template_id: templateId || null }),
+  });
+}
+
+export function listEmailTemplates(): Promise<EmailTemplate[]> {
+  return apiRequest<EmailTemplate[]>('/email/templates');
+}
+
+export function createEmailTemplate(input: EmailTemplateInput): Promise<EmailTemplate> {
+  return apiRequest<EmailTemplate>('/email/templates', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateEmailTemplate(id: string, input: Partial<EmailTemplateInput>): Promise<EmailTemplate> {
+  return apiRequest<EmailTemplate>(`/email/templates/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteEmailTemplate(id: string): Promise<void> {
+  return apiRequest<void>(`/email/templates/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export function testRobotReply(input: {
+  robot_id: string;
+  message: string;
+  conversation: TestReplyMessage[];
+  platform_code?: string;
+  shop_name?: string;
+  customer_name?: string;
+}): Promise<TestReplyResult> {
+  return apiRequest<TestReplyResult>('/automation/test-reply', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function getKnowledgeBase(id: string): Promise<KnowledgeBaseSummary> {
+  return knowledgeRequest<KnowledgeBaseSummary>(`/knowledge-bases/${encodeURIComponent(id)}`);
+}
+
+export function createKnowledgeBase(
+  name: string,
+  kind: 'product' | 'qa' | 'tone',
+  persona = '',
+): Promise<KnowledgeBaseSummary> {
+  return knowledgeRequest<KnowledgeBaseSummary>('/knowledge-bases', {
+    method: 'POST',
+    body: JSON.stringify({ name, kind, persona }),
+  });
+}
+
+export function updateKnowledgeBase(
+  id: string,
+  input: { name?: string; persona?: string; enabled?: boolean },
+): Promise<KnowledgeBaseSummary> {
+  return knowledgeRequest<KnowledgeBaseSummary>(`/knowledge-bases/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
+export function listKnowledgeBases(kind?: 'product' | 'qa' | 'tone'): Promise<KnowledgeBaseSummary[]> {
+  const query = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+  return knowledgeRequest<KnowledgeBaseSummary[]>(`/knowledge-bases${query}`);
+}
+
+export function deleteKnowledgeBase(id: string): Promise<KnowledgeBaseSummary> {
+  return knowledgeRequest<KnowledgeBaseSummary>(`/knowledge-bases/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export interface KnowledgeBaseUsage {
+  knowledge_base_id: string;
+  in_use: boolean;
+  robots: Array<{ id: string; name: string }>;
+}
+
+export function getKnowledgeBaseUsage(id: string): Promise<KnowledgeBaseUsage> {
+  return apiRequest<KnowledgeBaseUsage>(`/robots/knowledge-base-usage/${encodeURIComponent(id)}`);
+}
+
+export function deleteUnusedKnowledgeBase(id: string): Promise<KnowledgeBaseSummary> {
+  return apiRequest<KnowledgeBaseSummary>(`/robots/knowledge-bases/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export function listQaEntries(
+  baseId: string,
+  options: { categoryId?: string; keyword?: string; page?: number; pageSize?: number } = {},
+): Promise<QaEntryPage> {
+  const query = new URLSearchParams({
+    page: String(options.page ?? 1),
+    page_size: String(options.pageSize ?? 20),
+  });
+  if (options.categoryId && options.categoryId !== 'all') query.set('category_id', options.categoryId);
+  if (options.keyword) query.set('keyword', options.keyword);
+  return knowledgeRequest<QaEntryPage>(`/knowledge-bases/${encodeURIComponent(baseId)}/qa-entries?${query}`);
+}
+
+export function listQaCategories(baseId: string): Promise<QaCategory[]> {
+  return knowledgeRequest<QaCategory[]>(`/knowledge-bases/${encodeURIComponent(baseId)}/qa-categories`);
+}
+
+export function createQaCategory(baseId: string, name: string): Promise<QaCategory> {
+  return knowledgeRequest<QaCategory>(`/knowledge-bases/${encodeURIComponent(baseId)}/qa-categories`, {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function createQaEntry(baseId: string, input: QaEntryInput): Promise<QaEntry> {
+  return knowledgeRequest<QaEntry>(`/knowledge-bases/${encodeURIComponent(baseId)}/qa-entries`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateQaEntry(entryId: string, input: QaEntryInput): Promise<QaEntry> {
+  return knowledgeRequest<QaEntry>(`/qa-entries/${encodeURIComponent(entryId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteQaEntry(entryId: string): Promise<QaEntry> {
+  return knowledgeRequest<QaEntry>(`/qa-entries/${encodeURIComponent(entryId)}`, { method: 'DELETE' });
+}
+
+export async function uploadQaImage(file: File): Promise<{ image_url: string }> {
+  const body = new FormData();
+  body.append('file', file);
+  return knowledgeRequest<{ image_url: string }>('/qa-assets', { method: 'POST', body });
+}
+
+export function getQaImageUrl(imageUrl: string): string {
+  if (!imageUrl) return imageUrl;
+  if (/^(?:https?:)/i.test(imageUrl)) {
+    // Normalize URLs returned by older ai-reply processes that omitted the API prefix.
+    return imageUrl.replace(/(\/8010)(\/qa-assets\/)/i, '$1/api/v1$2');
+  }
+  if (/^(?:data:|blob:)/i.test(imageUrl)) return imageUrl;
+  return `${KNOWLEDGE_BASE_URL}${imageUrl.startsWith('/') ? '' : '/'}${imageUrl}`;
+}
+
+export function listProductDocuments(baseId: string): Promise<KnowledgeDocument[]> {
+  return knowledgeRequest<KnowledgeDocument[]>(`/knowledge-bases/${encodeURIComponent(baseId)}/documents`);
+}
+
+export function importProductDocument(baseId: string, file: File): Promise<KnowledgeDocument> {
+  const body = new FormData();
+  body.append('file', file);
+  return knowledgeRequest<KnowledgeDocument>(`/documents/import?base_id=${encodeURIComponent(baseId)}`, {
+    method: 'POST',
+    body,
+  });
+}
+
+export function deleteKnowledgeDocument(documentId: string): Promise<KnowledgeDocument> {
+  return knowledgeRequest<KnowledgeDocument>(`/documents/${encodeURIComponent(documentId)}`, { method: 'DELETE' });
+}
+
+export function listRobots(): Promise<ApiRobot[]> {
+  return apiRequest<ApiRobot[]>('/robots');
+}
+
+export function createRobot(input: RobotInput): Promise<ApiRobot> {
+  return apiRequest<ApiRobot>('/robots', { method: 'POST', body: JSON.stringify(input) });
+}
+
+export function updateRobot(robotId: string, input: Partial<RobotInput>): Promise<ApiRobot> {
+  return apiRequest<ApiRobot>(`/robots/${encodeURIComponent(robotId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteRobot(robotId: string): Promise<void> {
+  return apiRequest<void>(`/robots/${encodeURIComponent(robotId)}`, { method: 'DELETE' });
+}
+
+export function listPlatformAccounts(): Promise<{ items: PlatformAccount[] }> {
+  return apiRequest<{ items: PlatformAccount[] }>('/platform-accounts');
+}
+
+export function listConversations(): Promise<PageResponse<ApiConversation>> {
+  return apiRequest<PageResponse<ApiConversation>>('/conversations?limit=100');
+}
+
+export function listMessages(conversationId: string): Promise<PageResponse<ApiMessage>> {
+  return apiRequest<PageResponse<ApiMessage>>(
+    `/conversations/${encodeURIComponent(conversationId)}/messages?limit=200`,
+  );
+}
+
+export function sendMessage(conversationId: string, content: string): Promise<{ message: ApiMessage }> {
+  return apiRequest<{ message: ApiMessage }>('/messages/send', {
+    method: 'POST',
+    body: JSON.stringify({ conversation_id: conversationId, content }),
+  });
+}
+
+export function recordSentMessage(
+  conversationId: string,
+  content: string,
+  platformMessageId?: string | null,
+): Promise<{ message: ApiMessage }> {
+  return apiRequest<{ message: ApiMessage }>('/messages/record-sent', {
+    method: 'POST',
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      content,
+      platform_message_id: platformMessageId || null,
+    }),
+  });
+}
+
+export function connectRealtime(
+  accessToken: string,
+  onEvent: (event: RealtimeEvent) => void,
+  onStatus: (status: 'connecting' | 'connected' | 'disconnected') => void,
+): () => void {
+  const configured = import.meta.env.VITE_WS_URL as string | undefined;
+  const wsBase = configured
+    ? configured.replace(/\/$/, '')
+    : import.meta.env.DEV
+      ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
+      : API_BASE_URL.replace(/^http/, 'ws').replace(/\/api\/v1$/, '');
+  onStatus('connecting');
+  const socket = new WebSocket(`${wsBase}/ws/events?token=${encodeURIComponent(accessToken)}`);
+  const heartbeat = window.setInterval(() => {
+    if (socket.readyState === WebSocket.OPEN) socket.send('ping');
+  }, 30_000);
+
+  socket.addEventListener('open', () => onStatus('connected'));
+  socket.addEventListener('message', (event) => {
+    try {
+      onEvent(JSON.parse(event.data) as RealtimeEvent);
+    } catch {
+      // Ignore malformed push messages and keep the connection alive.
+    }
+  });
+  socket.addEventListener('close', () => onStatus('disconnected'));
+  socket.addEventListener('error', () => onStatus('disconnected'));
+
+  return () => {
+    window.clearInterval(heartbeat);
+    socket.close();
+  };
+}

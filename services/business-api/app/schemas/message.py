@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.common import PageMeta
+
+
+class MessageRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    conversation_id: str
+    user_id: str
+    platform_code: str
+    platform_message_id: str | None = None
+    sender_role: str
+    sender_name: str | None = None
+    content: str
+    message_status: str
+    source: str
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+    platform_sent_at: datetime | None = None
+    observed_at: datetime | None = None
+    snapshot_id: str | None = None
+    snapshot_sequence: int | None = None
+    time_group_index: int | None = None
+    has_explicit_time: bool | None = None
+    time_label: str | None = None
+    sent_at: datetime
+
+
+class MessageListResponse(BaseModel):
+    items: list[MessageRead]
+    meta: PageMeta
+
+
+class SendMessageRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    platform_code: str | None = None
+    sender_name: str | None = None
+
+
+class SendMessageResponse(BaseModel):
+    message: MessageRead
+    task_id: str
+    task_status: Literal["queued", "dispatched", "acknowledged", "completed", "failed"]
+
+
+class RecordSentMessageRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    platform_message_id: str | None = Field(default=None, max_length=128)
+    platform_code: str | None = None
+    sender_name: str | None = None
+
+
+class RecordSentMessageResponse(BaseModel):
+    message: MessageRead

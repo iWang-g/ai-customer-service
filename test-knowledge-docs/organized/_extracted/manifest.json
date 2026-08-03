@@ -1,0 +1,38 @@
+﻿[
+  {
+    "source": "售前售后宅小兔.docx",
+    "blocks": 104,
+    "chars": 7285,
+    "extract": "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\_extracted\\售前售后宅小兔.txt"
+  },
+  {
+    "source": "售前售后极霸猫 -.docx",
+    "blocks": 95,
+    "chars": 6437,
+    "extract": "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\_extracted\\售前售后极霸猫 -.txt"
+  },
+  {
+    "source": "客服性格特征及语言规范（未完成）.docx",
+    "blocks": 4,
+    "chars": 170,
+    "extract": "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\_extracted\\客服性格特征及语言规范（未完成）.txt"
+  },
+  {
+    "source": "沟通语气-二次元知识语录.docx",
+    "blocks": 12,
+    "chars": 719,
+    "extract": "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\_extracted\\沟通语气-二次元知识语录.txt"
+  },
+  {
+    "source": "语料合集.docx",
+    "blocks": 58,
+    "chars": 10109,
+    "extract": "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\_extracted\\语料合集.txt"
+  },
+  {
+    "source": "销售策略以及邮件相关（不能说）.docx",
+    "blocks": 30,
+    "chars": 2631,
+    "extract": "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\_extracted\\销售策略以及邮件相关（不能说）.txt"
+  }
+]

@@ -1,0 +1,22 @@
+﻿{
+  "source_files": [
+    "售前售后宅小兔.docx",
+    "售前售后极霸猫 -.docx",
+    "客服性格特征及语言规范（未完成）.docx",
+    "沟通语气-二次元知识语录.docx",
+    "语料合集.docx",
+    "销售策略以及邮件相关（不能说）.docx"
+  ],
+  "source_block_count": 303,
+  "qa_block_count": 255,
+  "product_block_count": 267,
+  "tone_block_count": 273,
+  "qa_entry_count": 31,
+  "outputs": [
+    "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\01-QA问答知识库整理稿.docx",
+    "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\01-QA问答知识库条目.csv",
+    "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\02-产品知识库整理稿.docx",
+    "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\03-语气知识库整理稿.docx",
+    "D:\\project-electron\\ai-customer-service\\test-knowledge-docs\\organized\\整理说明.md"
+  ]
+}

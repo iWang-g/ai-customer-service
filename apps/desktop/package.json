@@ -1,0 +1,67 @@
+{
+  "name": "@ai-customer-service/desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI customer service desktop application",
+  "type": "module",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1 --port 9527\" \"wait-on http://127.0.0.1:9527 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:9527 electron .\"",
+    "build": "vite build",
+    "lint": "tsc --noEmit",
+    "smoke:pdd-workspace": "electron scripts/smoke-pdd-workspace.mjs",
+    "smoke:pdd-adapter": "electron scripts/smoke-pdd-adapter.mjs",
+    "test:pdd-collector": "node scripts/test-pdd-collector.mjs",
+    "test:store-actor": "node scripts/test-store-actor.mjs",
+    "start": "electron .",
+    "dist": "pnpm build && electron-builder"
+  },
+  "dependencies": {
+    "@google/genai": "^1.29.0",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.42.2",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^3.8.1",
+    "tailwind-merge": "^3.5.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.2.1",
+    "cross-env": "^7.0.3",
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12",
+    "tailwindcss": "^4.1.14",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0",
+    "wait-on": "^8.0.4"
+  },
+  "build": {
+    "appId": "com.omniai.customer-service",
+    "productName": "AI智能客服",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../../agents/rpa",
+        "to": "rpa",
+        "filter": ["agent.py", "README.md"]
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "ai-customer-service-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI customer service desktop application and local/cloud services",
+  "scripts": {
+    "dev": "concurrently -k \"pnpm dev:api\" \"pnpm dev:kb\" \"pnpm dev:ai\" \"pnpm dev:desktop\"",
+    "dev:api": "cross-env DATABASE_URL=sqlite:///./services/business-api/data/business-api.db KNOWLEDGE_BASE_URL=http://127.0.0.1:8010 python -m uvicorn app.main:app --app-dir services/business-api --host 127.0.0.1 --port 8001",
+    "dev:kb": "cross-env KB_DATABASE_PATH=./data/knowledge-base.db python -m uvicorn app.main:app --app-dir services/knowledge-base --host 127.0.0.1 --port 8010",
+    "dev:ai": "cross-env KNOWLEDGE_BASE_URL=http://127.0.0.1:8010 python -m uvicorn app.main:app --app-dir services/ai-reply --host 127.0.0.1 --port 8020",
+    "dev:desktop": "pnpm --dir apps/desktop dev",
+    "build": "pnpm --dir apps/desktop build",
+    "lint": "pnpm --dir apps/desktop lint",
+    "smoke:phase-b": "python scripts/smoke_phase_b.py",
+    "smoke:phase-c": "python scripts/smoke_phase_c.py",
+    "start": "pnpm --dir apps/desktop start",
+    "dist": "pnpm --dir apps/desktop dist"
+  }
+}
