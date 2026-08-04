@@ -25,6 +25,9 @@ export interface Conversation {
   platform: string;
   platformName: string;
   status: 'active' | 'pending' | 'resolved';
+  humanRequired?: boolean;
+  humanRequiredReason?: string | null;
+  humanRequiredWord?: string | null;
   time: string;
   messages: Message[];
 }

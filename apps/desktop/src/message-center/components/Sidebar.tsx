@@ -25,6 +25,7 @@ interface SidebarProps {
   shops: Shop[];
   onShopSelect: (id: string) => void;
   onOpenImportModal: () => void;
+  onClearHumanRequired: (conversationId: string) => Promise<void>;
   lang: 'zh' | 'en';
 }
 
@@ -40,10 +41,12 @@ export default function Sidebar({
   shops,
   onShopSelect,
   onOpenImportModal,
+  onClearHumanRequired,
   lang
 }: SidebarProps) {
   const [isShopDropdownOpen, setIsShopDropdownOpen] = useState(false);
   const [shopFilterText, setShopFilterText] = useState('');
+  const [contextMenu, setContextMenu] = useState<{ conversationId: string; x: number; y: number } | null>(null);
 
   const filteredShops = shops.filter(s =>
     s.name.toLowerCase().includes(shopFilterText.toLowerCase())
@@ -184,6 +187,11 @@ export default function Sidebar({
           <motion.button
             key={conv.id}
             onClick={() => onSelect(conv.id)}
+            onContextMenu={(event) => {
+              if (!conv.humanRequired) return;
+              event.preventDefault();
+              setContextMenu({ conversationId: conv.id, x: event.clientX, y: event.clientY });
+            }}
             className={`w-full flex items-start gap-3 p-4 rounded-2xl transition-all text-left ${
               selectedId === conv.id 
                 ? 'bg-sky-50 shadow-sm border border-sky-100' 
@@ -207,6 +215,14 @@ export default function Sidebar({
               <p className="text-sm text-slate-500 truncate leading-relaxed">
                 {conv.lastMessage}
               </p>
+              {conv.humanRequired && (
+                <span
+                  className="mt-2 inline-flex items-center rounded-md bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700 ring-1 ring-inset ring-amber-200"
+                  title={conv.humanRequiredWord ? `命中敏感词：${conv.humanRequiredWord}` : '该会话等待人工处理'}
+                >
+                  待人工处理
+                </span>
+              )}
             </div>
             {conv.status === 'pending' && (
               <div className="w-2 h-2 rounded-full bg-brand-active mt-3 flex-shrink-0 shadow-[0_0_8px_rgba(14,165,233,0.5)]" />
@@ -231,6 +247,27 @@ export default function Sidebar({
           </div>
         )}
       </div>
+      {contextMenu && (
+        <>
+          <button type="button" aria-label="关闭会话菜单" className="fixed inset-0 z-40 cursor-default" onClick={() => setContextMenu(null)} />
+          <div
+            className="fixed z-50 min-w-44 rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                const conversationId = contextMenu.conversationId;
+                setContextMenu(null);
+                void onClearHumanRequired(conversationId);
+              }}
+              className="w-full rounded-lg px-3 py-2 text-left text-xs font-bold text-slate-700 hover:bg-slate-50"
+            >
+              清除“待人工处理”标记
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from app.core.config import get_settings
 from app.db import init_db
 from app.schemas import DocumentCreate, DocumentSearchRequest, KnowledgeBaseCreate, KnowledgeBaseUpdate, QaCategoryCreate, QaEntryCreate, QaMatchRequest
-from app.service import create_base, create_document, create_qa_category, create_qa_entry, delete_base, delete_document, delete_qa_entry, get_base, get_qa_image, import_document, list_bases, list_documents, list_qa_categories, list_qa_entries, match_qa, save_qa_image, search_documents, update_base, update_qa_entry
+from app.service import create_base, create_document, create_qa_category, create_qa_entry, delete_base, delete_document, delete_qa_entry, get_base, get_document, get_qa_image, import_document, list_bases, list_document_chunks, list_documents, list_qa_categories, list_qa_entries, match_qa, save_qa_image, search_documents, update_base, update_qa_entry
 
 
 def create_app() -> FastAPI:
@@ -108,6 +108,18 @@ def create_app() -> FastAPI:
     @router.get("/knowledge-bases/{base_id}/documents")
     def documents(base_id: str) -> list[dict]:
         return list_documents(base_id)
+
+    @router.get("/documents/{document_id}")
+    def document(document_id: str) -> dict:
+        return get_document(document_id)
+
+    @router.get("/documents/{document_id}/chunks")
+    def document_chunks(
+        document_id: str,
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=50, ge=1, le=100),
+    ) -> dict:
+        return list_document_chunks(document_id, page, page_size)
 
     @router.post("/documents/import")
     async def import_document_file(base_id: str = Query(...), file: UploadFile = File(...)) -> dict:

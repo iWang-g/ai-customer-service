@@ -228,6 +228,8 @@ def list_recent_events(db: Session, user: User, limit: int = 10) -> MonitoringEv
             text, level = "平台回复发送失败", "error"
         else:
             text, level = "自动回复已提交发送", "info"
+        if (task.idempotency_key or "").startswith("auto-timeout:"):
+            text = "超时安抚话术" + ("已发送" if task.status == "completed" else "已提交发送")
         candidates.append(MonitoringEvent(
             id=f"task:{task.id}:{task.status}",
             timestamp=task.completed_at or task.requested_at,

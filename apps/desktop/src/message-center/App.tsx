@@ -67,6 +67,7 @@ export default function App() {
       isLoadingMessages={controller.isLoadingMessages}
       dataError={controller.dataError}
       onSendMessage={controller.handleSendMessage}
+      onClearHumanRequired={controller.handleClearHumanRequired}
       bot={controller.bot}
       logs={controller.logs}
       statusEvents={controller.statusEvents}

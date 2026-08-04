@@ -10,6 +10,10 @@ from app.services.automation_service import (
     _context_length,
     _history_with_latest,
     _message_history,
+    _fallback_marks_human_required,
+    _is_fallback_reply,
+    _matched_sensitive_word,
+    _sensitive_words,
     _should_create_send_task,
 )
 
@@ -32,6 +36,13 @@ class AutomationConfigTests(unittest.TestCase):
             _auto_send_allowed(self.robot(allow_auto_send=False), requested=True)
         )
 
+    def test_sensitive_words_are_normalized_and_matched_case_insensitively(self) -> None:
+        robot = self.robot(inbound_sensitive_words=[" 投诉 ", "VIP", "投诉", "", 123])
+        self.assertEqual(_sensitive_words(robot), ["投诉", "VIP"])
+        self.assertEqual(_matched_sensitive_word(robot, "我要投诉"), "投诉")
+        self.assertEqual(_matched_sensitive_word(robot, "vip 客户"), "VIP")
+        self.assertIsNone(_matched_sensitive_word(robot, "普通咨询"))
+
     def test_send_task_requires_auto_send_decision_switch_and_text(self) -> None:
         result = {"decision": "auto_send", "text": "确定性回复"}
         self.assertTrue(_should_create_send_task(result, auto_send_allowed=True))
@@ -42,6 +53,19 @@ class AutomationConfigTests(unittest.TestCase):
         self.assertFalse(
             _should_create_send_task({"decision": "auto_send", "text": "  "}, auto_send_allowed=True)
         )
+
+    def test_fallback_human_required_setting_prefers_new_key_and_supports_legacy(self) -> None:
+        self.assertTrue(_fallback_marks_human_required(self.robot(fallback_mark_human_required=True)))
+        self.assertFalse(_fallback_marks_human_required(self.robot(
+            fallback_mark_human_required=False,
+            fallback_transfer_to_human=True,
+        )))
+        self.assertTrue(_fallback_marks_human_required(self.robot(fallback_transfer_to_human=True)))
+        self.assertFalse(_fallback_marks_human_required(self.robot()))
+
+    def test_fallback_result_is_identified_by_workflow(self) -> None:
+        self.assertTrue(_is_fallback_reply({"action_plan": {"workflow": "fallback_reply"}}))
+        self.assertFalse(_is_fallback_reply({"provider": "fallback-rule"}))
 
     def test_message_history_restores_chronological_order(self) -> None:
         newest = SimpleNamespace(sender_role="agent", content="第二条")

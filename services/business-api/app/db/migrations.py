@@ -31,6 +31,12 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "has_explicit_time": "BOOLEAN",
             "time_label": "VARCHAR(64)",
         },
+        "conversations": {
+            "human_required": "BOOLEAN NOT NULL DEFAULT 0",
+            "human_required_reason": "VARCHAR(64)",
+            "human_required_word": "VARCHAR(128)",
+            "human_required_at": "DATETIME",
+        },
         "automation_reply_runs": {
             "intent": "VARCHAR(64)",
             "qa_entry_id": "VARCHAR(128)",
@@ -88,6 +94,12 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_messages_collection_order "
                 "ON messages (conversation_id, platform_sent_at, observed_at, snapshot_sequence)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_conversations_human_required "
+                "ON conversations (human_required)"
             )
         )
         connection.execute(

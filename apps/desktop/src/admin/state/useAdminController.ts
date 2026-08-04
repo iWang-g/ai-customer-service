@@ -14,12 +14,14 @@ import {
   getKnowledgeBaseUsage,
   getUserSettings,
   getKnowledgeBase,
+  getKnowledgeDocument,
   importProductDocument,
   listPlatformAccounts,
   listKnowledgeBases,
   listQaCategories,
   listQaEntries,
   listProductDocuments,
+  listKnowledgeDocumentChunks,
   listRobots,
   listEmailTemplates,
   saveAiConfig,
@@ -42,6 +44,8 @@ import {
   type EmailTemplateInput,
   type UserSettingsInput,
   type KnowledgeDocument,
+  type KnowledgeDocumentChunk,
+  type KnowledgeDocumentDetail,
   type KnowledgeBaseSummary,
   type PlatformAccount,
   type QaCategory,
@@ -108,7 +112,7 @@ type ProductDocument = {
   format: string;
   status: string;
   date: string;
-  content: string;
+  chunkCount: number;
 };
 type ToneKB = { id: string; name: string; persona: string; date: string };
 
@@ -212,11 +216,16 @@ export function useAdminController() {
   const [selectedProductKB, setSelectedProductKB] = useState<ProductKB | null>(null);
   const [productKBName, setProductKBName] = useState('');
   const [productDocuments, setProductDocuments] = useState<Record<string, ProductDocument[]>>({});
+  const [selectedProductDocument, setSelectedProductDocument] = useState<ProductDocument | null>(null);
+  const [productDocumentDetail, setProductDocumentDetail] = useState<KnowledgeDocumentDetail | null>(null);
+  const [productDocumentChunks, setProductDocumentChunks] = useState<KnowledgeDocumentChunk[]>([]);
   const [selectedProductFile, setSelectedProductFile] = useState<File | null>(null);
   const [isImportingProductDocument, setIsImportingProductDocument] = useState(false);
   const [productImportProgress, setProductImportProgress] = useState(0);
   const [productImportNotice, setProductImportNotice] = useState('');
   const [isLoadingProductDocuments, setIsLoadingProductDocuments] = useState(false);
+  const [isLoadingProductDocumentDetail, setIsLoadingProductDocumentDetail] = useState(false);
+  const [productDocumentDetailNotice, setProductDocumentDetailNotice] = useState('');
   const [toneBases, setToneBases] = useState<ToneKB[]>([]);
   const [isAddToneKBModalOpen, setIsAddToneKBModalOpen] = useState(false);
   const [editingToneKBId, setEditingToneKBId] = useState<string | null>(null);
@@ -779,8 +788,41 @@ export function useAdminController() {
     format: document.file_type.toUpperCase(),
     status: document.status === 'ready' ? '已解析' : document.status === 'deleted' ? '已删除' : '待解析',
     date: document.updated_at.slice(0, 10),
-    content: '',
+    chunkCount: document.chunk_count,
   });
+
+  const openProductDocumentDetail = async (document: ProductDocument) => {
+    setSelectedProductDocument(document);
+    setProductDocumentDetail(null);
+    setProductDocumentChunks([]);
+    setProductDocumentDetailNotice('');
+    setIsLoadingProductDocumentDetail(true);
+    try {
+      const [detail, firstPage] = await Promise.all([
+        getKnowledgeDocument(document.id),
+        listKnowledgeDocumentChunks(document.id),
+      ]);
+      let chunks = firstPage.items;
+      for (let page = 2; page <= firstPage.pages; page += 1) {
+        const nextPage = await listKnowledgeDocumentChunks(document.id, page);
+        chunks = [...chunks, ...nextPage.items];
+      }
+      setProductDocumentDetail(detail);
+      setProductDocumentChunks(chunks);
+    } catch (error) {
+      setProductDocumentDetailNotice(error instanceof Error ? error.message : '文档处理结果加载失败');
+    } finally {
+      setIsLoadingProductDocumentDetail(false);
+    }
+  };
+
+  const closeProductDocumentDetail = () => {
+    setSelectedProductDocument(null);
+    setProductDocumentDetail(null);
+    setProductDocumentChunks([]);
+    setProductDocumentDetailNotice('');
+    setIsLoadingProductDocumentDetail(false);
+  };
 
   const openProductKBConfig = async (id: string) => {
     const base = productBases.find((candidate) => candidate.id === id);
@@ -1103,11 +1145,16 @@ export function useAdminController() {
     productKBName,
     setProductKBName,
     productDocuments,
+    selectedProductDocument,
+    productDocumentDetail,
+    productDocumentChunks,
     selectedProductFile,
     isImportingProductDocument,
     productImportProgress,
     productImportNotice,
     isLoadingProductDocuments,
+    isLoadingProductDocumentDetail,
+    productDocumentDetailNotice,
     toneBases,
     isLoadingToneKB,
     isSavingToneKB,
@@ -1137,6 +1184,8 @@ export function useAdminController() {
     handleImportProductDocument,
     handleDeleteProductDocument,
     refreshProductDocuments,
+    openProductDocumentDetail,
+    closeProductDocumentDetail,
     openAddToneKB,
     openEditToneKB,
     handleSaveToneKB,

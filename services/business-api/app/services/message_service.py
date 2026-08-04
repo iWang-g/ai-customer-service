@@ -112,6 +112,24 @@ def get_conversation(db: Session, user: User, conversation_id: str) -> Conversat
     return _conversation_read(conversation)
 
 
+def clear_human_required(db: Session, user: User, conversation_id: str) -> ConversationRead:
+    conversation = db.scalar(
+        select(Conversation)
+        .options(selectinload(Conversation.platform_account))
+        .where(and_(Conversation.id == conversation_id, Conversation.user_id == user.id))
+    )
+    if not conversation:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    conversation.human_required = False
+    conversation.human_required_reason = None
+    conversation.human_required_word = None
+    conversation.human_required_at = None
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return _conversation_read(conversation)
+
+
 def list_messages(
     db: Session,
     user: User,
@@ -160,6 +178,7 @@ def create_send_task(
     *,
     follow_up: dict[str, object] | None = None,
     idempotency_key: str | None = None,
+    source: str = "desktop",
 ) -> SendMessageResponse:
     conversation = db.get(Conversation, request.conversation_id)
     if not conversation or conversation.user_id != user.id:
@@ -175,7 +194,7 @@ def create_send_task(
         sender_name=request.sender_name or user.display_name,
         content=request.content,
         message_status="queued",
-        source="desktop",
+        source=source,
         observed_at=now,
         sent_at=now,
     )

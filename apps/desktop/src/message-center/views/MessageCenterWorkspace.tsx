@@ -28,6 +28,7 @@ interface MessageCenterWorkspaceProps {
   isLoadingMessages: boolean;
   dataError: string;
   onSendMessage: (content: string) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | null }>;
+  onClearHumanRequired: (conversationId: string) => Promise<void>;
   bot: BotStatus;
   logs: LogEntry[];
   statusEvents: StatusEvent[];
@@ -67,6 +68,7 @@ export default function MessageCenterWorkspace({
   isLoadingMessages,
   dataError,
   onSendMessage,
+  onClearHumanRequired,
   bot,
   logs,
   statusEvents,
@@ -110,6 +112,7 @@ export default function MessageCenterWorkspace({
           shops={shops}
           onShopSelect={onShopSelect}
           onOpenImportModal={onOpenImportModal}
+          onClearHumanRequired={onClearHumanRequired}
           lang={lang}
         />
       </div>

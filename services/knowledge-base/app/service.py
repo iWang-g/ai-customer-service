@@ -474,6 +474,59 @@ def list_documents(base_id: str) -> list[dict[str, Any]]:
     return [document_dict(row) for row in rows]
 
 
+def get_document(document_id: str) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM documents WHERE id = ? AND status != 'deleted'",
+            (document_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Document not found")
+    return {**document_dict(row), "content": row["content"]}
+
+
+def list_document_chunks(document_id: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    offset = (page - 1) * page_size
+    with connect() as db:
+        document = db.execute(
+            "SELECT id FROM documents WHERE id = ? AND status != 'deleted'",
+            (document_id,),
+        ).fetchone()
+        if not document:
+            raise HTTPException(404, "Document not found")
+        total = int(db.execute(
+            "SELECT COUNT(*) FROM document_chunks WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()[0])
+        rows = db.execute(
+            """SELECT id, document_id, base_id, chunk_index, title_path, content, enabled, created_at
+            FROM document_chunks
+            WHERE document_id = ?
+            ORDER BY chunk_index
+            LIMIT ? OFFSET ?""",
+            (document_id, page_size, offset),
+        ).fetchall()
+    return {
+        "items": [
+            {
+                "id": row["id"],
+                "document_id": row["document_id"],
+                "base_id": row["base_id"],
+                "chunk_index": int(row["chunk_index"]),
+                "title_path": row["title_path"],
+                "content": row["content"],
+                "enabled": bool(row["enabled"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, (total + page_size - 1) // page_size),
+    }
+
+
 def delete_document(document_id: str) -> dict[str, Any]:
     now = utc_now()
     with connect() as db:

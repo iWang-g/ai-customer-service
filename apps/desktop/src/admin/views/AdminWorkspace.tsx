@@ -102,6 +102,12 @@ interface AdminWorkspaceProps {
   controller: AdminController;
 }
 
+type OutboundBlockRule = {
+  word: string;
+  replacement: string;
+  enabled: boolean;
+};
+
 export default function AdminWorkspace({ onBack, controller }: AdminWorkspaceProps) {
   const {
     activeTab,
@@ -168,11 +174,16 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     productKBName,
     setProductKBName,
     productDocuments,
+    selectedProductDocument,
+    productDocumentDetail,
+    productDocumentChunks,
     selectedProductFile,
     isImportingProductDocument,
     productImportProgress,
     productImportNotice,
     isLoadingProductDocuments,
+    isLoadingProductDocumentDetail,
+    productDocumentDetailNotice,
     toneBases,
     isLoadingToneKB,
     isSavingToneKB,
@@ -201,6 +212,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     handleImportProductDocument,
     handleDeleteProductDocument,
     refreshProductDocuments,
+    openProductDocumentDetail,
+    closeProductDocumentDetail,
     openAddToneKB,
     openEditToneKB,
     handleSaveToneKB,
@@ -256,6 +269,17 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [testReplyMessages, setTestReplyMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; media?: Array<{ type: string; url?: string }> }>>([]);
   const [isTestingReply, setIsTestingReply] = useState(false);
   const [showQaCategoryCreator, setShowQaCategoryCreator] = useState(false);
+  const [productDocumentTab, setProductDocumentTab] = useState<'chunks' | 'content'>('chunks');
+  const [productDocumentSearch, setProductDocumentSearch] = useState('');
+  const normalizedProductDocumentSearch = productDocumentSearch.trim().toLocaleLowerCase();
+  const visibleProductDocumentChunks = normalizedProductDocumentSearch
+    ? productDocumentChunks.filter((chunk) => `${chunk.title_path}\n${chunk.content}`.toLocaleLowerCase().includes(normalizedProductDocumentSearch))
+    : productDocumentChunks;
+  const closeProductDocumentModal = () => {
+    closeProductDocumentDetail();
+    setProductDocumentTab('chunks');
+    setProductDocumentSearch('');
+  };
   const [emailTestRecipient, setEmailTestRecipient] = useState('');
   const [emailTestTemplateId, setEmailTestTemplateId] = useState('');
   const [emailTemplateModalId, setEmailTemplateModalId] = useState<string | null | undefined>(undefined);
@@ -277,6 +301,16 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [isCustomCustomerAddress, setIsCustomCustomerAddress] = useState(false);
   const [isCustomSelfAddress, setIsCustomSelfAddress] = useState(false);
   const [advancedInstruction, setAdvancedInstruction] = useState('善用 emoji 表情符号和分点，直观呈现重点信息，提升亲和力。');
+  const [inboundSensitiveWords, setInboundSensitiveWords] = useState<string[]>([]);
+  const [sensitiveWordDraft, setSensitiveWordDraft] = useState('');
+  const [outboundBlockRules, setOutboundBlockRules] = useState<OutboundBlockRule[]>([]);
+  const [outboundBlockWordDraft, setOutboundBlockWordDraft] = useState('');
+  const [outboundReplacementDraft, setOutboundReplacementDraft] = useState('');
+  const [fallbackReplyText, setFallbackReplyText] = useState('您的问题我将为您接入专业产品客服，请稍后');
+  const [fallbackMarkHumanRequired, setFallbackMarkHumanRequired] = useState(false);
+  const [timeoutEnabled, setTimeoutEnabled] = useState(true);
+  const [timeoutSeconds, setTimeoutSeconds] = useState(10);
+  const [timeoutReplyText, setTimeoutReplyText] = useState('专项客服正在赶来的路上请稍等~~');
   const [selectedToneKB, setSelectedToneKB] = useState('');
   const platformOptions = ['全部平台', '千牛', '拼多多', '个人微信', 'QQ', '抖音', '快手', '小红书'];
   const platformCodeByLabel: Record<string, string> = {
@@ -355,6 +389,16 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       setIsCustomCustomerAddress(false);
       setIsCustomSelfAddress(false);
       setAdvancedInstruction('善用 emoji 表情符号和分点，直观呈现重点信息，提升亲和力。');
+      setInboundSensitiveWords([]);
+      setSensitiveWordDraft('');
+      setOutboundBlockRules([]);
+      setOutboundBlockWordDraft('');
+      setOutboundReplacementDraft('');
+      setFallbackReplyText('您的问题我将为您接入专业产品客服，请稍后');
+      setFallbackMarkHumanRequired(false);
+      setTimeoutEnabled(true);
+      setTimeoutSeconds(10);
+      setTimeoutReplyText('专项客服正在赶来的路上请稍等~~');
       setSelectedQaKBIds([]);
       setSelectedProductKBIds([]);
       setSelectedToneKB('');
@@ -379,6 +423,44 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setIsCustomCustomerAddress(configuredCustomerAddress === '自定义' || !['亲亲', '宝宝'].includes(savedCustomerAddress));
     setIsCustomSelfAddress(configuredSelfAddress === '自定义' || !['在下', '鄙人'].includes(savedSelfAddress));
     setAdvancedInstruction(typeof config.advanced_instruction === 'string' ? config.advanced_instruction : '');
+    setInboundSensitiveWords(Array.isArray(config.inbound_sensitive_words)
+      ? config.inbound_sensitive_words.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+      : []);
+    setSensitiveWordDraft('');
+    const configuredBlockRules: OutboundBlockRule[] = Array.isArray(config.outbound_block_rules)
+      ? config.outbound_block_rules.flatMap((item) => {
+        if (!item || typeof item !== 'object') return [];
+        const rule = item as Record<string, unknown>;
+        const word = typeof rule.word === 'string' ? rule.word.trim() : '';
+        const replacement = typeof rule.replacement === 'string' ? rule.replacement.trim() : '';
+        return word ? [{ word, replacement, enabled: rule.enabled !== false }] : [];
+      })
+      : [];
+    const configuredRuleWords = new Set(configuredBlockRules.map((rule) => rule.word.toLocaleLowerCase()));
+    const legacyBlockRules: OutboundBlockRule[] = Array.isArray(config.outbound_block_words)
+      ? config.outbound_block_words.flatMap((item) => {
+        const word = typeof item === 'string' ? item.trim() : '';
+        return word && !configuredRuleWords.has(word.toLocaleLowerCase())
+          ? [{ word, replacement: '', enabled: true }]
+          : [];
+      })
+      : [];
+    setOutboundBlockRules([...configuredBlockRules, ...legacyBlockRules]);
+    setOutboundBlockWordDraft('');
+    setOutboundReplacementDraft('');
+    setFallbackReplyText(typeof config.fallback_reply_text === 'string' && config.fallback_reply_text.trim()
+      ? config.fallback_reply_text
+      : '您的问题我将为您接入专业产品客服，请稍后');
+    setFallbackMarkHumanRequired(
+      typeof config.fallback_mark_human_required === 'boolean'
+        ? config.fallback_mark_human_required
+        : config.fallback_transfer_to_human === true,
+    );
+    setTimeoutEnabled(config.timeout_enabled !== false);
+    setTimeoutSeconds(typeof config.timeout_seconds === 'number' ? Math.max(1, Math.min(60, Math.round(config.timeout_seconds))) : 10);
+    setTimeoutReplyText(typeof config.timeout_reply_text === 'string' && config.timeout_reply_text.trim()
+      ? config.timeout_reply_text
+      : '专项客服正在赶来的路上请稍等~~');
     setSelectedQaKBIds(selectedRobot.api.qa_knowledge_base_ids);
     setSelectedProductKBIds(selectedRobot.api.product_knowledge_base_ids);
     setSelectedToneKB(selectedRobot.api.tone_knowledge_base_id || '');
@@ -426,6 +508,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
 
   const handleSaveRobotConfiguration = async () => {
     if (!robotName.trim()) return;
+    const existingRobotConfig = { ...(selectedRobot?.api.config_json || {}) };
+    delete existingRobotConfig.fallback_transfer_to_human;
     const platformScopes: Array<{ platform_code: string; platform_account_id: string | null; all_accounts: boolean }> = [];
     selectedPlatforms.forEach((label) => {
       const platformCode = platformCodeByLabel[label] || label;
@@ -448,7 +532,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       name: robotName.trim(),
       enabled: selectedRobot?.api.enabled ?? false,
         config_json: {
-        ...(selectedRobot?.api.config_json || {}),
+        ...existingRobotConfig,
         model: robotModel,
         temperature: robotTemperature,
         allow_auto_send: allowRobotAutoReply,
@@ -458,6 +542,20 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         customer_address: customerAddress,
         self_address: selfAddress,
         advanced_instruction: advancedInstruction.trim(),
+        inbound_sensitive_words: inboundSensitiveWords,
+        sensitive_word_action: 'mark_human',
+        outbound_block_rules: outboundBlockRules
+          .filter((rule) => rule.word.trim() && rule.replacement.trim())
+          .map((rule) => ({ word: rule.word.trim(), replacement: rule.replacement.trim(), enabled: rule.enabled })),
+        outbound_block_words: outboundBlockRules
+          .filter((rule) => rule.enabled && rule.word.trim() && !rule.replacement.trim())
+          .map((rule) => rule.word.trim()),
+        outbound_block_action: outboundBlockRules.some((rule) => rule.enabled && rule.word.trim() && rule.replacement.trim()) ? 'replace' : 'fallback',
+        fallback_reply_text: fallbackReplyText.trim(),
+        fallback_mark_human_required: fallbackMarkHumanRequired,
+        timeout_enabled: timeoutEnabled,
+        timeout_seconds: timeoutSeconds,
+        timeout_reply_text: timeoutReplyText.trim(),
         routing_cards: routingCards,
       },
       qa_knowledge_base_ids: selectedQaKBIds,
@@ -466,6 +564,20 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       platform_scopes: platformScopes,
     });
     setActiveTab('robot-list');
+  };
+  const addSensitiveWord = () => {
+    const word = sensitiveWordDraft.trim();
+    if (!word || inboundSensitiveWords.some((item) => item.toLocaleLowerCase() === word.toLocaleLowerCase())) return;
+    setInboundSensitiveWords((current) => [...current, word]);
+    setSensitiveWordDraft('');
+  };
+  const addOutboundBlockWord = () => {
+    const word = outboundBlockWordDraft.trim();
+    const replacement = outboundReplacementDraft.trim();
+    if (!word || !replacement || outboundBlockRules.length >= 200 || outboundBlockRules.some((item) => item.word.toLocaleLowerCase() === word.toLocaleLowerCase())) return;
+    setOutboundBlockRules((current) => [...current, { word, replacement, enabled: true }]);
+    setOutboundBlockWordDraft('');
+    setOutboundReplacementDraft('');
   };
   const handleTestReply = async () => {
     const message = testReplyText.trim();
@@ -1399,11 +1511,16 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <div className="flex items-center gap-2">
                               <GitMerge className="w-5 h-5 text-indigo-500" />
                               <h3 className="text-lg font-bold text-slate-900">转分流策略</h3>
+                              <span className="px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-bold">开发中...</span>
                             </div>
                             <button onClick={handleAddRoutingCard} className="flex items-center gap-2 px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded-lg text-sm font-bold hover:bg-indigo-100 transition-colors">
                               <Plus className="w-4 h-4" />
                               新增时间段
                             </button>
+                          </div>
+
+                          <div className="p-4 rounded-xl border border-amber-200 bg-amber-50 text-sm text-amber-800">
+                            当前时间段、分流比例和平台会话转移仅为界面预览，尚未接入 business-api 和平台 RPA，请勿作为已生效策略使用。
                           </div>
                           
                           <div className="space-y-4">
@@ -1463,73 +1580,150 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           </div>
                         </div>
 
-                        {/* 违禁词拦截策略 */}
+                        {/* 机器人安全策略 */}
                         <div className="space-y-6">
                           <div className="flex items-center justify-between mb-2">
                             <div className="flex items-center gap-2">
                               <ShieldAlert className="w-5 h-5 text-rose-500" />
-                              <h3 className="text-lg font-bold text-slate-900">违禁词与高敏词拦截策略</h3>
+                              <h3 className="text-lg font-bold text-slate-900">机器人安全策略</h3>
                             </div>
-                            <button className="flex items-center gap-2 px-3 py-1.5 bg-rose-50 text-rose-600 rounded-lg text-sm font-bold hover:bg-rose-100 transition-colors">
-                              <RefreshCw className="w-4 h-4" />
-                              同步至所有店铺
-                            </button>
+                            <span className="text-xs font-medium text-slate-400">跟随当前机器人绑定的平台与店铺生效</span>
                           </div>
                           
                           <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+                            <div className="flex items-center gap-2 pb-4 border-b border-slate-200/70">
+                              <ShieldAlert className="w-5 h-5 text-rose-500" />
+                              <h4 className="text-base font-bold text-slate-900">违禁词处理策略</h4>
+                            </div>
                             <div className="p-4 bg-orange-50/80 rounded-xl border border-orange-100/50 flex items-start gap-3">
                               <Info className="w-5 h-5 text-orange-500 shrink-0 mt-0.5" />
                               <div>
-                                <p className="text-sm text-orange-800">已配置的违禁词为全局违禁词，后续新增店铺也会将默认使用上一次已配置好的规则。</p>
+                                <p className="text-sm text-orange-800">QA 或 AI 回复命中违禁词时，将违禁词替换为预设词后再发送；未配置替换词的旧规则仍使用常规兜底话术。</p>
                               </div>
                             </div>
                             
                             <div className="space-y-4">
-                              <label className="text-sm font-bold text-slate-700">添加违禁词 (按回车键添加)</label>
-                              <input 
-                                type="text" 
-                                placeholder="输入违禁词..." 
-                                className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
-                              />
+                              <label className="text-sm font-bold text-slate-700">添加违禁词替换规则</label>
+                              <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-3">
+                                <input
+                                  type="text"
+                                  placeholder="违禁词，例如：你好"
+                                  value={outboundBlockWordDraft}
+                                  maxLength={64}
+                                  onChange={(event) => setOutboundBlockWordDraft(event.target.value)}
+                                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
+                                />
+                                <input
+                                  type="text"
+                                  placeholder="替换为，例如：您好"
+                                  value={outboundReplacementDraft}
+                                  maxLength={128}
+                                  onChange={(event) => setOutboundReplacementDraft(event.target.value)}
+                                  onKeyDown={(event) => {
+                                    if (event.key !== 'Enter') return;
+                                    event.preventDefault();
+                                    addOutboundBlockWord();
+                                  }}
+                                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={addOutboundBlockWord}
+                                  disabled={!outboundBlockWordDraft.trim() || !outboundReplacementDraft.trim() || outboundBlockRules.length >= 200}
+                                  className="px-5 py-3 rounded-xl bg-indigo-600 text-white text-sm font-bold hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+                                >
+                                  添加
+                                </button>
+                              </div>
+                              {outboundBlockRules.some((rule) => rule.word.toLocaleLowerCase() === outboundBlockWordDraft.trim().toLocaleLowerCase()) && outboundBlockWordDraft.trim() && (
+                                <p className="text-xs text-rose-500">该违禁词已经存在，请先删除原规则再添加。</p>
+                              )}
                             </div>
-                            
+
                             <div className="space-y-3">
-                              <label className="text-sm font-bold text-slate-700">已配置违禁词 (3)</label>
-                              <div className="flex flex-wrap gap-2">
-                                {['最便宜', '绝对', '第一'].map(word => (
-                                  <div key={word} className="flex items-center gap-2 pl-3 pr-2 py-1.5 bg-rose-100 border border-rose-200 text-rose-700 rounded-lg text-sm font-medium">
-                                    {word}
-                                    <button className="p-1 hover:bg-rose-200/50 rounded transition-colors"><Trash2 className="w-3 h-3" /></button>
+                              <label className="text-sm font-bold text-slate-700">已配置替换规则 ({outboundBlockRules.length})</label>
+                              <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+                                <div className="grid grid-cols-[1fr_1fr_80px_80px] gap-3 px-4 py-2.5 bg-slate-50 text-xs font-bold text-slate-500">
+                                  <span>违禁词</span><span>替换为</span><span>状态</span><span>操作</span>
+                                </div>
+                                {outboundBlockRules.map((rule) => (
+                                  <div key={rule.word.toLocaleLowerCase()} className="grid grid-cols-[1fr_1fr_80px_80px] gap-3 items-center px-4 py-3 border-t border-slate-100 text-sm">
+                                    <span className="font-medium text-rose-600 break-all">{rule.word}</span>
+                                    <span className={cn("break-all", rule.replacement ? "text-slate-700" : "text-orange-500")}>{rule.replacement || '待补充（旧规则）'}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => setOutboundBlockRules((current) => current.map((item) => item.word === rule.word ? { ...item, enabled: !item.enabled } : item))}
+                                      className={cn("text-xs font-bold", rule.enabled ? "text-emerald-600" : "text-slate-400")}
+                                    >
+                                      {rule.enabled ? '已启用' : '已停用'}
+                                    </button>
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setOutboundBlockWordDraft(rule.word);
+                                          setOutboundReplacementDraft(rule.replacement);
+                                          setOutboundBlockRules((current) => current.filter((item) => item.word !== rule.word));
+                                        }}
+                                        className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
+                                        title="编辑规则"
+                                      ><Pencil className="w-4 h-4" /></button>
+                                      <button type="button" onClick={() => setOutboundBlockRules((current) => current.filter((item) => item.word !== rule.word))} className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors" title="删除规则"><Trash2 className="w-4 h-4" /></button>
+                                    </div>
                                   </div>
                                 ))}
+                                {outboundBlockRules.length === 0 && <div className="px-4 py-6 border-t border-slate-100 text-center text-xs text-slate-400">暂无违禁词替换规则</div>}
                               </div>
+                          </div>
+
+                        </div>
+                      </div>
+
+                          <div className="space-y-3">
+                            <div className="flex items-center gap-2">
+                              <ShieldAlert className="w-5 h-5 text-orange-500" />
+                              <h4 className="text-base font-bold text-slate-900">敏感词拦截策略</h4>
                             </div>
+                            <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+                              <div className="p-4 bg-orange-50/80 rounded-xl border border-orange-100/50 flex items-start gap-3">
+                                <Info className="w-5 h-5 text-orange-500 shrink-0 mt-0.5" />
+                                <p className="text-sm text-orange-800">客户消息命中敏感词后，立即标记为待人工处理，不再进入 QA 匹配或 AI 回复流程。</p>
+                              </div>
                             
-                            <div className="pt-6 border-t border-slate-200/60 space-y-4">
+                            <div className="space-y-4">
                               <label className="text-sm font-bold text-slate-700">添加敏感词 (按回车键添加)</label>
                               <input 
                                 type="text" 
                                 placeholder="输入敏感词..." 
+                                value={sensitiveWordDraft}
+                                maxLength={64}
+                                onChange={(event) => setSensitiveWordDraft(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key !== 'Enter') return;
+                                  event.preventDefault();
+                                  addSensitiveWord();
+                                }}
                                 className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
                               />
                             </div>
                             
                             <div className="space-y-3">
-                              <label className="text-sm font-bold text-slate-700">已配置敏感词 (2)</label>
+                              <label className="text-sm font-bold text-slate-700">已配置敏感词 ({inboundSensitiveWords.length})</label>
                               <div className="flex flex-wrap gap-2">
-                                {['差评', '投诉'].map(word => (
+                                {inboundSensitiveWords.map(word => (
                                   <div key={word} className="flex items-center gap-2 pl-3 pr-2 py-1.5 bg-orange-100 border border-orange-200 text-orange-700 rounded-lg text-sm font-medium">
                                     {word}
-                                    <button className="p-1 hover:bg-orange-200/50 rounded transition-colors"><Trash2 className="w-3 h-3" /></button>
+                                    <button type="button" onClick={() => setInboundSensitiveWords((current) => current.filter((item) => item !== word))} className="p-1 hover:bg-orange-200/50 rounded transition-colors"><Trash2 className="w-3 h-3" /></button>
                                   </div>
                                 ))}
+                                {inboundSensitiveWords.length === 0 && <span className="text-xs text-slate-400">暂无敏感词</span>}
                               </div>
                             </div>
 
                             <div className="pt-2">
                               <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
-                                <span className="text-sm font-bold text-slate-700">若检测到敏感词直接转入人工</span>
-                                <div className="w-12 h-6 bg-indigo-500 rounded-full relative cursor-pointer shadow-inner">
+                                <span className="text-sm font-bold text-slate-700">命中后标记待人工处理，并停止机器人处理该会话</span>
+                                <div className="w-12 h-6 bg-indigo-500 rounded-full relative shadow-inner" title="当前版本固定启用">
                                   <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
                                 </div>
                               </div>
@@ -1554,16 +1748,20 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                               <div className="space-y-4">
                                 <div className="space-y-2">
                                   <label className="text-sm font-bold text-slate-700">输入默认兜底回答：</label>
-                                  <textarea 
-                                    className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 transition-all resize-none"
-                                    defaultValue="您的问题我将为您接入专业产品客服，请稍后"
-                                  />
+                              <textarea
+                                className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 transition-all resize-none"
+                                value={fallbackReplyText}
+                                onChange={(event) => setFallbackReplyText(event.target.value)}
+                              />
                                 </div>
                                 <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
-                                  <span className="text-sm font-bold text-slate-700">发出兜底话术后将消息转人工</span>
-                                  <div className="w-12 h-6 bg-indigo-500 rounded-full relative cursor-pointer shadow-inner">
-                                    <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
+                                  <div>
+                                    <span className="block text-sm font-bold text-slate-700">发出兜底话术后标记待人工处理，并停止机器人处理该会话</span>
+                                    <span className="block mt-1 text-xs text-slate-400">仅标记消息中心会话，不调用平台的“转移会话”功能。</span>
                                   </div>
+                                  <button type="button" onClick={() => setFallbackMarkHumanRequired((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", fallbackMarkHumanRequired ? "bg-indigo-500" : "bg-slate-300")} title="发送任务入队后立即标记待人工处理">
+                                    <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
+                                  </button>
                                 </div>
                               </div>
                             </div>
@@ -1572,25 +1770,26 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
                               <div className="space-y-1">
                                 <h3 className="text-base font-bold text-slate-900">超时安抚话术</h3>
-                                <p className="text-sm text-slate-500">机器人超时未响应转人工</p>
+                                <p className="text-sm text-slate-500">正式回复超过设定时间仍未发送时，先发送一次安抚消息，正式回复继续执行。</p>
                               </div>
                               <div className="space-y-4 pt-2">
                                 <div className="space-y-2">
                                   <label className="text-sm font-bold text-slate-700">设置机器人未响应时间 (秒)</label>
-                                  <input type="number" defaultValue="10" min="1" max="60" className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
+                                  <input type="number" value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.max(1, Math.min(60, Number(event.target.value) || 1)))} min="1" max="60" className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
                                 </div>
                                 <div className="space-y-2">
                                   <label className="text-sm font-bold text-slate-700">输入默认安抚话术：</label>
                                   <textarea 
                                     className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 transition-all resize-none"
-                                    defaultValue="专项客服正在赶来的路上请稍等~~"
+                                    value={timeoutReplyText}
+                                    onChange={(event) => setTimeoutReplyText(event.target.value)}
                                   />
                                 </div>
                                 <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
-                                  <span className="text-sm font-bold text-slate-700">发出超时安抚话术后将消息转人工</span>
-                                  <div className="w-12 h-6 bg-indigo-500 rounded-full relative cursor-pointer shadow-inner">
+                                  <span className="text-sm font-bold text-slate-700">启用超时安抚（只发送一次，不打断正式回复）</span>
+                                  <button type="button" onClick={() => setTimeoutEnabled((value) => !value)} className={cn("w-12 h-6 rounded-full relative shadow-inner transition-colors", timeoutEnabled ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
-                                  </div>
+                                  </button>
                                 </div>
                               </div>
                             </div>
@@ -1755,19 +1954,22 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                       {(productDocuments[selectedProductKB.id] ?? []).length === 0 ? (
                         <div className="py-14 text-center text-sm text-slate-400">暂无文档，请先导入产品资料</div>
                       ) : (
-                        <table className="w-full text-left border-collapse">
-                          <thead><tr className="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-100"><th className="px-6 py-4">文档名称</th><th className="px-6 py-4">格式</th><th className="px-6 py-4">大小</th><th className="px-6 py-4">状态</th><th className="px-6 py-4">最后更新</th><th className="px-6 py-4 text-right">操作</th></tr></thead>
+                        <div className="overflow-x-auto custom-scrollbar">
+                        <table className="w-full min-w-[920px] text-left border-collapse">
+                          <thead><tr className="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-100"><th className="px-6 py-4">文档名称</th><th className="px-6 py-4">格式</th><th className="px-6 py-4">大小</th><th className="px-6 py-4">切片数</th><th className="px-6 py-4">状态</th><th className="px-6 py-4">最后更新</th><th className="px-6 py-4 text-right">操作</th></tr></thead>
                           <tbody className="divide-y divide-slate-100">{(productDocuments[selectedProductKB.id] ?? []).map((document) => (
                             <tr key={document.id} className="hover:bg-slate-50/50 transition-colors">
-                              <td className="px-6 py-4"><div className="flex items-center gap-3"><FileText className="w-4 h-4 text-slate-400" /><span className="text-sm font-bold text-slate-800">{document.name}</span></div></td>
+                              <td className="px-6 py-4"><button type="button" onClick={() => { setProductDocumentTab('chunks'); setProductDocumentSearch(''); void openProductDocumentDetail(document); }} className="flex items-center gap-3 text-left group"><FileText className="w-4 h-4 text-slate-400 group-hover:text-indigo-500" /><span className="text-sm font-bold text-slate-800 group-hover:text-indigo-600">{document.name}</span></button></td>
                               <td className="px-6 py-4 text-xs text-slate-500">{document.format}</td>
                               <td className="px-6 py-4 text-sm text-slate-500">{document.size}</td>
+                              <td className="px-6 py-4 text-sm text-slate-500">{document.chunkCount} 个</td>
                               <td className="px-6 py-4"><span className={cn("inline-flex items-center gap-1.5 text-xs font-bold", document.status === '已解析' ? "text-emerald-600" : "text-amber-600")}>{document.status === '已解析' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <RefreshCw className="w-3.5 h-3.5" />}{document.status}</span></td>
                               <td className="px-6 py-4 text-sm text-slate-500">{document.date}</td>
-                              <td className="px-6 py-4 text-right"><button onClick={() => requestConfirm(`确定删除“${document.name}”吗？`, () => handleDeleteProductDocument(document.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs">删除</button></td>
+                              <td className="px-6 py-4 text-right"><div className="flex items-center justify-end gap-4"><button type="button" onClick={() => { setProductDocumentTab('chunks'); setProductDocumentSearch(''); void openProductDocumentDetail(document); }} className="text-indigo-600 hover:text-indigo-700 font-bold text-xs">查看</button><button onClick={() => requestConfirm(`确定删除“${document.name}”吗？`, () => handleDeleteProductDocument(document.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs">删除</button></div></td>
                             </tr>
                           ))}</tbody>
                         </table>
+                        </div>
                       )}
                     </div>
                   </div>
@@ -2305,6 +2507,85 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
           </motion.div>
         )}
 
+        {selectedProductDocument && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-slate-900/50 z-[70] flex items-center justify-center p-4 lg:p-6 backdrop-blur-sm"
+            role="presentation"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.97, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.97, y: 10 }}
+              className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl h-[calc(100vh-2rem)] lg:h-[calc(100vh-3rem)] max-h-[900px] overflow-hidden flex flex-col"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="product-document-dialog-title"
+            >
+              <div className="shrink-0 flex items-start justify-between gap-6 px-6 py-5 border-b border-slate-100">
+                <div className="min-w-0 flex items-start gap-4">
+                  <div className="w-11 h-11 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0"><FileText className="w-5 h-5" /></div>
+                  <div className="min-w-0">
+                    <h3 id="product-document-dialog-title" className="text-lg font-bold text-slate-900 truncate">{selectedProductDocument.name}</h3>
+                    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+                      <span>{selectedProductDocument.format}</span>
+                      <span>{selectedProductDocument.size}</span>
+                      <span>{selectedProductDocument.chunkCount} 个切片</span>
+                      <span>更新于 {selectedProductDocument.date}</span>
+                      <span className="inline-flex items-center gap-1 font-bold text-emerald-600"><CheckCircle2 className="w-3.5 h-3.5" />{selectedProductDocument.status}</span>
+                    </div>
+                  </div>
+                </div>
+                <button type="button" onClick={closeProductDocumentModal} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors" title="关闭"><X className="w-5 h-5" /></button>
+              </div>
+
+              <div className="shrink-0 flex flex-col gap-4 px-6 py-4 border-b border-slate-100 bg-slate-50/70 lg:flex-row lg:items-center lg:justify-between">
+                <div className="flex items-center p-1 bg-slate-200/70 rounded-xl self-start">
+                  <button type="button" onClick={() => setProductDocumentTab('chunks')} className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-colors", productDocumentTab === 'chunks' ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700")}>检索切片 ({productDocumentChunks.length})</button>
+                  <button type="button" onClick={() => setProductDocumentTab('content')} className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-colors", productDocumentTab === 'content' ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700")}>解析全文</button>
+                </div>
+                <div className="flex items-center gap-3">
+                  <label className="relative flex-1 lg:w-72">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input value={productDocumentSearch} onChange={(event) => setProductDocumentSearch(event.target.value)} placeholder="搜索处理后的内容" className="w-full rounded-xl border border-slate-200 bg-white pl-9 pr-9 py-2.5 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                    {productDocumentSearch && <button type="button" onClick={() => setProductDocumentSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"><X className="w-4 h-4" /></button>}
+                  </label>
+                  <button type="button" onClick={() => void navigator.clipboard.writeText(productDocumentTab === 'content' ? (productDocumentDetail?.content ?? '') : visibleProductDocumentChunks.map((chunk) => chunk.content).join('\n\n'))} disabled={!productDocumentDetail} className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-600 hover:text-indigo-600 disabled:opacity-50"><Copy className="w-4 h-4" />复制</button>
+                </div>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto p-6 bg-slate-50 custom-scrollbar">
+                {isLoadingProductDocumentDetail && <div className="h-full min-h-64 flex flex-col items-center justify-center text-sm text-slate-500"><RefreshCw className="w-6 h-6 mb-3 text-indigo-500 animate-spin" />正在读取文档处理结果...</div>}
+                {!isLoadingProductDocumentDetail && productDocumentDetailNotice && <div className="max-w-xl mx-auto mt-16 rounded-xl border border-rose-100 bg-rose-50 px-5 py-4 text-sm text-rose-600">{productDocumentDetailNotice}</div>}
+                {!isLoadingProductDocumentDetail && productDocumentDetail && productDocumentTab === 'chunks' && (
+                  <div className="space-y-4">
+                    <div className="rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm text-indigo-700">以下是机器人检索时实际使用的内容。为保证上下文连续，前后切片可能包含少量重复文本。</div>
+                    {normalizedProductDocumentSearch && <p className="text-xs text-slate-500">找到 {visibleProductDocumentChunks.length} 个匹配切片</p>}
+                    {visibleProductDocumentChunks.map((chunk) => (
+                      <article key={chunk.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                          <div className="flex items-center gap-3"><span className="rounded-lg bg-indigo-50 px-2.5 py-1 text-xs font-bold text-indigo-600">切片 {chunk.chunk_index + 1} / {productDocumentChunks.length}</span>{chunk.title_path && <span className="text-sm font-bold text-slate-700">{chunk.title_path}</span>}</div>
+                          <span className="text-xs text-slate-400">{chunk.content.length} 字符</span>
+                        </div>
+                        <p className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-700">{chunk.content}</p>
+                      </article>
+                    ))}
+                    {visibleProductDocumentChunks.length === 0 && <div className="py-20 text-center text-sm text-slate-400">没有匹配的切片</div>}
+                  </div>
+                )}
+                {!isLoadingProductDocumentDetail && productDocumentDetail && productDocumentTab === 'content' && (
+                  <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                    <div className="mb-5 flex items-center justify-between gap-4 border-b border-slate-100 pb-4"><div><h4 className="font-bold text-slate-900">解析后的完整文本</h4><p className="mt-1 text-xs text-slate-400">共 {productDocumentDetail.content.length} 个字符，不代表原文件排版</p></div>{normalizedProductDocumentSearch && <span className={cn("text-xs font-bold", productDocumentDetail.content.toLocaleLowerCase().includes(normalizedProductDocumentSearch) ? "text-emerald-600" : "text-slate-400")}>{productDocumentDetail.content.toLocaleLowerCase().includes(normalizedProductDocumentSearch) ? '全文中已找到匹配内容' : '全文中无匹配内容'}</span>}</div>
+                    <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-7 text-slate-700">{productDocumentDetail.content}</pre>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+
         {emailTemplateModalId !== undefined && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 bg-slate-900/40 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
             <motion.div initial={{ opacity: 0, scale: 0.95, y: 10 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: 10 }} className="bg-white rounded-2xl shadow-xl w-full max-w-2xl overflow-hidden">
@@ -2609,9 +2890,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
               initial={{ opacity: 0, scale: 0.95, y: 10 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className="bg-white rounded-2xl shadow-xl w-full max-w-lg overflow-hidden"
+              className="bg-white rounded-2xl shadow-xl w-full max-w-3xl h-[calc(100vh-2rem)] max-h-[800px] overflow-hidden flex flex-col"
             >
-              <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+              <div className="flex shrink-0 items-center justify-between px-6 py-4 border-b border-slate-100">
                 <div>
                   <h3 className="text-lg font-bold text-slate-900">测试回复</h3>
                   <p className="text-xs text-slate-500 mt-1">{robots.find((robot) => robot.id === testReplyRobotId)?.name}</p>
@@ -2620,8 +2901,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                   <X className="w-5 h-5" />
                 </button>
               </div>
-              <div className="p-6 space-y-4">
-                <div className="h-72 overflow-y-auto rounded-xl border border-slate-100 bg-slate-50 p-4 space-y-3 custom-scrollbar">
+              <div className="flex-1 min-h-0 overflow-y-auto p-6 space-y-4 custom-scrollbar">
+                <div className="h-80 overflow-y-auto rounded-xl border border-slate-100 bg-slate-50 p-4 space-y-3 custom-scrollbar">
                   {testReplyMessages.length === 0 && <p className="py-20 text-center text-sm text-slate-400">输入问题开始多轮测试</p>}
                   {testReplyMessages.map((item, index) => (
                     <div key={`${index}-${item.role}`} className={cn('flex', item.role === 'user' ? 'justify-end' : 'justify-start')}>
@@ -2636,39 +2917,41 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                 {testReplyDebug && (
                   <details className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600">
                     <summary className="cursor-pointer font-bold text-slate-700">查看本轮决策链路</summary>
-                    <div className="mt-3 grid grid-cols-2 gap-3">
-                      <div className="rounded-lg bg-slate-50 p-3">
-                        <p className="font-bold text-slate-500">意图</p>
-                        <p className="mt-1 break-all text-slate-800">{String(testReplyDebug.intent.intent || 'unknown')} · {Math.round(testReplyDebug.confidence * 100)}%</p>
+                    <div className="mt-3 max-h-72 overflow-y-auto pr-1 custom-scrollbar">
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="rounded-lg bg-slate-50 p-3">
+                          <p className="font-bold text-slate-500">意图</p>
+                          <p className="mt-1 break-all text-slate-800">{String(testReplyDebug.intent.intent || 'unknown')} · {Math.round(testReplyDebug.confidence * 100)}%</p>
+                        </div>
+                        <div className="rounded-lg bg-slate-50 p-3">
+                          <p className="font-bold text-slate-500">下一动作</p>
+                          <p className="mt-1 break-all text-slate-800">{String(testReplyDebug.action_plan.next_action || '未定义')}</p>
+                        </div>
+                        <div className="rounded-lg bg-slate-50 p-3">
+                          <p className="font-bold text-slate-500">模型调用</p>
+                          <p className="mt-1 break-all text-slate-800">意图：{testReplyDebug.model_calls.intent || 'skipped'}；生成：{testReplyDebug.model_calls.generation || 'skipped'}</p>
+                        </div>
+                        <div className="rounded-lg bg-slate-50 p-3">
+                          <p className="font-bold text-slate-500">知识检索</p>
+                          <p className="mt-1 text-slate-800">召回 {testReplyDebug.retrieval.length} 个片段</p>
+                        </div>
                       </div>
-                      <div className="rounded-lg bg-slate-50 p-3">
-                        <p className="font-bold text-slate-500">下一动作</p>
-                        <p className="mt-1 break-all text-slate-800">{String(testReplyDebug.action_plan.next_action || '未定义')}</p>
-                      </div>
-                      <div className="rounded-lg bg-slate-50 p-3">
-                        <p className="font-bold text-slate-500">模型调用</p>
-                        <p className="mt-1 break-all text-slate-800">意图：{testReplyDebug.model_calls.intent || 'skipped'}；生成：{testReplyDebug.model_calls.generation || 'skipped'}</p>
-                      </div>
-                      <div className="rounded-lg bg-slate-50 p-3">
-                        <p className="font-bold text-slate-500">知识检索</p>
-                        <p className="mt-1 text-slate-800">召回 {testReplyDebug.retrieval.length} 个片段</p>
-                      </div>
+                      {testReplyDebug.retrieval.length > 0 && (
+                        <div className="mt-3 space-y-2">
+                          {testReplyDebug.retrieval.slice(0, 3).map((item, index) => (
+                            <div key={`${testReplyDebug.trace_id}-${index}`} className="rounded-lg bg-indigo-50 px-3 py-2 text-indigo-900">
+                              {String(item.snippet || item.content || '无摘要')}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <p className="mt-3 font-mono text-[11px] text-slate-400">Trace ID: {testReplyDebug.trace_id}</p>
                     </div>
-                    {testReplyDebug.retrieval.length > 0 && (
-                      <div className="mt-3 space-y-2">
-                        {testReplyDebug.retrieval.slice(0, 3).map((item, index) => (
-                          <div key={`${testReplyDebug.trace_id}-${index}`} className="rounded-lg bg-indigo-50 px-3 py-2 text-indigo-900">
-                            {String(item.snippet || item.content || '无摘要')}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <p className="mt-3 font-mono text-[11px] text-slate-400">Trace ID: {testReplyDebug.trace_id}</p>
                   </details>
                 )}
                 {testReplyResult && <div className="p-3 bg-rose-50 border border-rose-100 rounded-xl text-sm text-rose-700">{testReplyResult}</div>}
               </div>
-              <div className="flex items-center justify-end gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100">
+              <div className="flex shrink-0 items-center justify-end gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100">
                 <button onClick={() => { setTestReplyRobotId(null); setTestReplyMessages([]); setTestReplyResult(''); setTestReplyDebug(null); }} className="px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-xl text-sm font-bold hover:bg-slate-50 transition-colors">关闭</button>
                 <button
                   onClick={() => void handleTestReply()}

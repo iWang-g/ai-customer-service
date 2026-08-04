@@ -122,6 +122,131 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         search_mock.assert_not_awaited()
         provider_mock.assert_not_awaited()
 
+    async def test_qa_answer_containing_block_word_uses_configured_fallback(self) -> None:
+        request = ReplyRequest(
+            message="多少钱",
+            qa_base_ids=["qa-1"],
+            allow_auto_send=True,
+            reply_config={
+                "outbound_block_words": ["绝对"],
+                "fallback_reply_text": "我先帮您核实一下",
+            },
+        )
+        with (
+            patch("app.pipeline.match_qa", AsyncMock(return_value={
+                "matched": True,
+                "match_type": "exact",
+                "score": 1.0,
+                "entry": {"id": "entry-1", "answer": "这是绝对最低价", "image_url": ""},
+            })),
+            patch("app.pipeline.generate_with_provider", AsyncMock()) as provider_mock,
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "我先帮您核实一下")
+        self.assertEqual(result.provider, "outbound-block-fallback")
+        self.assertIn("outbound_block_word", result.risk_flags)
+        provider_mock.assert_not_awaited()
+
+    async def test_qa_answer_replaces_block_word_and_preserves_media(self) -> None:
+        request = ReplyRequest(
+            message="什么时候发货",
+            qa_base_ids=["qa-1"],
+            allow_auto_send=True,
+            reply_config={
+                "outbound_block_rules": [
+                    {"word": "你好", "replacement": "您好", "enabled": True},
+                ],
+            },
+        )
+        with (
+            patch("app.pipeline.match_qa", AsyncMock(return_value={
+                "matched": True,
+                "match_type": "exact",
+                "score": 1.0,
+                "entry": {
+                    "id": "entry-1",
+                    "answer": "你好，你好，下单后三天内发货哦",
+                    "image_url": "https://example.com/product.png",
+                },
+            })),
+            patch("app.pipeline.generate_with_provider", AsyncMock()) as provider_mock,
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "您好，您好，下单后三天内发货哦")
+        self.assertEqual(result.provider, "qa-rule")
+        self.assertEqual(result.media, [{"type": "image", "url": "https://example.com/product.png"}])
+        self.assertIn("outbound_block_replaced", result.risk_flags)
+        provider_mock.assert_not_awaited()
+
+    async def test_outbound_replacement_is_single_pass_and_residual_needs_human(self) -> None:
+        request = ReplyRequest(
+            message="什么时候发货",
+            qa_base_ids=["qa-1"],
+            allow_auto_send=True,
+            reply_config={
+                "outbound_block_rules": [
+                    {"word": "你好", "replacement": "您好"},
+                    {"word": "您好", "replacement": "尊敬的客户"},
+                ],
+            },
+        )
+        with patch("app.pipeline.match_qa", AsyncMock(return_value={
+            "matched": True,
+            "match_type": "exact",
+            "score": 1.0,
+            "entry": {"id": "entry-1", "answer": "你好", "image_url": ""},
+        })):
+            result = await build_reply(request)
+
+        self.assertEqual(result.decision, "needs_human")
+        self.assertEqual(result.text, "")
+        self.assertIn("replacement_blocked", result.risk_flags)
+
+    async def test_longer_outbound_word_is_replaced_first(self) -> None:
+        request = ReplyRequest(
+            message="什么时候发货",
+            qa_base_ids=["qa-1"],
+            allow_auto_send=True,
+            reply_config={
+                "outbound_block_rules": [
+                    {"word": "你好", "replacement": "您好"},
+                    {"word": "你好呀", "replacement": "您好呀"},
+                ],
+            },
+        )
+        with patch("app.pipeline.match_qa", AsyncMock(return_value={
+            "matched": True,
+            "match_type": "exact",
+            "score": 1.0,
+            "entry": {"id": "entry-1", "answer": "你好呀，请问需要什么", "image_url": ""},
+        })):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "您好呀，请问需要什么")
+        self.assertEqual(result.decision, "auto_send")
+
+    async def test_empty_product_retrieval_uses_fallback_without_generation(self) -> None:
+        request = ReplyRequest(
+            message="商品有什么规格",
+            product_base_ids=["product-1"],
+            allow_auto_send=True,
+            reply_config={"fallback_reply_text": "请稍等，客服正在核实"},
+        )
+        provider = AsyncMock(return_value=(intent_json(), "deepseek"))
+        with (
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[])),
+            patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.get_knowledge_base", AsyncMock(return_value={})),
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "请稍等，客服正在核实")
+        self.assertEqual(result.provider, "fallback-rule")
+        self.assertEqual(result.model_calls["generation"], "skipped-no-retrieval")
+        self.assertEqual(provider.await_count, 1)
+
     async def test_qa_miss_runs_intent_search_and_generation_in_order(self) -> None:
         request = ReplyRequest(
             message="商品有什么规格",
@@ -273,11 +398,12 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_product_question_cannot_use_direct_route(self) -> None:
         request = ReplyRequest(message="这个键帽能装我的键盘吗", product_base_ids=["product-1"])
         provider = AsyncMock(return_value=(intent_json(
-            "direct_reply", direct_reply_text="可以安装", confidence=0.99,
+            "direct_reply",
+            direct_reply_text="可以安装",
+            confidence=0.99,
         ), "deepseek"))
         with (
             patch("app.pipeline.generate_with_provider", provider),
-            patch("app.pipeline.search_documents", AsyncMock(return_value=[{"snippet": "商品有现货"}])),
             patch("app.pipeline.search_documents", AsyncMock(return_value=[])) as search_mock,
         ):
             result = await build_reply(request)
@@ -285,6 +411,23 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.intent.intent, "normal_question")
         self.assertEqual(result.retrieval_status, "empty")
         self.assertEqual(result.model_calls["generation"], "skipped-no-retrieval")
+        search_mock.assert_awaited_once()
+
+    async def test_low_confidence_direct_route_uses_conservative_retrieval(self) -> None:
+        request = ReplyRequest(message="能用吗", product_base_ids=["product-1"])
+        provider = AsyncMock(return_value=(intent_json(
+            "direct_reply",
+            direct_reply_text="可以",
+            confidence=0.6,
+        ), "deepseek"))
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[])) as search_mock,
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.intent.reply_route, "retrieve_product")
+        self.assertEqual(result.retrieval_status, "empty")
         search_mock.assert_awaited_once()
 
     async def test_product_route_without_bound_base_reports_configuration_gap(self) -> None:
@@ -303,7 +446,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             patch("app.pipeline.search_documents", AsyncMock(side_effect=RuntimeError("offline"))),
         ):
             result = await build_reply(ReplyRequest(
-                message="商品有什么规格", product_base_ids=["product-1"],
+                message="商品有什么规格",
+                product_base_ids=["product-1"],
             ))
 
         self.assertEqual(result.retrieval_status, "unavailable")

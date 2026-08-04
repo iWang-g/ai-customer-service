@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   clearStoredSession,
+  clearConversationHumanRequired,
   connectRealtime,
   getQaImageUrl,
   getCurrentUser,
@@ -90,6 +91,9 @@ function mapConversation(conversation: ApiConversation, existingMessages: Messag
     platform: conversation.platform_code,
     platformName,
     status,
+    humanRequired: conversation.human_required,
+    humanRequiredReason: conversation.human_required_reason,
+    humanRequiredWord: conversation.human_required_word,
     time: formatTime(conversation.latest_message_at),
     messages: existingMessages,
   };
@@ -345,7 +349,7 @@ export function useMessageCenterController() {
       filtered = filtered.filter((conversation) => conversation.platform === selectedPlatform);
     }
     if (selectedCategory === 'pending') {
-      filtered = filtered.filter((conversation) => conversation.status === 'pending');
+      filtered = filtered.filter((conversation) => conversation.status === 'pending' || conversation.humanRequired);
     }
     if (selectedShop !== 'all') {
       filtered = filtered.filter((conversation) => conversation.shopId === selectedShop);
@@ -432,6 +436,15 @@ export function useMessageCenterController() {
     return { draftOnly: false };
   };
 
+  const handleClearHumanRequired = async (conversationId: string) => {
+    const response = await clearConversationHumanRequired(conversationId);
+    setConversations((current) => current.map((conversation) => (
+      conversation.id === conversationId
+        ? mapConversation(response.conversation, conversation.messages)
+        : conversation
+    )));
+  };
+
   const handleImportCandidate = useCallback(async (candidate: PddImportCandidate) => {
     if (!window.desktopBridge) throw new Error('当前运行环境不支持桌面客服窗口导入');
     await window.desktopBridge.importPddConversation(candidate.accountId, candidate.conversationKey);
@@ -485,6 +498,7 @@ export function useMessageCenterController() {
     handleRegister,
     handleLogout,
     handleSendMessage,
+    handleClearHumanRequired,
     handleImportCandidate,
     loadImportCandidates,
     openImportModal,

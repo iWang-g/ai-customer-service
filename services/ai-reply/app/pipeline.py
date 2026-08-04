@@ -32,6 +32,9 @@ PRODUCT_KNOWLEDGE_WORDS = (
 DEFAULT_FALLBACK_REPLY = "您的问题我将为您接入专业产品客服，请稍后"
 DEFAULT_DIRECT_REPLY = "好的亲亲，有需要随时告诉我哦～"
 DEFAULT_HUMAN_HANDOFF_REPLY = "好的亲亲，正在为您转接人工客服，请稍等～"
+MAX_OUTBOUND_BLOCK_WORDS = 200
+MAX_OUTBOUND_BLOCK_WORD_LENGTH = 64
+MAX_OUTBOUND_REPLACEMENT_LENGTH = 128
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +66,79 @@ def _email_template_prompt_items(request: ReplyRequest) -> list[dict[str, Any]]:
 
 def clean_reply(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _outbound_block_words(request: ReplyRequest) -> list[str]:
+    value = request.reply_config.get("outbound_block_words", [])
+    if not isinstance(value, list):
+        return []
+    words: list[str] = []
+    for item in value:
+        word = clean_reply(item) if isinstance(item, str) else ""
+        if not word or len(word) > MAX_OUTBOUND_BLOCK_WORD_LENGTH or word in words:
+            continue
+        words.append(word)
+        if len(words) >= MAX_OUTBOUND_BLOCK_WORDS:
+            break
+    return words
+
+
+def _outbound_replace_rules(request: ReplyRequest) -> list[tuple[str, str]]:
+    value = request.reply_config.get("outbound_block_rules", [])
+    if not isinstance(value, list):
+        return []
+    rules: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or item.get("enabled", True) is False:
+            continue
+        word = clean_reply(item.get("word")) if isinstance(item.get("word"), str) else ""
+        replacement = clean_reply(item.get("replacement")) if isinstance(item.get("replacement"), str) else ""
+        normalized_word = word.casefold()
+        if (
+            not word
+            or not replacement
+            or len(word) > MAX_OUTBOUND_BLOCK_WORD_LENGTH
+            or len(replacement) > MAX_OUTBOUND_REPLACEMENT_LENGTH
+            or normalized_word in seen
+        ):
+            continue
+        seen.add(normalized_word)
+        rules.append((word, replacement))
+        if len(rules) >= MAX_OUTBOUND_BLOCK_WORDS:
+            break
+    return sorted(rules, key=lambda item: len(item[0]), reverse=True)
+
+
+def _apply_outbound_replacements(
+    request: ReplyRequest,
+    text: str,
+) -> tuple[str, list[str], str | None]:
+    rules = _outbound_replace_rules(request)
+    if not rules or not text:
+        return text, [], None
+    replacements = {word.casefold(): replacement for word, replacement in rules}
+    pattern = re.compile("|".join(re.escape(word) for word, _ in rules), flags=re.IGNORECASE)
+    matched_words: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        normalized = match.group(0).casefold()
+        if normalized not in matched_words:
+            matched_words.append(normalized)
+        return replacements[normalized]
+
+    replaced = pattern.sub(replace, text)
+    normalized_replaced = replaced.casefold()
+    residual = next((word for word, _ in rules if word.casefold() in normalized_replaced), None)
+    return replaced, matched_words, residual
+
+
+def _matched_outbound_block_word(request: ReplyRequest, text: str) -> str | None:
+    normalized_text = text.casefold()
+    return next(
+        (word for word in _outbound_block_words(request) if word.casefold() in normalized_text),
+        None,
+    )
 
 
 def _fallback_reply(request: ReplyRequest) -> str:
@@ -98,6 +174,136 @@ def _direct_fallback_reply(message: str) -> str:
     if any(word in normalized for word in ("你好", "您好", "嗨", "哈喽", "hello", "hi")):
         return "您好亲亲，请问有什么可以帮您？"
     return DEFAULT_DIRECT_REPLY
+
+
+def _reply_with_outbound_guard(
+    request: ReplyRequest,
+    *,
+    text: str,
+    intent: IntentDecision,
+    action_plan: ActionPlan,
+    confidence: float,
+    risk_flags: list[str],
+    qa_match: dict[str, Any],
+    retrieval: list[dict[str, Any]],
+    model_calls: dict[str, str],
+    provider: str,
+    trace_id: str,
+    retrieval_status: str = "not_needed",
+    media: list[dict[str, Any]] | None = None,
+) -> ReplyResponse:
+    replaced_text, replaced_words, residual_word = _apply_outbound_replacements(request, text)
+    guarded_flags = list(risk_flags)
+    if replaced_words:
+        guarded_flags = list(dict.fromkeys([*guarded_flags, "outbound_block_word", "outbound_block_replaced"]))
+    if residual_word:
+        logger.error(
+            "outbound replacement remains blocked trace_id=%s word=%s",
+            trace_id,
+            residual_word,
+        )
+        return ReplyResponse(
+            decision="needs_human",
+            text="",
+            media=[],
+            intent=intent,
+            action_plan=ActionPlan(
+                workflow="human_review",
+                next_action="mark_needs_human",
+                required_actions=["mark_needs_human"],
+                blocked_actions=["send_platform_text", "send_platform_image"],
+            ),
+            confidence=confidence,
+            risk_flags=list(dict.fromkeys([*guarded_flags, "replacement_blocked"])),
+            qa_match=qa_match,
+            retrieval=retrieval,
+            retrieval_status=retrieval_status,
+            model_calls=model_calls,
+            provider="outbound-replace-rule",
+            trace_id=trace_id,
+        )
+
+    matched_word = _matched_outbound_block_word(request, replaced_text)
+    if not matched_word:
+        if replaced_words:
+            logger.info(
+                "outbound reply words replaced trace_id=%s replacement_count=%d",
+                trace_id,
+                len(replaced_words),
+            )
+        return ReplyResponse(
+            decision="auto_send" if request.allow_auto_send else "suggest",
+            text=replaced_text,
+            media=media or [],
+            intent=intent,
+            action_plan=action_plan,
+            confidence=confidence,
+            risk_flags=guarded_flags,
+            qa_match=qa_match,
+            retrieval=retrieval,
+            retrieval_status=retrieval_status,
+            model_calls=model_calls,
+            provider=provider,
+            trace_id=trace_id,
+        )
+
+    fallback, fallback_replaced_words, fallback_residual_word = _apply_outbound_replacements(
+        request,
+        _fallback_reply(request),
+    )
+    fallback_blocked_word = _matched_outbound_block_word(request, fallback)
+    guarded_flags = list(dict.fromkeys([
+        *guarded_flags,
+        "outbound_block_word",
+        *(["outbound_block_replaced"] if fallback_replaced_words else []),
+    ]))
+    if fallback_residual_word or fallback_blocked_word:
+        logger.error(
+            "outbound reply and fallback blocked trace_id=%s reply_word=%s fallback_word=%s",
+            trace_id,
+            matched_word,
+            fallback_residual_word or fallback_blocked_word,
+        )
+        return ReplyResponse(
+            decision="needs_human",
+            text="",
+            media=[],
+            intent=intent,
+            action_plan=ActionPlan(
+                workflow="human_review",
+                next_action="mark_needs_human",
+                required_actions=["mark_needs_human"],
+                blocked_actions=["send_platform_text", "send_platform_image"],
+            ),
+            confidence=confidence,
+            risk_flags=[*guarded_flags, "fallback_blocked"],
+            qa_match=qa_match,
+            retrieval=retrieval,
+            retrieval_status=retrieval_status,
+            model_calls=model_calls,
+            provider="outbound-block-rule",
+            trace_id=trace_id,
+        )
+    logger.warning("outbound reply replaced by fallback trace_id=%s word=%s", trace_id, matched_word)
+    return ReplyResponse(
+        decision="auto_send" if request.allow_auto_send else "suggest",
+        text=fallback,
+        media=[],
+        intent=intent,
+        action_plan=ActionPlan(
+            workflow="fallback_reply",
+            next_action="send_platform_text",
+            required_actions=["send_platform_text"],
+        ),
+        confidence=confidence,
+        risk_flags=guarded_flags,
+        qa_match=qa_match,
+        retrieval=retrieval,
+        retrieval_status=retrieval_status,
+        model_calls=model_calls,
+        provider="outbound-block-fallback",
+        trace_id=trace_id,
+    )
 
 
 def conversation_prompt(request: ReplyRequest) -> str:
@@ -241,6 +447,7 @@ reason: 一句简短理由
             and decision.confidence >= 0.75
             and not _requires_product_knowledge(request.message)
         ):
+            decision.reply_route = "direct"
             decision.direct_reply_text = clean_reply(decision.direct_reply_text) or _direct_fallback_reply(request.message)
             decision.need_doc_search = False
             decision.need_email = False
@@ -308,12 +515,13 @@ def build_action_plan(intent: IntentDecision, has_product_bases: bool) -> Action
             required_actions=["send_platform_text"],
         )
     if intent.reply_route == "retrieve_product":
+        actions = ["search_product_documents", "generate_reply", "send_platform_text"]
         return ActionPlan(
             workflow="answer_question",
             next_action="search_product_documents",
             generate_reply=True,
             need_doc_search=True,
-            required_actions=["search_product_documents", "generate_reply", "send_platform_text"],
+            required_actions=actions,
         )
     if intent.intent == "email_link_request":
         return ActionPlan(
@@ -461,8 +669,8 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
             entry.get("id", ""),
             len(request.qa_base_ids),
         )
-        return ReplyResponse(
-            decision="auto_send" if request.allow_auto_send else "suggest",
+        return _reply_with_outbound_guard(
+            request,
             text=str(entry.get("answer") or ""),
             media=([{"type": "image", "url": image_url}] if image_url else []),
             intent=intent,
@@ -470,6 +678,7 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
             confidence=float(qa_result.get("score") or 0),
             risk_flags=risk_flags,
             qa_match=qa_result,
+            retrieval=[],
             model_calls={"intent": "skipped", "generation": "skipped"},
             provider="qa-rule",
             trace_id=trace_id,
@@ -486,34 +695,33 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
     action_plan = build_action_plan(intent, bool(request.product_base_ids))
 
     if intent.reply_route == "direct":
-        return ReplyResponse(
-            decision="auto_send" if request.allow_auto_send else "suggest",
+        return _reply_with_outbound_guard(
+            request,
             text=clean_reply(intent.direct_reply_text) or _direct_fallback_reply(request.message),
             intent=intent,
             action_plan=action_plan,
             confidence=intent.confidence,
             risk_flags=intent.risk_flags,
             qa_match=qa_result,
-            retrieval_status="not_needed",
+            retrieval=[],
             model_calls={"intent": intent_provider, "generation": "skipped"},
             provider=intent_provider,
             trace_id=trace_id,
         )
     if intent.reply_route == "human_handoff":
-        return ReplyResponse(
-            decision="auto_send" if request.allow_auto_send else "suggest",
+        return _reply_with_outbound_guard(
+            request,
             text=clean_reply(intent.direct_reply_text) or DEFAULT_HUMAN_HANDOFF_REPLY,
             intent=intent,
             action_plan=action_plan,
             confidence=intent.confidence,
             risk_flags=intent.risk_flags,
             qa_match=qa_result,
-            retrieval_status="not_needed",
+            retrieval=[],
             model_calls={"intent": intent_provider, "generation": "skipped"},
             provider=intent_provider,
             trace_id=trace_id,
         )
-
     if intent.reply_route != "retrieve_product":
         return ReplyResponse(
             decision="needs_human",
@@ -523,7 +731,6 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
             confidence=intent.confidence,
             risk_flags=intent.risk_flags,
             qa_match=qa_result,
-            retrieval_status="not_needed",
             model_calls={"intent": intent_provider, "generation": "skipped"},
             provider=intent_provider,
             trace_id=trace_id,
@@ -545,16 +752,23 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
                     type(exc).__name__,
                 )
     if action_plan.need_doc_search and not retrieval:
-        return ReplyResponse(
-            decision="auto_send" if request.allow_auto_send else "suggest",
-            text=_fallback_reply(request),
+        fallback_text = _fallback_reply(request)
+        fallback_plan = ActionPlan(
+            workflow="fallback_reply",
+            next_action="send_platform_text",
+            required_actions=["send_platform_text"],
+            blocked_actions=["generate_reply"],
+        )
+        logger.info(
+            "document retrieval empty trace_id=%s base_count=%d generation_skipped=true",
+            trace_id,
+            len(request.product_base_ids),
+        )
+        return _reply_with_outbound_guard(
+            request,
+            text=fallback_text,
             intent=intent,
-            action_plan=ActionPlan(
-                workflow="fallback_reply",
-                next_action="send_platform_text",
-                required_actions=["send_platform_text"],
-                blocked_actions=["generate_reply"],
-            ),
+            action_plan=fallback_plan,
             confidence=intent.confidence,
             risk_flags=intent.risk_flags,
             qa_match=qa_result,
@@ -584,9 +798,7 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
         text = "您好，我已经看到您的问题了。客服正在为您核实，请稍等一下。"
         if retrieval:
             text = f"您好，关于您咨询的问题，{retrieval[0].get('snippet', '')[:180]}"
-    decision = "suggest"
-    if request.allow_auto_send and intent.confidence >= 0.6:
-        decision = "auto_send"
+    decision = "auto_send" if request.allow_auto_send and intent.confidence >= 0.6 else "suggest"
     logger.info(
         "reply generated trace_id=%s intent_provider=%s generation_provider=%s retrieval_count=%d decision=%s",
         trace_id,
@@ -595,8 +807,8 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
         len(retrieval),
         decision,
     )
-    return ReplyResponse(
-        decision=decision,
+    response = _reply_with_outbound_guard(
+        request,
         text=text,
         intent=intent,
         action_plan=action_plan,
@@ -609,3 +821,6 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
         provider=generation_provider,
         trace_id=trace_id,
     )
+    if decision == "suggest" and response.decision == "auto_send":
+        response.decision = "suggest"
+    return response

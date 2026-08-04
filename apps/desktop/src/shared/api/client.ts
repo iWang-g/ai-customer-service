@@ -40,6 +40,10 @@ export interface ApiConversation {
   latest_message_at: string | null;
   unread_count: number;
   status: string;
+  human_required: boolean;
+  human_required_reason: string | null;
+  human_required_word: string | null;
+  human_required_at: string | null;
   metadata_json: Record<string, unknown>;
 }
 
@@ -245,6 +249,29 @@ export interface KnowledgeDocument {
   created_at: string;
   updated_at: string;
   duplicate?: boolean;
+}
+
+export interface KnowledgeDocumentDetail extends KnowledgeDocument {
+  content: string;
+}
+
+export interface KnowledgeDocumentChunk {
+  id: string;
+  document_id: string;
+  base_id: string;
+  chunk_index: number;
+  title_path: string;
+  content: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface KnowledgeDocumentChunkPage {
+  items: KnowledgeDocumentChunk[];
+  total: number;
+  page: number;
+  page_size: number;
+  pages: number;
 }
 
 export interface QaEntry {
@@ -669,6 +696,19 @@ export function listProductDocuments(baseId: string): Promise<KnowledgeDocument[
   return knowledgeRequest<KnowledgeDocument[]>(`/knowledge-bases/${encodeURIComponent(baseId)}/documents`);
 }
 
+export function getKnowledgeDocument(documentId: string): Promise<KnowledgeDocumentDetail> {
+  return knowledgeRequest<KnowledgeDocumentDetail>(`/documents/${encodeURIComponent(documentId)}`);
+}
+
+export function listKnowledgeDocumentChunks(
+  documentId: string,
+  page = 1,
+  pageSize = 100,
+): Promise<KnowledgeDocumentChunkPage> {
+  const query = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  return knowledgeRequest<KnowledgeDocumentChunkPage>(`/documents/${encodeURIComponent(documentId)}/chunks?${query}`);
+}
+
 export function importProductDocument(baseId: string, file: File): Promise<KnowledgeDocument> {
   const body = new FormData();
   body.append('file', file);
@@ -707,6 +747,13 @@ export function listPlatformAccounts(): Promise<{ items: PlatformAccount[] }> {
 
 export function listConversations(): Promise<PageResponse<ApiConversation>> {
   return apiRequest<PageResponse<ApiConversation>>('/conversations?limit=100');
+}
+
+export function clearConversationHumanRequired(conversationId: string): Promise<{ conversation: ApiConversation }> {
+  return apiRequest<{ conversation: ApiConversation }>(
+    `/conversations/${encodeURIComponent(conversationId)}/clear-human-required`,
+    { method: 'POST' },
+  );
 }
 
 export function listMessages(conversationId: string): Promise<PageResponse<ApiMessage>> {

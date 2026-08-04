@@ -5,7 +5,8 @@ from app.api.deps import get_current_user, get_db_session
 from app.models import User
 from app.schemas.conversation import ConversationDetailResponse, ConversationListResponse
 from app.schemas.message import MessageListResponse
-from app.services.message_service import get_conversation, list_conversations, list_messages
+from app.services.message_service import clear_human_required, get_conversation, list_conversations, list_messages
+from app.services.realtime import realtime_manager
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -29,6 +30,20 @@ def conversation_detail(
     db: Session = Depends(get_db_session),
 ) -> ConversationDetailResponse:
     return ConversationDetailResponse(conversation=get_conversation(db, user, conversation_id))
+
+
+@router.post("/{conversation_id}/clear-human-required", response_model=ConversationDetailResponse)
+async def clear_conversation_human_required(
+    conversation_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> ConversationDetailResponse:
+    conversation = clear_human_required(db, user, conversation_id)
+    await realtime_manager.broadcast(
+        user.id,
+        {"type": "conversation.updated", "conversation": conversation.model_dump(mode="json")},
+    )
+    return ConversationDetailResponse(conversation=conversation)
 
 
 @router.get("/{conversation_id}/messages", response_model=MessageListResponse)

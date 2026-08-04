@@ -255,6 +255,10 @@ class Conversation(Base, TimestampMixin):
     latest_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     unread_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    human_required: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    human_required_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    human_required_word: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    human_required_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="conversations")
