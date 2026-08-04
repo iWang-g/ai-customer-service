@@ -10,7 +10,10 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.knowledge_client import get_knowledge_base, match_qa, search_documents
-from app.provider import generate_with_provider
+from app.provider import (
+    generate_with_provider,
+    observe_model_calls,
+)
 from app.schemas import ActionPlan, IntentDecision, ReplyRequest, ReplyResponse
 
 
@@ -224,6 +227,7 @@ reason: 一句简短理由
             provider_config=request.provider_config,
             temperature=0,
             json_mode=True,
+            stage="intent",
         )
         if not generated:
             raise ValueError("intent provider is not configured")
@@ -398,6 +402,7 @@ def _generation_prompts(
     return system, user
 
 
+@observe_model_calls
 async def build_reply(request: ReplyRequest) -> ReplyResponse:
     trace_id = f"reply-{uuid.uuid4().hex[:16]}"
     risk_flags = [word for word in RISK_WORDS if word in request.message]
@@ -565,6 +570,7 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
             system=system,
             user=user,
             provider_config=request.provider_config,
+            stage="generation",
         )
     except Exception as exc:
         logger.warning(

@@ -37,12 +37,11 @@ export interface Shop {
 }
 
 export interface BotStatus {
-  name: string;
   model: string;
-  status: 'online' | 'busy' | 'offline';
-  uptime: string;
+  availableModels: string[];
+  uptime: string | null;
   requestsProcessed: number;
-  avgResponseTime: string;
+  avgResponseTimeMs: number | null;
   health: number;
 }
 
@@ -57,8 +56,18 @@ export interface DesktopWindow {
 export interface LogEntry {
   id: string;
   timestamp: string;
-  type: 'reply' | 'token' | 'system';
+  type: 'reply' | 'token';
+  status: string;
   message: string;
   details?: string;
-  tokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  durationMs?: number | null;
+}
+
+export interface StatusEvent {
+  id: string;
+  timestamp: string;
+  message: string;
+  level: 'info' | 'success' | 'warning' | 'error';
 }

@@ -32,6 +32,7 @@ class ReplyRunResponse(BaseModel):
     qa_match: dict[str, Any] | None = None
     retrieval: list[dict[str, Any]] = Field(default_factory=list)
     model_calls: dict[str, str] = Field(default_factory=dict)
+    model_call_details: list[dict[str, Any]] = Field(default_factory=list)
     provider: str
     trace_id: str
     task_ids: list[str] = Field(default_factory=list)

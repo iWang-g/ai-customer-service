@@ -68,6 +68,10 @@ export default function App() {
       dataError={controller.dataError}
       onSendMessage={controller.handleSendMessage}
       bot={controller.bot}
+      logs={controller.logs}
+      statusEvents={controller.statusEvents}
+      isLoadingMonitoring={controller.isLoadingMonitoring}
+      onMonitoringModelChange={controller.handleMonitoringModelChange}
       connectionStatus={controller.connectionStatus}
       onViewLogs={() => controller.setIsLogModalOpen(true)}
       isLogModalOpen={controller.isLogModalOpen}

@@ -4,7 +4,7 @@ import ChatWindow from '../components/ChatWindow';
 import StatusPanel from '../components/StatusPanel';
 import LogModal from '../components/LogModal';
 import ImportModal from '../components/ImportModal';
-import type { Conversation, BotStatus, Shop } from '../types';
+import type { Conversation, BotStatus, LogEntry, Shop, StatusEvent } from '../types';
 import type { ApiUser } from '../../shared/api/client';
 
 interface MessageCenterWorkspaceProps {
@@ -29,6 +29,10 @@ interface MessageCenterWorkspaceProps {
   dataError: string;
   onSendMessage: (content: string) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | null }>;
   bot: BotStatus;
+  logs: LogEntry[];
+  statusEvents: StatusEvent[];
+  isLoadingMonitoring: boolean;
+  onMonitoringModelChange: (model: string) => void;
   connectionStatus: 'connecting' | 'connected' | 'disconnected';
   onViewLogs: () => void;
   isLogModalOpen: boolean;
@@ -64,6 +68,10 @@ export default function MessageCenterWorkspace({
   dataError,
   onSendMessage,
   bot,
+  logs,
+  statusEvents,
+  isLoadingMonitoring,
+  onMonitoringModelChange,
   connectionStatus,
   onViewLogs,
   isLogModalOpen,
@@ -113,9 +121,16 @@ export default function MessageCenterWorkspace({
         onSendMessage={onSendMessage}
       />
 
-      <StatusPanel bot={bot} onViewLogs={onViewLogs} connectionStatus={connectionStatus} />
+      <StatusPanel
+        bot={bot}
+        events={statusEvents}
+        isLoading={isLoadingMonitoring}
+        onModelChange={onMonitoringModelChange}
+        onViewLogs={onViewLogs}
+        connectionStatus={connectionStatus}
+      />
 
-      <LogModal isOpen={isLogModalOpen} onClose={onCloseLogModal} />
+      <LogModal isOpen={isLogModalOpen} onClose={onCloseLogModal} logs={logs} isLoading={isLoadingMonitoring} />
 
       <ImportModal
         isOpen={isImportModalOpen}

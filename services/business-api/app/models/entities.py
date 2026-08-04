@@ -475,6 +475,7 @@ class AutomationReplyRun(Base, TimestampMixin):
     qa_match_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     document_retrieval_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     retrieval_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reply_generation_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     trace_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
     reply_message_id: Mapped[str | None] = mapped_column(
         ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
@@ -488,3 +489,30 @@ class AutomationReplyRun(Base, TimestampMixin):
     user: Mapped["User"] = relationship(back_populates="automation_reply_runs")
     conversation: Mapped["Conversation"] = relationship(back_populates="automation_reply_runs")
     robot: Mapped["Robot"] = relationship(back_populates="automation_reply_runs")
+
+
+class AiModelCall(Base, TimestampMixin):
+    __tablename__ = "ai_model_calls"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    automation_reply_run_id: Mapped[str] = mapped_column(
+        ForeignKey("automation_reply_runs.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    robot_id: Mapped[str] = mapped_column(
+        ForeignKey("robots.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    trace_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

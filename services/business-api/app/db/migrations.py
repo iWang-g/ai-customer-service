@@ -39,6 +39,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "qa_match_type": "VARCHAR(32)",
             "document_retrieval_used": "BOOLEAN NOT NULL DEFAULT 0",
             "retrieval_count": "INTEGER NOT NULL DEFAULT 0",
+            "reply_generation_duration_ms": "INTEGER",
         },
     }
     inspector = inspect(engine)
@@ -235,6 +236,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 qa_match_type VARCHAR(32),
                 document_retrieval_used BOOLEAN NOT NULL DEFAULT 0,
                 retrieval_count INTEGER NOT NULL DEFAULT 0,
+                reply_generation_duration_ms INTEGER,
                 trace_id VARCHAR(128),
                 reply_message_id VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL,
                 send_task_id VARCHAR(32) REFERENCES rpa_tasks(id) ON DELETE SET NULL,
@@ -244,6 +246,27 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 updated_at DATETIME NOT NULL,
                 CONSTRAINT uq_automation_reply_run_robot_source
                     UNIQUE (robot_id, source_message_id)
+            )"""
+        ))
+        connection.execute(text(
+            """CREATE TABLE IF NOT EXISTS ai_model_calls (
+                id VARCHAR(32) PRIMARY KEY,
+                user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                automation_reply_run_id VARCHAR(32) NOT NULL
+                    REFERENCES automation_reply_runs(id) ON DELETE CASCADE,
+                robot_id VARCHAR(32) NOT NULL REFERENCES robots(id) ON DELETE CASCADE,
+                conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                trace_id VARCHAR(128),
+                stage VARCHAR(32) NOT NULL,
+                provider VARCHAR(32) NOT NULL,
+                model VARCHAR(128) NOT NULL,
+                status VARCHAR(32) NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
             )"""
         ))
         for table, index, column in (
@@ -269,5 +292,12 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             ("automation_reply_runs", "ix_automation_reply_runs_robot_id", "robot_id"),
             ("automation_reply_runs", "ix_automation_reply_runs_status", "status"),
             ("automation_reply_runs", "ix_automation_reply_runs_trace_id", "trace_id"),
+            ("ai_model_calls", "ix_ai_model_calls_user_id", "user_id"),
+            ("ai_model_calls", "ix_ai_model_calls_reply_run_id", "automation_reply_run_id"),
+            ("ai_model_calls", "ix_ai_model_calls_robot_id", "robot_id"),
+            ("ai_model_calls", "ix_ai_model_calls_conversation_id", "conversation_id"),
+            ("ai_model_calls", "ix_ai_model_calls_trace_id", "trace_id"),
+            ("ai_model_calls", "ix_ai_model_calls_model", "model"),
+            ("ai_model_calls", "ix_ai_model_calls_status", "status"),
         ):
             connection.execute(text(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({column})"))

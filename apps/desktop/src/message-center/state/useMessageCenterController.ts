@@ -4,9 +4,12 @@ import {
   connectRealtime,
   getQaImageUrl,
   getCurrentUser,
+  getMonitoringOverview,
   getStoredSession,
   listConversations,
   listMessages,
+  listMonitoringEvents,
+  listMonitoringLogs,
   login,
   logout,
   recordSentMessage,
@@ -16,9 +19,11 @@ import {
   type ApiConversation,
   type ApiMessage,
   type AuthSession,
+  type MonitoringEvent,
+  type MonitoringLog,
 } from '../../shared/api/client';
-import { MOCK_BOT, MOCK_PLATFORMS } from '../types';
-import type { Conversation, Message, Shop } from '../types';
+import { MOCK_PLATFORMS } from '../types';
+import type { BotStatus, Conversation, LogEntry, Message, Shop, StatusEvent } from '../types';
 
 type AuthMode = 'login' | 'register';
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
@@ -111,6 +116,63 @@ export function useMessageCenterController() {
   const [selectedCategory, setSelectedCategory] = useState<'all' | 'pending'>('all');
   const [selectedShop, setSelectedShop] = useState('all');
   const [isLogModalOpen, setIsLogModalOpen] = useState(false);
+  const [bot, setBot] = useState<BotStatus>({
+    model: 'deepseek-chat',
+    availableModels: ['deepseek-chat'],
+    uptime: null,
+    requestsProcessed: 0,
+    avgResponseTimeMs: null,
+    health: 0,
+  });
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
+  const [isLoadingMonitoring, setIsLoadingMonitoring] = useState(false);
+  const monitoringModelRef = useRef('deepseek-chat');
+
+  const mapMonitoringLog = (item: MonitoringLog): LogEntry => ({
+    id: item.id,
+    timestamp: item.timestamp,
+    type: item.type,
+    status: item.status,
+    message: item.message,
+    details: item.details,
+    inputTokens: item.input_tokens,
+    outputTokens: item.output_tokens,
+    durationMs: item.duration_ms,
+  });
+
+  const mapMonitoringEvent = (item: MonitoringEvent): StatusEvent => ({
+    id: item.id,
+    timestamp: item.timestamp,
+    message: item.message,
+    level: item.level,
+  });
+
+  const loadMonitoring = useCallback(async (model?: string) => {
+    setIsLoadingMonitoring(true);
+    try {
+      const [overview, logResponse, eventResponse] = await Promise.all([
+        getMonitoringOverview(model),
+        listMonitoringLogs('all'),
+        listMonitoringEvents(),
+      ]);
+      setBot({
+        model: overview.current_model,
+        availableModels: overview.available_models,
+        uptime: overview.metrics.uptime,
+        requestsProcessed: overview.metrics.request_count,
+        avgResponseTimeMs: overview.metrics.average_response_ms,
+        health: overview.metrics.success_rate,
+      });
+      monitoringModelRef.current = overview.current_model;
+      setLogs(logResponse.items.map(mapMonitoringLog));
+      setStatusEvents(eventResponse.items.map(mapMonitoringEvent));
+    } catch (error) {
+      console.error('加载模型运行数据失败:', error);
+    } finally {
+      setIsLoadingMonitoring(false);
+    }
+  }, []);
 
   const shops = useMemo<Shop[]>(() => {
     const unique = new Map<string, Shop>();
@@ -229,6 +291,7 @@ export function useMessageCenterController() {
   useEffect(() => {
     if (!session || !authReady) return;
     void loadConversationData();
+    void loadMonitoring();
   }, [authReady, session?.user.id]);
 
   useEffect(() => {
@@ -261,11 +324,20 @@ export function useMessageCenterController() {
           );
           return;
         }
-        if (event.type.startsWith('rpa.')) void loadConversationData();
+        if (event.type.startsWith('rpa.') || event.type === 'conversation.updated') void loadConversationData();
+        if (
+          event.type.startsWith('rpa.')
+          || event.type === 'conversation.updated'
+          || event.type === 'automation.reply.completed'
+        ) void loadMonitoring(monitoringModelRef.current);
       },
       setConnectionStatus,
     );
-  }, [authReady, loadConversationData, session?.access_token]);
+  }, [authReady, loadConversationData, loadMonitoring, session?.access_token]);
+
+  const handleMonitoringModelChange = useCallback((model: string) => {
+    void loadMonitoring(model);
+  }, [loadMonitoring]);
 
   const filteredConversations = useMemo(() => {
     let filtered = conversations;
@@ -403,7 +475,12 @@ export function useMessageCenterController() {
     isLoadingMessages,
     dataError,
     connectionStatus,
-    bot: MOCK_BOT,
+    bot,
+    logs,
+    statusEvents,
+    isLoadingMonitoring,
+    handleMonitoringModelChange,
+    loadMonitoring,
     handleLogin,
     handleRegister,
     handleLogout,

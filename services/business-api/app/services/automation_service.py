@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -32,6 +33,7 @@ from app.services.email_workflow_service import (
     template_metadata,
 )
 from app.services.message_service import create_send_task
+from app.services.model_call_service import persist_model_calls
 from app.services.robot_service import serialize_robot
 
 
@@ -248,6 +250,7 @@ async def _execute_bound_reply(
         else:
             result = sandbox_email_result(message=message, templates=email_template_rows)
     else:
+        generation_started = monotonic()
         result = await _decide_reply(
             settings=settings, message=message, history=history,
             platform=conversation.platform_code,
@@ -256,6 +259,9 @@ async def _execute_bound_reply(
             robot_read=robot_read, ai_config=ai_config,
             auto_send_allowed=auto_send_allowed,
             email_templates=template_metadata(email_template_rows),
+        )
+        result["reply_generation_duration_ms"] = max(
+            0, round((monotonic() - generation_started) * 1000)
         )
         intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
         action_plan = result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}
@@ -421,12 +427,33 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
         persisted_run.document_retrieval_used = bool(retrieval)
         persisted_run.retrieval_count = len(retrieval)
         persisted_run.trace_id = str(result.get("trace_id") or "") or None
+        model_call_details = persist_model_calls(
+            db, user, persisted_run, robot, conversation, result
+        )
         persisted_run.send_task_id = task_id
         if task_id:
             send_task = db.get(RpaTask, task_id)
             persisted_run.reply_message_id = send_task.message_id if send_task else None
         persisted_run.completed_at = utcnow()
         db.commit()
+        from app.services.realtime import realtime_manager
+
+        await realtime_manager.broadcast(
+            user.id,
+            {
+                "type": "automation.reply.completed",
+                "reply_run_id": persisted_run.id,
+                "conversation_id": conversation.id,
+                "model": next(
+                    (
+                        str(item.get("model"))
+                        for item in reversed(model_call_details)
+                        if isinstance(item, dict) and item.get("model")
+                    ),
+                    "",
+                ),
+            },
+        )
     return result
 
 

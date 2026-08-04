@@ -11,9 +11,10 @@ import type {
   BotStatus,
   DesktopWindow,
   LogEntry,
+  StatusEvent,
 } from '../shared/types';
 
-export type { Platform, Message, Conversation, Shop, BotStatus, DesktopWindow, LogEntry };
+export type { Platform, Message, Conversation, Shop, BotStatus, DesktopWindow, LogEntry, StatusEvent };
 
 export const MOCK_SHOPS: Shop[] = [
   { id: 'all', name: '全部门店' },
@@ -111,22 +112,3 @@ export const MOCK_DESKTOP_WINDOWS: DesktopWindow[] = [
   { id: 'w4', title: '小红书专业号后台 - 社区团购店 C', platform: 'xiaohongshu', shopName: '社区团购店 C', associatedConversationId: '4' },
   { id: 'w5', title: '快手小店工作台 - 海外代购店 B', platform: 'kuaishou', shopName: '海外代购店 B', associatedConversationId: '5' },
 ];
-
-export const MOCK_LOGS: LogEntry[] = [
-  { id: 'l1', timestamp: '14:22:10', type: 'reply', message: '已自动回复张伟：是的，旗舰店 A 目前有现货。', details: 'Model: Gemini 1.5 Pro' },
-  { id: 'l2', timestamp: '14:22:11', type: 'token', message: 'Token 调用', tokens: 154, details: 'Input: 45, Output: 109' },
-  { id: 'l3', timestamp: '14:20:05', type: 'system', message: '上下文窗口已刷新', details: 'Session: conv_1' },
-  { id: 'l4', timestamp: '14:15:30', type: 'reply', message: '已自动回复小李：快递预计于明天下午送达。' },
-  { id: 'l5', timestamp: '14:15:31', type: 'token', message: 'Token 调用', tokens: 89, details: 'Input: 32, Output: 57' },
-  { id: 'l6', timestamp: '14:10:12', type: 'system', message: '检测到模型延迟 1.4s', details: 'Region: asia-east1' },
-];
-
-export const MOCK_BOT: BotStatus = {
-  name: 'OmniHelper v2',
-  model: 'Gemini 1.5 Pro',
-  status: 'online',
-  uptime: '15d 4h 22m',
-  requestsProcessed: 12450,
-  avgResponseTime: '1.2s',
-  health: 98,
-};

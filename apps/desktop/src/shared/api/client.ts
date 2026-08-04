@@ -163,6 +163,42 @@ export interface DashboardAnalytics {
   updated_at: string;
 }
 
+export interface MonitoringOverview {
+  current_model: string;
+  available_models: string[];
+  metrics: {
+    model: string;
+    period: 'today';
+    uptime: string | null;
+    request_count: number;
+    success_rate: number;
+    average_response_ms: number | null;
+  };
+  updated_at: string;
+}
+
+export interface MonitoringLog {
+  id: string;
+  timestamp: string;
+  type: 'reply' | 'token';
+  status: string;
+  message: string;
+  details: string;
+  model: string;
+  stage: string;
+  input_tokens: number;
+  output_tokens: number;
+  duration_ms: number | null;
+}
+
+export interface MonitoringEvent {
+  id: string;
+  timestamp: string;
+  type: string;
+  level: 'info' | 'success' | 'warning' | 'error';
+  message: string;
+}
+
 export interface TestReplyMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -699,6 +735,21 @@ export function recordSentMessage(
       platform_message_id: platformMessageId || null,
     }),
   });
+}
+
+export function getMonitoringOverview(model?: string): Promise<MonitoringOverview> {
+  const query = model ? `?model=${encodeURIComponent(model)}` : '';
+  return apiRequest<MonitoringOverview>(`/monitoring/overview${query}`);
+}
+
+export function listMonitoringLogs(
+  type: 'all' | 'reply' | 'token' = 'all',
+): Promise<{ items: MonitoringLog[] }> {
+  return apiRequest<{ items: MonitoringLog[] }>(`/monitoring/logs?type=${type}&limit=100`);
+}
+
+export function listMonitoringEvents(): Promise<{ items: MonitoringEvent[] }> {
+  return apiRequest<{ items: MonitoringEvent[] }>('/monitoring/events?limit=10');
 }
 
 export function connectRealtime(

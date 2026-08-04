@@ -14,6 +14,7 @@ from app.api.routes.conversations import router as conversations_router
 from app.api.routes.email import router as email_router
 from app.api.routes.health import router as health_router
 from app.api.routes.messages import router as messages_router
+from app.api.routes.monitoring import router as monitoring_router
 from app.api.routes.platform_accounts import router as platform_accounts_router
 from app.api.routes.rpa import router as rpa_router
 from app.api.routes.robots import router as robots_router
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations_router, prefix=settings.api_prefix)
     app.include_router(email_router, prefix=settings.api_prefix)
     app.include_router(messages_router, prefix=settings.api_prefix)
+    app.include_router(monitoring_router, prefix=settings.api_prefix)
     app.include_router(platform_accounts_router, prefix=settings.api_prefix)
     app.include_router(robots_router, prefix=settings.api_prefix)
     app.include_router(settings_router, prefix=settings.api_prefix)
