@@ -22,16 +22,20 @@ class ReplyRequest(BaseModel):
 
 IntentName = Literal[
     "qa_match",
+    "direct_reply",
     "normal_question",
     "email_link_request",
-    "no_reply_needed",
     "human_handoff",
     "unknown",
 ]
 
+ReplyRoute = Literal["direct", "retrieve_product", "email_workflow", "human_handoff"]
+
 
 class IntentDecision(BaseModel):
     intent: IntentName
+    reply_route: ReplyRoute = "retrieve_product"
+    direct_reply_text: str = ""
     confidence: float = Field(ge=0, le=1)
     need_customer_reply: bool = True
     need_doc_search: bool = False
@@ -56,7 +60,7 @@ class ActionPlan(BaseModel):
 
 
 class ReplyResponse(BaseModel):
-    decision: Literal["auto_send", "suggest", "needs_human", "no_reply"]
+    decision: Literal["auto_send", "suggest", "needs_human"]
     text: str
     media: list[dict[str, Any]] = Field(default_factory=list)
     intent: IntentDecision
@@ -65,6 +69,13 @@ class ReplyResponse(BaseModel):
     risk_flags: list[str] = Field(default_factory=list)
     qa_match: dict[str, Any] | None = None
     retrieval: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_status: Literal[
+        "not_needed",
+        "hit",
+        "empty",
+        "unavailable",
+        "no_product_base",
+    ] = "not_needed"
     model_calls: dict[str, str] = Field(default_factory=dict)
     provider: str
     trace_id: str

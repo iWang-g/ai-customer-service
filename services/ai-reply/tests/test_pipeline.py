@@ -9,8 +9,15 @@ from app.schemas import ReplyRequest
 
 
 def intent_json(intent: str = "normal_question", **overrides: object) -> str:
+    route = {
+        "direct_reply": "direct",
+        "email_link_request": "email_workflow",
+        "human_handoff": "human_handoff",
+    }.get(intent, "retrieve_product")
     payload = {
         "intent": intent,
+        "reply_route": route,
+        "direct_reply_text": "",
         "confidence": 0.9,
         "need_customer_reply": True,
         "need_doc_search": intent == "normal_question",
@@ -47,6 +54,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_generation_system_prompt_contains_bound_tone_persona(self) -> None:
         request = ReplyRequest(
             message="商品有现货吗",
+            product_base_ids=["product-1"],
             tone_base_id="tone-1",
             reply_config={
                 "base_style": "随和",
@@ -64,6 +72,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[{"snippet": "商品有现货"}])),
             patch(
                 "app.pipeline.get_knowledge_base",
                 AsyncMock(return_value={
@@ -240,15 +249,15 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.intent.template_id, "")
         self.assertEqual(result.intent.template_key, "")
 
-    async def test_no_reply_intent_returns_without_second_model_call(self) -> None:
+    async def test_direct_reply_intent_returns_first_model_text_without_second_model_call(self) -> None:
         request = ReplyRequest(message="好的，谢谢")
         provider = AsyncMock(
             return_value=(
                 intent_json(
-                    "no_reply_needed",
-                    need_customer_reply=False,
+                    "direct_reply",
+                    direct_reply_text="不客气亲亲，很高兴能帮到您～",
                     need_doc_search=False,
-                    next_action="finish_without_reply",
+                    next_action="send_direct_reply",
                 ),
                 "deepseek",
             )
@@ -256,14 +265,71 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.pipeline.generate_with_provider", provider):
             result = await build_reply(request)
 
-        self.assertEqual(result.decision, "no_reply")
-        self.assertEqual(result.text, "")
+        self.assertEqual(result.decision, "suggest")
+        self.assertEqual(result.text, "不客气亲亲，很高兴能帮到您～")
+        self.assertEqual(result.retrieval_status, "not_needed")
+        self.assertEqual(provider.await_count, 1)
+
+    async def test_product_question_cannot_use_direct_route(self) -> None:
+        request = ReplyRequest(message="这个键帽能装我的键盘吗", product_base_ids=["product-1"])
+        provider = AsyncMock(return_value=(intent_json(
+            "direct_reply", direct_reply_text="可以安装", confidence=0.99,
+        ), "deepseek"))
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[{"snippet": "商品有现货"}])),
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[])) as search_mock,
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.intent.intent, "normal_question")
+        self.assertEqual(result.retrieval_status, "empty")
+        self.assertEqual(result.model_calls["generation"], "skipped-no-retrieval")
+        search_mock.assert_awaited_once()
+
+    async def test_product_route_without_bound_base_reports_configuration_gap(self) -> None:
+        provider = AsyncMock(return_value=(intent_json(), "deepseek"))
+        with patch("app.pipeline.generate_with_provider", provider):
+            result = await build_reply(ReplyRequest(message="商品有什么规格"))
+
+        self.assertEqual(result.retrieval_status, "no_product_base")
+        self.assertEqual(result.model_calls["generation"], "skipped-no-retrieval")
+        self.assertEqual(provider.await_count, 1)
+
+    async def test_retrieval_failure_is_distinct_from_empty_result(self) -> None:
+        provider = AsyncMock(return_value=(intent_json(), "deepseek"))
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.search_documents", AsyncMock(side_effect=RuntimeError("offline"))),
+        ):
+            result = await build_reply(ReplyRequest(
+                message="商品有什么规格", product_base_ids=["product-1"],
+            ))
+
+        self.assertEqual(result.retrieval_status, "unavailable")
+        self.assertEqual(result.model_calls["generation"], "skipped-no-retrieval")
+
+    async def test_human_handoff_sends_acknowledgement_without_second_model_call(self) -> None:
+        provider = AsyncMock(return_value=(intent_json(
+            "human_handoff",
+            direct_reply_text="好的亲亲，正在为您转接人工客服，请稍等～",
+        ), "deepseek"))
+        with patch("app.pipeline.generate_with_provider", provider):
+            result = await build_reply(ReplyRequest(message="转人工", allow_auto_send=True))
+
+        self.assertEqual(result.decision, "auto_send")
+        self.assertEqual(result.intent.reply_route, "human_handoff")
+        self.assertTrue(result.text)
+        self.assertIn("mark_needs_human", result.action_plan.required_actions)
         self.assertEqual(provider.await_count, 1)
 
     async def test_intent_parse_failure_uses_local_fallback_then_generates(self) -> None:
-        request = ReplyRequest(message="普通咨询")
+        request = ReplyRequest(message="普通咨询", product_base_ids=["product-1"])
         provider = AsyncMock(side_effect=[("not-json", "deepseek"), ("生成回复", "deepseek")])
-        with patch("app.pipeline.generate_with_provider", provider):
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[{"snippet": "知识片段"}])),
+        ):
             result = await build_reply(request)
 
         self.assertEqual(result.intent.intent, "normal_question")
