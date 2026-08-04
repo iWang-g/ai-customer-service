@@ -23,6 +23,8 @@ interface MessageCenterWorkspaceProps {
   selectedShop: string;
   shops: Shop[];
   onShopSelect: (id: string) => void;
+  conversationSearch: string;
+  onConversationSearchChange: (value: string) => void;
   onOpenImportModal: () => void;
   selectedConversation?: Conversation;
   isLoadingMessages: boolean;
@@ -63,6 +65,8 @@ export default function MessageCenterWorkspace({
   selectedShop,
   shops,
   onShopSelect,
+  conversationSearch,
+  onConversationSearchChange,
   onOpenImportModal,
   selectedConversation,
   isLoadingMessages,
@@ -111,6 +115,8 @@ export default function MessageCenterWorkspace({
           selectedShop={selectedShop}
           shops={shops}
           onShopSelect={onShopSelect}
+          searchTerm={conversationSearch}
+          onSearchTermChange={onConversationSearchChange}
           onOpenImportModal={onOpenImportModal}
           onClearHumanRequired={onClearHumanRequired}
           lang={lang}

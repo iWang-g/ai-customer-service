@@ -42,6 +42,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     platform: 'qianniu',
     platformName: '千牛',
     status: 'pending',
+    awaitingReply: true,
     time: '14:20',
     messages: [
       { id: 'm1', sender: 'user', content: '医生，这个还有货吗？', timestamp: '14:20' },
@@ -56,6 +57,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     platform: 'douyin',
     platformName: '抖音',
     status: 'pending',
+    awaitingReply: true,
     time: '12:05',
     messages: [
       { id: 'm4', sender: 'user', content: '视频里的同款链接在哪里？', timestamp: '12:05' },
@@ -70,6 +72,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     platform: 'pinduoduo',
     platformName: '拼多多',
     status: 'active',
+    awaitingReply: true,
     time: '10:15',
     messages: [
       { id: 'm5', sender: 'user', content: '快递什么时候到？', timestamp: '10:15' },
@@ -84,6 +87,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     platform: 'xiaohongshu',
     platformName: '小红书',
     status: 'pending',
+    awaitingReply: true,
     time: '09:30',
     messages: [
       { id: 'm8', sender: 'user', content: '真的好用吗？看很多人推荐', timestamp: '09:30' },
@@ -98,6 +102,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     platform: 'kuaishou',
     platformName: '快手',
     status: 'resolved',
+    awaitingReply: true,
     time: '昨天',
     messages: [
       { id: 'm9', sender: 'user', content: '谢谢老板', timestamp: '昨天' },

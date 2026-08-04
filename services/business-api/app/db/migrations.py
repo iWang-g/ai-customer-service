@@ -32,6 +32,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "time_label": "VARCHAR(64)",
         },
         "conversations": {
+            "awaiting_reply": "BOOLEAN NOT NULL DEFAULT 0",
             "human_required": "BOOLEAN NOT NULL DEFAULT 0",
             "human_required_reason": "VARCHAR(64)",
             "human_required_word": "VARCHAR(128)",
@@ -50,6 +51,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
     }
     inspector = inspect(engine)
     with engine.begin() as connection:
+        added_columns: set[tuple[str, str]] = set()
         for table_name, columns in additions.items():
             if not inspector.has_table(table_name):
                 continue
@@ -59,6 +61,19 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                     connection.execute(
                         text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {definition}')
                     )
+                    added_columns.add((table_name, column_name))
+
+        if ("conversations", "awaiting_reply") in added_columns:
+            connection.execute(text(
+                """UPDATE conversations
+                SET awaiting_reply = CASE WHEN (
+                    SELECT sender_role FROM messages
+                    WHERE messages.conversation_id = conversations.id
+                    ORDER BY COALESCE(platform_sent_at, observed_at, sent_at) DESC,
+                             created_at DESC, id DESC
+                    LIMIT 1
+                ) = 'customer' THEN 1 ELSE 0 END"""
+            ))
 
         connection.execute(
             text(
@@ -100,6 +115,12 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_conversations_human_required "
                 "ON conversations (human_required)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_conversations_awaiting_reply "
+                "ON conversations (awaiting_reply)"
             )
         )
         connection.execute(

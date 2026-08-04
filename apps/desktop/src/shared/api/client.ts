@@ -40,6 +40,7 @@ export interface ApiConversation {
   latest_message_at: string | null;
   unread_count: number;
   status: string;
+  awaiting_reply: boolean;
   human_required: boolean;
   human_required_reason: string | null;
   human_required_word: string | null;

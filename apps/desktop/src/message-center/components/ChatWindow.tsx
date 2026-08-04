@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { Conversation } from '../types';
 import CustomerAvatar from './CustomerAvatar';
+import DevelopmentNotice from './DevelopmentNotice';
 
 interface ChatWindowProps {
   conversation?: Conversation;
@@ -32,6 +33,7 @@ export default function ChatWindow({ conversation, isLoading, error, onSendMessa
   const [sendNotice, setSendNotice] = useState('');
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [failedImages, setFailedImages] = useState<Set<string>>(() => new Set());
+  const [developmentNotice, setDevelopmentNotice] = useState({ trigger: 0, message: '' });
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeMessages = conversation?.messages ?? [];
 
@@ -243,7 +245,13 @@ export default function ChatWindow({ conversation, isLoading, error, onSendMessa
         {sendError && <p className="max-w-4xl mx-auto mb-2 text-xs font-semibold text-rose-600">{sendError}</p>}
         {sendNotice && <p className="max-w-4xl mx-auto mb-2 text-xs font-semibold text-emerald-600">{sendNotice}</p>}
         <div className="flex items-end gap-3 max-w-4xl mx-auto bg-slate-50 border border-slate-100 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-brand-active/10 focus-within:border-brand-active transition-all">
-          <button className="p-2.5 hover:bg-slate-200 rounded-xl transition-colors text-slate-400" id="attach-btn">
+          <button
+            type="button"
+            onClick={() => setDevelopmentNotice((current) => ({ trigger: current.trigger + 1, message: '链接功能开发中' }))}
+            className="p-2.5 hover:bg-slate-200 rounded-xl transition-colors text-slate-400"
+            id="attach-btn"
+            aria-label="添加链接"
+          >
             <Paperclip size={18} />
           </button>
           <textarea
@@ -260,7 +268,13 @@ export default function ChatWindow({ conversation, isLoading, error, onSendMessa
             }}
             id="chat-input"
           />
-          <button className="p-2.5 hover:bg-slate-200 rounded-xl transition-colors text-slate-400" id="emoji-btn">
+          <button
+            type="button"
+            onClick={() => setDevelopmentNotice((current) => ({ trigger: current.trigger + 1, message: '表情功能开发中' }))}
+            className="p-2.5 hover:bg-slate-200 rounded-xl transition-colors text-slate-400"
+            id="emoji-btn"
+            aria-label="添加表情"
+          >
             <Smile size={18} />
           </button>
           <button 
@@ -280,6 +294,7 @@ export default function ChatWindow({ conversation, isLoading, error, onSendMessa
            由 AI 智能分流系统处理中
         </p>
       </div>
+      <DevelopmentNotice trigger={developmentNotice.trigger} message={developmentNotice.message} />
     </div>
   );
 }

@@ -57,6 +57,7 @@ def seed_demo_conversations(db: Session, user: User) -> None:
             latest_message_at=latest_at,
             unread_count=sample["unread_count"],
             status=sample["status"],
+            awaiting_reply=latest_role == "customer",
             metadata_json={"shop_name": sample["shop_name"], "demo": True},
         )
         db.add(conversation)

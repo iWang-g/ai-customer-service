@@ -62,6 +62,8 @@ export default function App() {
       selectedShop={controller.selectedShop}
       shops={controller.shops}
       onShopSelect={controller.setSelectedShop}
+      conversationSearch={controller.conversationSearch}
+      onConversationSearchChange={controller.setConversationSearch}
       onOpenImportModal={controller.openImportModal}
       selectedConversation={controller.selectedConversation}
       isLoadingMessages={controller.isLoadingMessages}

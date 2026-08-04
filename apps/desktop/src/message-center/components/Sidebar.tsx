@@ -8,7 +8,8 @@ import { motion } from 'framer-motion';
 import { 
   Search,
   Plus,
-  ChevronDown
+  ChevronDown,
+  X,
 } from 'lucide-react';
 import type { Conversation, Shop } from '../types';
 import CustomerAvatar from './CustomerAvatar';
@@ -24,6 +25,8 @@ interface SidebarProps {
   selectedShop: string;
   shops: Shop[];
   onShopSelect: (id: string) => void;
+  searchTerm: string;
+  onSearchTermChange: (value: string) => void;
   onOpenImportModal: () => void;
   onClearHumanRequired: (conversationId: string) => Promise<void>;
   lang: 'zh' | 'en';
@@ -40,6 +43,8 @@ export default function Sidebar({
   selectedShop,
   shops,
   onShopSelect,
+  searchTerm,
+  onSearchTermChange,
   onOpenImportModal,
   onClearHumanRequired,
   lang
@@ -67,6 +72,8 @@ export default function Sidebar({
       searchPlaceholder: '搜索回复、用户...',
       allMsg: '全部消息',
       pendingMsg: '待处理',
+      searchEmptyTitle: '未找到匹配的会话',
+      searchEmptySub: '请尝试搜索其他客户、消息、门店或平台',
     },
     en: {
       title: 'Messages',
@@ -75,6 +82,8 @@ export default function Sidebar({
       searchPlaceholder: 'Search replies, users...',
       allMsg: 'All Messages',
       pendingMsg: 'Pending',
+      searchEmptyTitle: 'No matching conversations',
+      searchEmptySub: 'Try another customer, message, shop, or platform',
     }
   }[lang];
 
@@ -171,9 +180,22 @@ export default function Sidebar({
           <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input 
             type="text" 
-            placeholder="搜索回复、用户..." 
-            className="w-full pl-9 pr-4 py-2 bg-white border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-active/20 focus:border-brand-active transition-all"
+            value={searchTerm}
+            onChange={(event) => onSearchTermChange(event.target.value)}
+            placeholder={t.searchPlaceholder}
+            aria-label={t.searchPlaceholder}
+            className="w-full pl-9 pr-9 py-2 bg-white border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-active/20 focus:border-brand-active transition-all"
           />
+          {searchTerm && (
+            <button
+              type="button"
+              onClick={() => onSearchTermChange('')}
+              aria-label={lang === 'zh' ? '清除会话搜索' : 'Clear conversation search'}
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+            >
+              <X size={13} />
+            </button>
+          )}
         </div>
       </div>
 
@@ -224,11 +246,19 @@ export default function Sidebar({
                 </span>
               )}
             </div>
-            {conv.status === 'pending' && (
+            {conv.awaitingReply && (
               <div className="w-2 h-2 rounded-full bg-brand-active mt-3 flex-shrink-0 shadow-[0_0_8px_rgba(14,165,233,0.5)]" />
             )}
           </motion.button>
-        )) : (
+        )) : searchTerm.trim() ? (
+          <div className="flex-1 px-6 py-16 text-center" id="sidebar-search-empty-state">
+            <Search size={28} className="mx-auto text-slate-300" />
+            <h3 className="mt-4 text-[15px] font-bold text-slate-700">{t.searchEmptyTitle}</h3>
+            <p className="mt-2 text-[11px] font-medium leading-relaxed text-slate-400">
+              {t.searchEmptySub}
+            </p>
+          </div>
+        ) : (
           <div className="flex-1 flex flex-col items-center justify-center py-16 px-6 text-center" id="sidebar-empty-state">
             <motion.button
               whileHover={{ scale: 1.05 }}

@@ -91,6 +91,7 @@ function mapConversation(conversation: ApiConversation, existingMessages: Messag
     platform: conversation.platform_code,
     platformName,
     status,
+    awaitingReply: conversation.awaiting_reply,
     humanRequired: conversation.human_required,
     humanRequiredReason: conversation.human_required_reason,
     humanRequiredWord: conversation.human_required_word,
@@ -119,6 +120,7 @@ export function useMessageCenterController() {
   const [selectedPlatform, setSelectedPlatform] = useState('all');
   const [selectedCategory, setSelectedCategory] = useState<'all' | 'pending'>('all');
   const [selectedShop, setSelectedShop] = useState('all');
+  const [conversationSearch, setConversationSearch] = useState('');
   const [isLogModalOpen, setIsLogModalOpen] = useState(false);
   const [bot, setBot] = useState<BotStatus>({
     model: 'deepseek-chat',
@@ -349,17 +351,37 @@ export function useMessageCenterController() {
       filtered = filtered.filter((conversation) => conversation.platform === selectedPlatform);
     }
     if (selectedCategory === 'pending') {
-      filtered = filtered.filter((conversation) => conversation.status === 'pending' || conversation.humanRequired);
+      filtered = filtered.filter((conversation) => conversation.awaitingReply);
     }
     if (selectedShop !== 'all') {
       filtered = filtered.filter((conversation) => conversation.shopId === selectedShop);
     }
+    const keyword = conversationSearch.trim().toLocaleLowerCase();
+    if (keyword) {
+      filtered = filtered.filter((conversation) => [
+        conversation.userName,
+        conversation.lastMessage,
+        conversation.shopName,
+        conversation.platformName,
+      ].some((value) => value.toLocaleLowerCase().includes(keyword)));
+    }
     return filtered;
-  }, [conversations, selectedCategory, selectedPlatform, selectedShop]);
+  }, [conversationSearch, conversations, selectedCategory, selectedPlatform, selectedShop]);
+
+  useEffect(() => {
+    if (filteredConversations.some((conversation) => conversation.id === selectedIdRef.current)) return;
+    const nextId = filteredConversations[0]?.id || '';
+    if (nextId) {
+      void loadMessagesForConversation(nextId);
+      return;
+    }
+    selectedIdRef.current = '';
+    setSelectedId('');
+  }, [filteredConversations, loadMessagesForConversation]);
 
   const selectedConversation = useMemo(
-    () => conversations.find((conversation) => conversation.id === selectedId),
-    [conversations, selectedId],
+    () => filteredConversations.find((conversation) => conversation.id === selectedId),
+    [filteredConversations, selectedId],
   );
 
   const handleLogin = async (username: string, password: string) => {
@@ -409,6 +431,7 @@ export function useMessageCenterController() {
               ...conversation,
               lastMessage: nextMessage.content,
               time: nextMessage.timestamp,
+              awaitingReply: false,
               messages: conversation.messages.some((message) => message.id === nextMessage.id)
                 ? conversation.messages
                 : [...conversation.messages, nextMessage],
@@ -480,6 +503,7 @@ export function useMessageCenterController() {
     selectedPlatform,
     selectedCategory,
     selectedShop,
+    conversationSearch,
     shops,
     isLogModalOpen,
     filteredConversations,
@@ -507,9 +531,13 @@ export function useMessageCenterController() {
     setCurrentView,
     setIsImportModalOpen,
     setSelectedId: (id: string) => void loadMessagesForConversation(id),
-    setSelectedPlatform,
+    setSelectedPlatform: (platform: string) => {
+      setSelectedShop('all');
+      setSelectedPlatform(platform);
+    },
     setSelectedCategory,
     setSelectedShop,
+    setConversationSearch,
     setIsLogModalOpen,
   };
 }

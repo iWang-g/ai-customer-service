@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
-from app.models import Base, Message, RpaNode, User
+from app.models import Base, Conversation, Message, RpaNode, User
 from app.schemas.rpa import RpaEventCreate
 from app.services.rpa_service import create_event
 
@@ -158,6 +158,38 @@ class RpaMessageDedupTests(unittest.TestCase):
         self.assertIsNotNone(message)
         self.assertEqual(message.platform_sent_at, datetime(2026, 7, 31, 2, 40, 0))
         self.assertEqual(message.sent_at, datetime(2026, 7, 31, 2, 49, 42))
+
+    def test_latest_sender_controls_awaiting_reply(self) -> None:
+        create_event(
+            self.db,
+            self.user,
+            self.node,
+            self.event("event-customer", 0, platform_message_id="customer-message"),
+        )
+        conversation = self.db.scalar(select(Conversation))
+        self.assertIsNotNone(conversation)
+        self.assertTrue(conversation.awaiting_reply)
+
+        agent_event = self.event(
+            "event-agent",
+            1,
+            platform_message_id="agent-message",
+            snapshot_id="snapshot-agent",
+            platform_sent_at="2026-07-31T03:00:00.000Z",
+            observed_at="2026-07-31T03:00:01.000Z",
+        ).model_copy(update={
+            "event_type": "message_sent",
+            "payload_json": {
+                "content": "agent reply",
+                "sender_role": "agent",
+                "platform_sent_at": "2026-07-31T03:00:00.000Z",
+                "observed_at": "2026-07-31T03:00:01.000Z",
+            },
+        })
+        create_event(self.db, self.user, self.node, agent_event)
+
+        self.db.refresh(conversation)
+        self.assertFalse(conversation.awaiting_reply)
 
 
 if __name__ == "__main__":

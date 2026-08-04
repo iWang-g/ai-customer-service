@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, desc, or_, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -134,6 +134,8 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
     if conversation:
         conversations.append(conversation)
     message, is_new_reply_source = _upsert_message_from_event(db, user.id, conversation, request)
+    if conversation and message:
+        _refresh_awaiting_reply(db, conversation)
     if message and is_new_reply_source:
         messages.append(message)
 
@@ -233,6 +235,29 @@ def _payload_unread_count(payload: dict[str, Any]) -> int | None:
         return max(0, min(int(payload.get("unread_count") or 0), 9999))
     except (TypeError, ValueError):
         return None
+
+
+def _refresh_awaiting_reply(db: Session, conversation: Conversation) -> None:
+    latest_sender = db.scalar(
+        select(Message.sender_role)
+        .where(
+            Message.conversation_id == conversation.id,
+            Message.message_status == "sent",
+        )
+        .order_by(
+            desc(func.coalesce(
+                Message.platform_sent_at,
+                Message.observed_at,
+                Message.sent_at,
+                Message.created_at,
+            )),
+            desc(Message.created_at),
+            desc(Message.id),
+        )
+        .limit(1)
+    )
+    conversation.awaiting_reply = latest_sender == "customer"
+    db.add(conversation)
 
 
 def _payload_datetime(payload: dict[str, Any], key: str) -> datetime | None:
@@ -515,6 +540,10 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
             if request.result_json.get("platform_message_id"):
                 message.platform_message_id = request.result_json["platform_message_id"]
             db.add(message)
+            if message.message_status == "sent":
+                conversation = db.get(Conversation, task.conversation_id)
+                if conversation:
+                    _refresh_awaiting_reply(db, conversation)
     if (
         request.status == "completed"
         and not was_completed

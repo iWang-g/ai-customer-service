@@ -24,6 +24,7 @@ class ConversationRead(BaseModel):
     latest_message_at: datetime | None = None
     unread_count: int
     status: str
+    awaiting_reply: bool = False
     human_required: bool = False
     human_required_reason: str | None = None
     human_required_word: str | None = None

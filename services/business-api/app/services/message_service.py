@@ -284,6 +284,7 @@ def record_sent_message(
     conversation.latest_message_text = request.content
     conversation.latest_message_at = now
     conversation.status = "active"
+    conversation.awaiting_reply = False
     db.add(conversation)
     db.commit()
     db.refresh(message)

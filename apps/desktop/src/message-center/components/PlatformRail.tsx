@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 import customerServiceAvatar from '../../shared/assets/customer-service-avatar.svg';
+import DevelopmentNotice from './DevelopmentNotice';
 
 interface PlatformRailProps {
   selectedPlatform: string;
@@ -65,6 +66,7 @@ const railPlatforms = [
 
 export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpenAdmin, onLogout, userName, userId, userRole, lang }: PlatformRailProps) {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [developmentNoticeTrigger, setDevelopmentNoticeTrigger] = useState(0);
 
   const t = {
     zh: {
@@ -160,7 +162,13 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
           </div>
         </button>
 
-        <button className="p-2.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-xl transition-all group relative">
+        <button
+          type="button"
+          onClick={() => setDevelopmentNoticeTrigger((current) => current + 1)}
+          className="p-2.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-xl transition-all group relative"
+          id="assistant-settings-btn"
+          aria-label={t.settings}
+        >
           <Settings size={20} />
           <div className="absolute left-full ml-4 px-2.5 py-1.5 bg-slate-900 text-white text-[10px] rounded-lg opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap z-50 transition-all font-bold uppercase tracking-wider shadow-2xl translate-x-[-4px] group-hover:translate-x-0">
             {t.settings}
@@ -219,6 +227,10 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
           </AnimatePresence>
         </div>
       </div>
+      <DevelopmentNotice
+        trigger={developmentNoticeTrigger}
+        message={lang === 'zh' ? '设置助手功能开发中' : 'Assistant settings are under development'}
+      />
     </div>
   );
 }

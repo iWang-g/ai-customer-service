@@ -26,6 +26,7 @@ class RpaReplyBundleTests(unittest.TestCase):
             user_id=self.user.id,
             platform_code="pinduoduo",
             external_conversation_id="customer-1",
+            awaiting_reply=True,
         )
         self.db.add(self.conversation)
         self.db.flush()
@@ -73,6 +74,8 @@ class RpaReplyBundleTests(unittest.TestCase):
         self.db.refresh(self.message)
         self.assertEqual(image_tasks, 0)
         self.assertEqual(self.message.message_status, "sent")
+        self.db.refresh(self.conversation)
+        self.assertFalse(self.conversation.awaiting_reply)
         image_messages = list(self.db.scalars(
             select(Message).where(
                 Message.conversation_id == self.conversation.id,
@@ -120,6 +123,22 @@ class RpaReplyBundleTests(unittest.TestCase):
             )
         )
         self.assertEqual(image_message_count, 0)
+        self.db.refresh(self.conversation)
+        self.assertFalse(self.conversation.awaiting_reply)
+
+    def test_failed_reply_keeps_conversation_awaiting_reply(self) -> None:
+        complete_task(
+            self.db,
+            self.task,
+            TaskCompleteRequest(
+                status="failed",
+                result_json={"text_sent": False},
+                error_message="Text send failed",
+            ),
+        )
+
+        self.db.refresh(self.conversation)
+        self.assertTrue(self.conversation.awaiting_reply)
 
 
 if __name__ == "__main__":
