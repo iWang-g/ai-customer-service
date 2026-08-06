@@ -19,3 +19,4 @@ services/*/.deps/
 services/*/.tmp/
 *.pyc
 *.db
+~$*
