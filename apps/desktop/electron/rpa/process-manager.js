@@ -56,7 +56,7 @@ export class RpaProcessManager extends EventEmitter {
       account_name: account.platformAccountName || account.alias,
       login_status: account.paused || account.archivedAt
         ? 'paused'
-        : account.loginStatus || 'unknown',
+        : account.loginStatus === 'account_mismatch' ? 'error' : account.loginStatus || 'unknown',
     }));
     this.#send({ type: 'sync_accounts', accounts: this.accounts });
   }

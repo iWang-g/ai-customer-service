@@ -51,9 +51,38 @@ function cleanConversation(conversation) {
     unread_count: Math.max(0, Math.min(Number(conversation.unread_count) || 0, 9999)),
     avatar_url: cleanText(conversation.avatar_url, 1000),
     active: Boolean(conversation.active),
+    customer_orders: cleanOrdersSnapshot(conversation.customer_orders),
     messages: Array.isArray(conversation.messages)
       ? conversation.messages.slice(-200).map(cleanMessage).filter(Boolean)
       : [],
+  };
+}
+
+function cleanOrdersSnapshot(value) {
+  if (!value || typeof value !== 'object') return null;
+  const allowed = ['success', 'empty', 'unavailable'];
+  const collectionStatus = allowed.includes(value.collection_status)
+    ? value.collection_status
+    : 'unavailable';
+  return {
+    collection_status: collectionStatus,
+    observed_at: cleanText(value.observed_at, 64),
+    orders: Array.isArray(value.orders) ? value.orders.slice(0, 100).map((order) => ({
+      platform_order_id: cleanId(order?.platform_order_id),
+      raw_status: cleanText(order?.raw_status, 128) || '',
+      status: cleanText(order?.status, 32) || 'unknown',
+      ordered_at: cleanText(order?.ordered_at, 64),
+      products: Array.isArray(order?.products) ? order.products.slice(0, 50) : [],
+      order_amount: Number.isFinite(order?.order_amount) ? order.order_amount : null,
+      discount_amount: Number.isFinite(order?.discount_amount) ? order.discount_amount : null,
+      paid_amount: Number.isFinite(order?.paid_amount) ? order.paid_amount : null,
+      after_sale: order?.after_sale && typeof order.after_sale === 'object' ? order.after_sale : {},
+      raw_text: cleanText(order?.raw_text),
+    })).filter((order) => order.platform_order_id) : [],
+    page_summary: value.page_summary && typeof value.page_summary === 'object'
+      ? value.page_summary
+      : {},
+    error: cleanText(value.error, 256),
   };
 }
 

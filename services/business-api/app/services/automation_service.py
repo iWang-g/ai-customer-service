@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+from datetime import datetime
 from time import monotonic
 from typing import Any
 
@@ -33,7 +34,10 @@ from app.services.email_workflow_service import (
     start_or_resume_email_workflow,
     template_metadata,
 )
+from app.services.email_service import get_config
 from app.services.message_service import create_send_task
+from app.services.order_service import order_prompt_context
+from app.services.order_service import maybe_create_order_follow_up
 from app.services.model_call_service import persist_model_calls
 from app.services.robot_service import serialize_robot
 
@@ -47,6 +51,7 @@ MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 60
 MAX_SENSITIVE_WORDS = 200
 MAX_SENSITIVE_WORD_LENGTH = 64
+DEFAULT_SENSITIVE_WORD_REPLY_TEXT = "已收到您的消息，正在为您转接人工客服，请稍等～"
 
 
 def _active_robot(db: Session, user: User, conversation: Conversation) -> Robot | None:
@@ -126,6 +131,11 @@ def _matched_sensitive_word(robot: Robot | None, message: str) -> str | None:
     )
 
 
+def _sensitive_word_reply_text(robot: Robot | None) -> str:
+    text = str(_robot_config(robot).get("sensitive_word_reply_text") or "").strip()
+    return text or DEFAULT_SENSITIVE_WORD_REPLY_TEXT
+
+
 def _mark_human_required(
     conversation: Conversation,
     *,
@@ -136,6 +146,25 @@ def _mark_human_required(
     conversation.human_required_reason = reason
     conversation.human_required_word = word
     conversation.human_required_at = utcnow()
+
+
+def _mark_reply_run_human_required(
+    result: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    result["human_required_marked"] = True
+    result["human_required_reason"] = reason
+    result["human_required_marked_at"] = utcnow().isoformat()
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _fallback_marks_human_required(robot: Robot | None) -> bool:
@@ -150,11 +179,16 @@ def _is_fallback_reply(result: dict[str, Any]) -> bool:
     return bool(isinstance(action_plan, dict) and action_plan.get("workflow") == "fallback_reply")
 
 
-def _sensitive_word_result(source_message_id: str, matched_word: str | None = None) -> dict[str, Any]:
+def _sensitive_word_result(
+    source_message_id: str,
+    matched_word: str | None = None,
+    reply_text: str | None = None,
+) -> dict[str, Any]:
     matched = bool(matched_word)
+    text = str(reply_text or "").strip() or DEFAULT_SENSITIVE_WORD_REPLY_TEXT
     return {
         "decision": "auto_send",
-        "text": "已收到您的消息，正在为您转接人工客服，请稍等～",
+        "text": text,
         "media": [],
         "intent": {
             "intent": "human_handoff",
@@ -164,7 +198,7 @@ def _sensitive_word_result(source_message_id: str, matched_word: str | None = No
             "workflow": "sensitive_word_guard" if matched else "human_review",
             "next_action": "send_handoff_reply",
             "reply_route": "human_handoff",
-            "direct_reply_text": "已收到您的消息，正在为您转接人工客服，请稍等～",
+            "direct_reply_text": text,
             "risk_flags": ["sensitive_word" if matched else "human_required"],
             "reason": "客户消息命中机器人敏感词策略" if matched else "会话处于待人工处理状态",
         },
@@ -346,6 +380,8 @@ async def _decide_reply(
     ai_config: AiProviderConfig | None,
     auto_send_allowed: bool,
     email_templates: list[dict[str, Any]] | None = None,
+    email_config: Any | None = None,
+    customer_orders: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = _robot_config(robot)
     payload = {
@@ -354,6 +390,7 @@ async def _decide_reply(
         "platform": platform,
         "shop_name": shop_name,
         "customer_name": customer_name,
+        "customer_orders": customer_orders or {"collection_status": "not_collected"},
         "qa_base_ids": robot_read.qa_knowledge_base_ids,
         "product_base_ids": robot_read.product_knowledge_base_ids,
         "tone_base_id": robot_read.tone_knowledge_base_id or "",
@@ -369,6 +406,7 @@ async def _decide_reply(
             "outbound_block_rules": config.get("outbound_block_rules", []),
             "outbound_block_action": str(config.get("outbound_block_action") or "fallback"),
             "fallback_reply_text": str(config.get("fallback_reply_text") or ""),
+            "email_trigger_scenarios": str(getattr(email_config, "trigger_scenarios", "") or ""),
         },
         "provider_config": {
             "provider": ai_config.provider,
@@ -409,7 +447,11 @@ async def _execute_bound_reply(
 
     matched_sensitive_word = _matched_sensitive_word(robot, message)
     if matched_sensitive_word:
-        result = _sensitive_word_result(source_message.id, matched_sensitive_word)
+        result = _sensitive_word_result(
+            source_message.id,
+            matched_sensitive_word,
+            _sensitive_word_reply_text(robot),
+        )
         task_id = _queue_reply_task(
             db,
             user,
@@ -424,6 +466,7 @@ async def _execute_bound_reply(
             reason="sensitive_word",
             word=matched_sensitive_word,
         )
+        _mark_reply_run_human_required(result, reason="sensitive_word")
         db.add(conversation)
         db.commit()
         logger.info(
@@ -470,6 +513,13 @@ async def _execute_bound_reply(
     )
     ai_config = db.query(AiProviderConfig).filter(AiProviderConfig.user_id == user.id).first()
     email_template_rows = enabled_templates(db, user)
+    email_config = get_config(db, user)
+    customer_orders = order_prompt_context(db, conversation)
+    email_workflow_config = {
+        "ask_email_text": email_config.ask_email_text,
+        "success_text": email_config.success_text,
+        "missing_template_text": email_config.missing_template_text,
+    }
     workflow = active_workflow(db, user, conversation, robot)
     logger.info(
         "automation reply started conversation_id=%s robot_id=%s prompt_message_count=%d "
@@ -491,9 +541,15 @@ async def _execute_bound_reply(
                 source_message=source_message,
                 templates=email_template_rows,
                 workflow=workflow,
+                config=email_workflow_config,
             )
         else:
-            result = sandbox_email_result(message=message, templates=email_template_rows)
+            result = sandbox_email_result(
+                message=message,
+                templates=email_template_rows,
+                platform_account_id=conversation.platform_account_id,
+                config=email_workflow_config,
+            )
     else:
         generation_started = monotonic()
         result = await _decide_reply(
@@ -504,6 +560,8 @@ async def _execute_bound_reply(
             robot_read=robot_read, ai_config=ai_config,
             auto_send_allowed=auto_send_allowed,
             email_templates=template_metadata(email_template_rows),
+            email_config=email_config,
+            customer_orders=customer_orders,
         )
         result["reply_generation_duration_ms"] = max(
             0, round((monotonic() - generation_started) * 1000)
@@ -522,12 +580,15 @@ async def _execute_bound_reply(
                     source_message=source_message,
                     templates=email_template_rows,
                     suggested_template_id=suggested_template_id,
+                    config=email_workflow_config,
                 )
             else:
                 result = sandbox_email_result(
                     message=message,
                     templates=email_template_rows,
                     suggested_template_id=suggested_template_id,
+                    platform_account_id=conversation.platform_account_id,
+                    config=email_workflow_config,
                 )
 
     task_ids: list[str] = []
@@ -544,11 +605,15 @@ async def _execute_bound_reply(
         task_ids.append(task_id)
         action_plan = result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}
         if action_plan.get("workflow") == "human_review":
-            _mark_human_required(conversation, reason="human_handoff")
+            result_risks = result.get("risk_flags") if isinstance(result.get("risk_flags"), list) else []
+            reason = "missing_email_template" if "missing_bound_email_template" in result_risks else "human_handoff"
+            _mark_human_required(conversation, reason=reason)
+            _mark_reply_run_human_required(result, reason=reason)
             db.add(conversation)
             db.commit()
         if _is_fallback_reply(result) and _fallback_marks_human_required(robot):
             _mark_human_required(conversation, reason="fallback_reply")
+            _mark_reply_run_human_required(result, reason="fallback_reply")
             db.add(conversation)
             db.commit()
             logger.info(
@@ -558,6 +623,11 @@ async def _execute_bound_reply(
                 robot.id,
                 task_id,
             )
+        outreach = maybe_create_order_follow_up(db, conversation, robot, source_message, result)
+        if outreach is not None:
+            db.add(outreach)
+            db.commit()
+            result["outreach_run_id"] = outreach.id
     result["task_ids"] = task_ids
     qa_match = result.get("qa_match") if isinstance(result.get("qa_match"), dict) else {}
     logger.info(
@@ -622,7 +692,10 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
             detail="No online robot is assigned to this platform account",
         )
     if conversation.human_required:
-        result = _sensitive_word_result(source_message.id)
+        result = _sensitive_word_result(
+            source_message.id,
+            reply_text=_sensitive_word_reply_text(robot),
+        )
         task_id = _queue_reply_task(
             db,
             user,
@@ -694,6 +767,11 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
         persisted_run.qa_match_type = str(qa_match.get("match_type") or "") or None
         persisted_run.document_retrieval_used = bool(retrieval)
         persisted_run.retrieval_count = len(retrieval)
+        persisted_run.human_required_marked = result.get("human_required_marked") is True
+        persisted_run.human_required_reason = str(result.get("human_required_reason") or "") or None
+        persisted_run.human_required_marked_at = _parse_iso_datetime(
+            result.get("human_required_marked_at")
+        )
         persisted_run.trace_id = str(result.get("trace_id") or "") or None
         persist_model_calls(db, user, persisted_run, robot, conversation, result)
         persisted_run.send_task_id = task_id
@@ -730,7 +808,11 @@ async def run_test_reply(db: Session, user: User, request: TestReplyRequest) -> 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Robot not found")
     matched_sensitive_word = _matched_sensitive_word(robot, request.message)
     if matched_sensitive_word:
-        return _sensitive_word_result("test", matched_sensitive_word)
+        return _sensitive_word_result(
+            "test",
+            matched_sensitive_word,
+            _sensitive_word_reply_text(robot),
+        )
     robot_read = serialize_robot(db, robot)
     ai_config = db.query(AiProviderConfig).filter(AiProviderConfig.user_id == user.id).first()
     context_length = _context_length(robot)
@@ -775,6 +857,11 @@ async def process_inbound_reply(
             )
         )
         if not conversation:
+            return None
+        if conversation.human_required_reason in {
+            "order_follow_up_outreach",
+            "post_receipt_care_outreach",
+        }:
             return None
         robot = _active_robot(db, user, conversation)
         if not robot:

@@ -10,7 +10,12 @@ from sqlalchemy.orm import Session
 
 from app.core.security import utcnow
 from app.models import Conversation, ConversationWorkflow, EmailTemplate, Message, Robot, User
-from app.services.email_service import send_template_email
+from app.services.email_service import (
+    DEFAULT_ASK_EMAIL_TEXT,
+    DEFAULT_EMAIL_SUCCESS_TEXT,
+    DEFAULT_MISSING_TEMPLATE_TEXT,
+    send_template_email,
+)
 
 
 EMAIL_PATTERN = re.compile(
@@ -22,10 +27,11 @@ EMAIL_PATTERN = re.compile(
 )
 ACTIVE_STATUSES = ("waiting_for_template", "waiting_for_email", "ready_to_send", "sending")
 WORKFLOW_TTL = timedelta(hours=24)
-ASK_EMAIL_TEXT = "亲，麻烦提供一下邮箱哦~"
+ASK_EMAIL_TEXT = DEFAULT_ASK_EMAIL_TEXT
 ASK_TEMPLATE_TEXT = "亲，请问您需要哪一份资料呢？"
-SUCCESS_TEXT = "亲，资料已发送到您的邮箱，请注意查收哦~"
+SUCCESS_TEXT = DEFAULT_EMAIL_SUCCESS_TEXT
 FAILURE_TEXT = "亲，邮件发送暂时异常，我这边帮您进一步处理。"
+MISSING_TEMPLATE_TEXT = DEFAULT_MISSING_TEMPLATE_TEXT
 
 
 def extract_email(value: str) -> str:
@@ -49,9 +55,22 @@ def template_metadata(templates: list[EmailTemplate]) -> list[dict[str, Any]]:
             "name": item.name,
             "scene": item.scene,
             "aliases": list(item.aliases or []),
+            "platform_account_id": item.platform_account_id or "",
         }
         for item in templates
     ]
+
+
+def _workflow_texts(config: dict[str, Any] | None = None) -> dict[str, str]:
+    source = config or {}
+    ask_email = str(source.get("ask_email_text") or "").strip() or ASK_EMAIL_TEXT
+    success = str(source.get("success_text") or "").strip() or SUCCESS_TEXT
+    missing_template = str(source.get("missing_template_text") or "").strip() or MISSING_TEMPLATE_TEXT
+    return {
+        "ask_email": ask_email,
+        "success": success,
+        "missing_template": missing_template,
+    }
 
 
 def _not_expired(expires_at: Any, now: Any) -> bool:
@@ -66,7 +85,14 @@ def select_template(
     templates: list[EmailTemplate],
     message: str,
     suggested_id: str = "",
+    platform_account_id: str | None = None,
 ) -> EmailTemplate | None:
+    account_id = (platform_account_id or "").strip()
+    if account_id:
+        bound = [item for item in templates if item.platform_account_id == account_id]
+        if bound:
+            return bound[0]
+        return None
     suggestion = suggested_id.strip()
     if suggestion:
         for item in templates:
@@ -120,7 +146,12 @@ def _workflow_result(
     workflow: ConversationWorkflow | None,
     email_action: str,
     email_task_id: str = "",
+    workflow_type: str = "collect_email_for_link",
+    blocked_actions: list[str] | None = None,
 ) -> dict[str, Any]:
+    risk_flags = ["direct_external_link_blocked"]
+    if email_action == "missing_bound_template":
+        risk_flags.append("missing_bound_email_template")
     return {
         "decision": decision,
         "text": text,
@@ -131,23 +162,23 @@ def _workflow_result(
             "need_customer_reply": bool(text),
             "need_doc_search": False,
             "need_email": True,
-            "workflow": "collect_email_for_link",
+            "workflow": workflow_type,
             "next_action": next_action,
             "missing_slots": list(workflow.missing_slots_json if workflow else []),
-            "risk_flags": ["direct_external_link_blocked"],
+            "risk_flags": risk_flags,
             "reason": "会话邮件工作流由程序恢复和编排",
         },
         "action_plan": {
-            "workflow": "collect_email_for_link",
+            "workflow": workflow_type,
             "next_action": next_action,
             "generate_reply": False,
             "need_doc_search": False,
             "email_service_required": email_action in {"send_email", "email_sent", "email_failed"},
             "required_actions": [email_action] if email_action else [],
-            "blocked_actions": ["send_external_link_in_chat"],
+            "blocked_actions": blocked_actions or ["send_external_link_in_chat"],
         },
         "confidence": 1.0,
-        "risk_flags": ["direct_external_link_blocked"],
+        "risk_flags": risk_flags,
         "qa_match": {"matched": False, "status": "skipped", "match_type": "workflow_resume"},
         "retrieval": [],
         "model_calls": {"intent": "skipped-workflow-resume", "generation": "skipped"},
@@ -163,27 +194,32 @@ def sandbox_email_result(
     message: str,
     templates: list[EmailTemplate],
     suggested_template_id: str = "",
+    platform_account_id: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    template = select_template(templates, message, suggested_template_id)
+    texts = _workflow_texts(config)
+    template = select_template(templates, message, suggested_template_id, platform_account_id)
     recipient = extract_email(message)
     if template is None:
         return _workflow_result(
-            text=ASK_TEMPLATE_TEXT,
-            next_action="ask_template",
-            decision="suggest",
+            text=texts["missing_template"],
+            next_action="mark_needs_human",
+            decision="needs_human",
             workflow=None,
-            email_action="simulate_save_pending_workflow",
+            email_action="missing_bound_template",
+            workflow_type="human_review",
+            blocked_actions=["send_external_link_in_chat", "send_email"],
         )
     if not recipient:
         return _workflow_result(
-            text=ASK_EMAIL_TEXT,
+            text=texts["ask_email"],
             next_action="ask_email",
             decision="suggest",
             workflow=None,
             email_action="simulate_save_pending_workflow",
         )
     return _workflow_result(
-        text=SUCCESS_TEXT,
+        text=texts["success"],
         next_action="simulate_send_email",
         decision="suggest",
         workflow=None,
@@ -202,7 +238,9 @@ def start_or_resume_email_workflow(
     templates: list[EmailTemplate],
     suggested_template_id: str = "",
     workflow: ConversationWorkflow | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    texts = _workflow_texts(config)
     row = workflow
     if row is None:
         row = ConversationWorkflow(
@@ -225,7 +263,7 @@ def start_or_resume_email_workflow(
     if row.template_id:
         template = next((item for item in templates if item.id == row.template_id), None)
     if template is None:
-        template = select_template(templates, message, suggested_template_id)
+        template = select_template(templates, message, suggested_template_id, conversation.platform_account_id)
     recipient = extract_email(message) or str(slots.get("email") or "")
     if template is not None:
         row.template_id = template.id
@@ -243,22 +281,25 @@ def start_or_resume_email_workflow(
         missing.append("email")
     row.missing_slots_json = missing
     if "template" in missing:
-        row.status = "waiting_for_template"
+        row.status = "failed"
+        row.completed_at = utcnow()
         db.commit()
         db.refresh(row)
         return _workflow_result(
-            text=ASK_TEMPLATE_TEXT,
-            next_action="ask_template",
+            text=texts["missing_template"],
+            next_action="mark_needs_human",
             decision="auto_send",
             workflow=row,
-            email_action="save_pending_workflow",
+            email_action="missing_bound_template",
+            workflow_type="human_review",
+            blocked_actions=["send_external_link_in_chat", "send_email"],
         )
     if "email" in missing:
         row.status = "waiting_for_email"
         db.commit()
         db.refresh(row)
         return _workflow_result(
-            text=ASK_EMAIL_TEXT,
+            text=texts["ask_email"],
             next_action="ask_email",
             decision="auto_send",
             workflow=row,
@@ -310,7 +351,7 @@ def start_or_resume_email_workflow(
     row.missing_slots_json = []
     db.commit()
     return _workflow_result(
-        text=SUCCESS_TEXT,
+        text=texts["success"],
         next_action="email_sent",
         decision="auto_send",
         workflow=row,

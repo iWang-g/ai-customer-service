@@ -11,8 +11,20 @@ const SWITCH_TIMEOUT_MS = 4000;
 const SWITCH_POLL_MS = 100;
 const MANUAL_ACTIVITY_PAUSE_MS = 5000;
 const IDENTITY_STABLE_MS = 1000;
+const HANDLED_UNREAD_RETRY_MS = 30000;
+const MANUAL_VERIFICATION_PATTERN = /安全验证|请完成验证|风险验证|拖动.{0,8}滑块|滑块验证|账号异常|盗号风险|存在盗号风险|安全风险|立即修改密码|验证码错误|验证码已发送/i;
+const MANUAL_VERIFICATION_SELECTOR = [
+  '[class*="captcha"]',
+  '[id*="captcha"]',
+  '[data-testid*="captcha"]',
+  '[class*="risk-verify"]',
+  '[class*="slider"]',
+  '[id*="slider"]',
+  'iframe[src*="captcha"]',
+].join(',');
 const UNREAD_STATUS_PATTERN = /\u672a\u56de\u590d|\u5f85\u56de\u590d|\u8bf7\d*\u5206\u949f\u5185\u56de\u590d|\u8d85\u65f6|\u7ea2\u70b9|new/i;
 const GENERIC_ACCOUNT_NAME = /^(\u62fc\u591a\u591a|\u62fc\u591a\u591a\u5546\u5bb6\u540e\u53f0|\u62fc\u591a\u591a\u5546\u5bb6\u7ba1\u7406\u540e\u53f0|\u62fc\u591a\u591a\u5ba2\u670d\u5e73\u53f0|\u5546\u5bb6\u540e\u53f0|\u5ba2\u670d\u5e73\u53f0)$/;
+const PLATFORM_SYSTEM_PROMPT_PATTERN = /(?:您好像还没有配置消费者问到的常见问题回答|还没有配置.*常见问题回答|常见问题回答.*立即配置|立即配置.*常见问题回答|提升.*接待效率|减少顾客流失)/;
 const FALLBACK_SELECTORS = {
   conversationItems: ['.chat-item', '[data-conversation-id]', '[data-session-id]', '[data-chat-id]'],
   conversationName: ['[data-role="customer-name"]', '[class*="nickname"]', '[class*="user-name"]'],
@@ -68,6 +80,14 @@ const FALLBACK_SELECTORS = {
     '#replySendButton',
     '#sendBtn',
     'button[type="submit"]',
+  ],
+  latestOrdersTab: ['[data-role="latest-orders"]', '[class*="LatestOrder"]', '[class*="latest-order"]'],
+  personalOrdersTab: ['[data-role="personal-orders"]', '[class*="PersonalOrder"]', '[class*="personal-order"]'],
+  orderCards: [
+    '[data-order-id]',
+    '[class*="OrderCard"]',
+    '[class*="order-card"]',
+    '[class*="OrderItem"]',
   ],
 };
 
@@ -224,9 +244,22 @@ function avatarUrl(element) {
   }
 }
 
+function isPlatformSystemPrompt(value) {
+  const normalized = text(value, 1000);
+  return Boolean(normalized && PLATFORM_SYSTEM_PROMPT_PATTERN.test(normalized));
+}
+
+function conversationPreviewText(element) {
+  const candidates = queryCandidates(element, selectors.conversationPreview);
+  for (const candidate of candidates) {
+    const candidateText = text(candidate.textContent);
+    if (candidateText && !isPlatformSystemPrompt(candidateText)) return candidateText;
+  }
+  return null;
+}
+
 function readConversation(element) {
   const nameElement = queryFirst(element, selectors.conversationName);
-  const previewElement = queryFirst(element, selectors.conversationPreview);
   const customerName = text(nameElement?.textContent, 128);
   const randomMarker = attribute(element.querySelector('[data-random]'), ['data-random']);
   const externalId = attribute(element, [
@@ -237,7 +270,7 @@ function readConversation(element) {
     external_conversation_id: externalId,
     customer_name: customerName,
     title: customerName,
-    latest_message_text: text(previewElement?.textContent),
+    latest_message_text: conversationPreviewText(element),
     unread_count: unreadCount(element),
     avatar_url: avatarUrl(element),
     active: isActive(element),
@@ -422,6 +455,7 @@ function isIgnoredMessage(element, type, content) {
   if (['notice', 'system', 'lead'].includes(type)) return true;
   if (element.querySelector('[class*="BuyerFromCard"]')) return true;
   const normalized = content.replace(/\s+/g, ' ').trim();
+  if (isPlatformSystemPrompt(normalized)) return true;
   if (/^(?:(?:\d{4}\s*(?:[-/.]|\u5e74))?\d{1,2}\s*(?:[-/.]|\u6708)\s*\d{1,2}\s*(?:\u65e5)?|\u4eca\u5929|\u6628\u5929|\u524d\u5929)\s+\d{1,2}:\d{2}(?::\d{2})?$/.test(normalized)) return true;
   return /^(?:\u5f53\u524d\u7528\u6237\u6765\u81ea.*(?:\u5546\u54c1\u8be6\u60c5\u9875|\u5e97\u94fa|\u76f4\u64ad\u95f4|\u641c\u7d22|\u6d3b\u52a8\u9875)|(?:\u5bf9\u65b9|\u60a8|\u4f60)?\u64a4\u56de\u4e86\u4e00\u6761\u6d88\u606f|.*\u9080\u8bf7\u4e0b\u5355.*\u7acb\u5373\u4f7f\u7528)/.test(normalized);
 }
@@ -530,12 +564,17 @@ function accountIdentity() {
 
 function currentPageStatus() {
   const path = location.pathname.toLowerCase();
-  if (path.startsWith('/login')) return 'login_required';
   if (/\/risk|\/verify|\/captcha/.test(path)) return 'risk_control';
-  if (document.querySelector('[class*="captcha"], [class*="risk-verify"], [data-testid*="captcha"]')) {
+  if (document.querySelector(MANUAL_VERIFICATION_SELECTOR)) {
     return 'risk_control';
   }
+  if (hasManualVerification()) return 'risk_control';
+  if (path.startsWith('/login')) return 'login_required';
   return path.startsWith('/chat-windows') || path.startsWith('/chat-merchant') ? 'online' : 'unknown';
+}
+
+function hasManualVerification() {
+  return MANUAL_VERIFICATION_PATTERN.test(text(document.body?.innerText, 6000) || '');
 }
 
 function messageAreaFingerprint() {
@@ -581,6 +620,399 @@ function readSnapshot(observedAt, entries = collectConversationEntries(), verifi
     if (messages.length) active.messages = messages.slice(-200);
   }
   return conversations;
+}
+
+function visibleElement(element) {
+  if (!element) return false;
+  const rect = element.getBoundingClientRect();
+  const style = getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+
+function safeElementSummary(element) {
+  if (!element) return null;
+  const rect = element.getBoundingClientRect();
+  const value = (text(element.textContent, 80) || '')
+    .replace(/\d{4,}/g, '[number]');
+  return {
+    tag: element.tagName?.toLowerCase?.() || '',
+    role: attribute(element, ['role', 'data-role', 'data-testid']),
+    id: attribute(element, ['id']),
+    class_name: text(element.className, 160),
+    text: value,
+    rect: {
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    },
+  };
+}
+
+function orderLabelCandidates() {
+  return [...document.querySelectorAll('button,[role="tab"],a,div,span')]
+    .filter(visibleElement)
+    .map((element) => ({ element, value: text(element.textContent, 80) || '' }))
+    .filter(({ value }) => value.length <= 40 && /最新订单|个人订单/.test(value))
+    .slice(0, 20)
+    .map(({ element }) => safeElementSummary(element));
+}
+
+function textNodeHitElement(label) {
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    const value = String(node.nodeValue || '');
+    const index = value.indexOf(label);
+    const parent = node.parentElement;
+    if (index >= 0 && visibleElement(parent)) {
+      const range = document.createRange();
+      range.setStart(node, index);
+      range.setEnd(node, index + label.length);
+      const rect = range.getBoundingClientRect();
+      const hit = rect.width > 0 && rect.height > 0
+        ? document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+        : null;
+      if (visibleElement(hit)) return hit;
+      return parent;
+    }
+    node = walker.nextNode();
+  }
+  return null;
+}
+
+function findVisibleTextElement(label, catalogs = []) {
+  const configured = queryCandidates(document, catalogs).filter(visibleElement);
+  const textNodeHit = textNodeHitElement(label);
+  const textMatches = [...document.querySelectorAll('button,[role="tab"],a,div,span')].filter((element) => {
+    const value = text(element.textContent, 128) || '';
+    return visibleElement(element) && value.includes(label);
+  });
+  const candidates = [...new Set([...configured, ...(textNodeHit ? [textNodeHit] : []), ...textMatches])];
+  return candidates.sort((left, right) => {
+    const leftText = text(left.textContent, 128) || '';
+    const rightText = text(right.textContent, 128) || '';
+    const leftExact = leftText === label ? 0 : 1;
+    const rightExact = rightText === label ? 0 : 1;
+    if (leftExact !== rightExact) return leftExact - rightExact;
+    const leftInteractive = left.matches('button,[role="tab"],a,[onclick]') ? 0 : 1;
+    const rightInteractive = right.matches('button,[role="tab"],a,[onclick]') ? 0 : 1;
+    if (leftInteractive !== rightInteractive) return leftInteractive - rightInteractive;
+    return leftText.length - rightText.length;
+  })[0] || null;
+}
+
+async function waitForVisibleTextElement(label, catalogs, timeoutMs = 2500) {
+  const deadline = Date.now() + timeoutMs;
+  let element = findVisibleTextElement(label, catalogs);
+  while (!element && Date.now() < deadline) {
+    await sleep(100);
+    element = findVisibleTextElement(label, catalogs);
+  }
+  return element;
+}
+
+function parseMoney(source, label) {
+  const pattern = new RegExp(`${label}\\s*[：:]?\\s*([+-]?)\\s*[¥￥]?\\s*(\\d+(?:\\.\\d{1,2})?)`);
+  const matched = source.match(pattern);
+  return matched ? Number(`${matched[1] || ''}${matched[2]}`) : null;
+}
+
+function parseOrderTime(source) {
+  const matched = source.match(
+    /下单时间\s*[：:]?\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/,
+  );
+  if (!matched) return null;
+  const pad = (value) => String(value).padStart(2, '0');
+  // Pinduoduo displays shop-local wall time without a timezone marker.
+  return `${matched[1]}-${pad(matched[2])}-${pad(matched[3])}T${pad(matched[4])}:${matched[5]}:${pad(matched[6] || 0)}`;
+}
+
+function orderMarkerElements() {
+  const markers = [];
+  const seen = new Set();
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    const parent = node.parentElement;
+    if (String(node.nodeValue || '').includes('订单编号') && visibleElement(parent) && !seen.has(parent)) {
+      seen.add(parent);
+      markers.push(parent);
+    }
+    node = walker.nextNode();
+  }
+  return markers;
+}
+
+function fallbackOrderCards() {
+  const markers = orderMarkerElements();
+  const cards = markers.map((marker) => {
+    let candidate = marker;
+    for (let depth = 0; candidate && depth < 14; depth += 1, candidate = candidate.parentElement) {
+      const value = text(candidate.innerText || candidate.textContent, MAX_TEXT) || '';
+      const hasOrderId = /订单编号\s*[：:]?\s*[\d\s-]{8,}/.test(value);
+      const hasStatus = normalizeOrderStatus(value) !== 'unknown';
+      const hasAmount = /实付\s*[：:]|实收\s*[：:]|订单金额\s*[：:]/.test(value);
+      if (hasOrderId && /下单时间/.test(value) && (hasStatus || hasAmount)) return candidate;
+    }
+    return null;
+  }).filter(Boolean);
+  return [...new Set(cards)].filter((element) => (
+    !cards.some((candidate) => candidate !== element && element.contains(candidate))
+  ));
+}
+
+function orderMarkerDiagnostics() {
+  const markers = orderMarkerElements();
+  return markers.slice(-5).map((marker) => {
+    const ancestors = [];
+    let candidate = marker;
+    for (let depth = 0; candidate && depth < 10; depth += 1, candidate = candidate.parentElement) {
+      const value = text(candidate.innerText || candidate.textContent, MAX_TEXT) || '';
+      ancestors.push({
+        depth,
+        tag: candidate.tagName?.toLowerCase?.() || '',
+        class_name: text(candidate.className, 160),
+        text_length: value.length,
+        has_order_time: /下单时间/.test(value),
+        has_paid: /实付\s*[：:]/.test(value),
+        has_received: /实收\s*[：:]/.test(value),
+        has_amount: /订单金额\s*[：:]/.test(value),
+        normalized_status: normalizeOrderStatus(value),
+      });
+    }
+    return { marker: safeElementSummary(marker), ancestors };
+  });
+}
+
+function normalizeOrderStatus(source) {
+  if (/退款中|退货中|售后中|退款\/售后/.test(source)) return 'refunding';
+  if (/已退款|退款成功/.test(source)) return 'refunded';
+  if (/待支付|待付款/.test(source)) return 'pending_payment';
+  if (/待发货|已付款|已支付/.test(source)) return 'paid_pending_shipment';
+  if (/待签收|已发货|运输中/.test(source)) return 'shipped_pending_receipt';
+  if (/已签收/.test(source)) return 'signed';
+  if (/已完成|交易成功|订单完成/.test(source)) return 'completed';
+  if (/已取消|已关闭|交易关闭/.test(source)) return 'cancelled';
+  return 'unknown';
+}
+
+function orderCardImageUrl(element) {
+  const images = [...element.querySelectorAll('img')]
+    .filter(visibleElement)
+    .map((image) => {
+      const rect = image.getBoundingClientRect();
+      const source = ['src', 'data-src', 'data-original']
+        .map((name) => text(image.getAttribute(name), 2000))
+        .find((value) => /^(?:https?:)?\/\//i.test(value || '')) || null;
+      return { source, area: rect.width * rect.height };
+    })
+    .filter(({ source, area }) => area >= 400 && /^(?:https?:)?\/\//i.test(source || ''))
+    .sort((left, right) => right.area - left.area);
+  if (images.length) {
+    return images[0].source.startsWith('//') ? `https:${images[0].source}` : images[0].source;
+  }
+  const backgrounds = [...element.querySelectorAll('*')]
+    .filter(visibleElement)
+    .map((candidate) => {
+      const rect = candidate.getBoundingClientRect();
+      const matched = getComputedStyle(candidate).backgroundImage.match(/url\(["']?((?:https?:)?\/\/[^"')]+)["']?\)/i);
+      return { source: matched?.[1] || null, area: rect.width * rect.height };
+    })
+    .filter(({ source, area }) => source && area >= 400)
+    .sort((left, right) => right.area - left.area);
+  if (!backgrounds.length) return null;
+  return backgrounds[0].source.startsWith('//') ? `https:${backgrounds[0].source}` : backgrounds[0].source;
+}
+
+function productTitleFromOrderSource(source) {
+  const afterOrderedAt = source.split(/下单时间\s*[：:]?\s*\d{4}[/-]\d{1,2}[/-]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?/)[1] || '';
+  return afterOrderedAt
+    .replace(/^(?:退货包运费\s*(?:未赠送|已赠送)?\s*)+/g, '')
+    .split(/\s+x\d+\s+[¥￥]|店铺优惠抵扣|实付[：:]|实收[：:]/i)[0]
+    .trim();
+}
+
+function readOrderCard(element, sequence) {
+  const source = text(element.innerText || element.textContent, MAX_TEXT);
+  if (!source) return null;
+  const orderId = attribute(element, ['data-order-id', 'data-id'])
+    || source.match(/订单编号\s*[：:]?\s*([\d\s-]{8,})/)?.[1]?.replace(/\s+/g, '')
+    || null;
+  if (!orderId) return null;
+  const orderedAt = parseOrderTime(source);
+  const status = normalizeOrderStatus(source);
+  const rawStatus = source.match(/(?:待支付|待付款|待发货|待签收|已签收|已完成|交易成功|退款中|退货中|售后中|已退款|已取消|已关闭)/)?.[0] || '';
+  const quantity = Number(source.match(/(?:^|\s)x(\d+)(?:\s|$)/i)?.[1] || 1);
+  const productText = productTitleFromOrderSource(source);
+  const imageUrl = orderCardImageUrl(element);
+  return {
+    platform_order_id: orderId.slice(0, 128),
+    raw_status: rawStatus,
+    status,
+    ordered_at: orderedAt,
+    products: productText ? [{
+      title: productText.slice(0, 512),
+      quantity,
+      ...(imageUrl ? { image_url: imageUrl } : {}),
+    }] : [],
+    order_amount: parseMoney(source, '订单金额'),
+    discount_amount: parseMoney(source, '店铺优惠抵扣'),
+    paid_amount: parseMoney(source, '实付') ?? parseMoney(source, '实收'),
+    after_sale: {
+      text: source.match(/(?:退款中|退货中|售后中|已退款|退货包运费[^\s]*)/)?.[0] || '',
+    },
+    sequence,
+    raw_text: source,
+  };
+}
+
+function personalOrderPanelState() {
+  const personalTab = findVisibleTextElement('个人订单', selectors.personalOrdersTab);
+  const panel = personalTab?.closest?.('.right-panel-container') || document.querySelector('.right-panel-container');
+  const value = text(panel?.innerText || panel?.textContent, 12000) || '';
+  const selected = Boolean(
+    personalTab?.classList?.contains('bar-select')
+    || personalTab?.getAttribute?.('aria-selected') === 'true'
+  );
+  return {
+    personal_tab_selected: selected,
+    has_personal_filters: /全部\s*\d*\s+未完成\s*\d*\s+待发货/.test(value),
+    has_store_pending_notice: /店铺待支付订单不再提供聊天催付|您可使用催支付/.test(value),
+    has_store_pending_action: /(?:^|\s)催支付(?:\s|$)/.test(value),
+    has_personal_action: /查看说明书|查看视频|改价/.test(value),
+    has_order_marker: /订单编号/.test(value),
+    panel_text_length: value.length,
+  };
+}
+
+async function waitForPersonalOrdersStable(timeoutMs = 3500) {
+  const deadline = Date.now() + timeoutMs;
+  let stableChecks = 0;
+  let lastFingerprint = '';
+  let state = personalOrderPanelState();
+  while (Date.now() < deadline) {
+    const next = personalOrderPanelState();
+    const ready = next.personal_tab_selected
+      && next.has_personal_filters
+      && !next.has_store_pending_notice
+      && !next.has_store_pending_action;
+    const fingerprint = JSON.stringify(next);
+    if (ready && fingerprint === lastFingerprint) stableChecks += 1;
+    else stableChecks = ready ? 1 : 0;
+    state = next;
+    lastFingerprint = fingerprint;
+    if (stableChecks >= 3) return { ready: true, state };
+    await sleep(250);
+  }
+  return { ready: false, state };
+}
+
+async function collectCustomerOrders() {
+  const observedAt = new Date().toISOString();
+  let phase = 'find_latest_orders';
+  diagnostic('order_collection_started', {
+    location_host: location.hostname,
+    location_path: location.pathname,
+    iframe_count: document.querySelectorAll('iframe').length,
+    latest_selector_hits: selectorHitCounts(selectors.latestOrdersTab),
+    personal_selector_hits: selectorHitCounts(selectors.personalOrdersTab),
+    label_candidates: orderLabelCandidates(),
+  }, 'debug');
+  try {
+    const latestOrders = await waitForVisibleTextElement('最新订单', selectors.latestOrdersTab);
+    if (!latestOrders) throw new Error('latest_orders_tab_not_found');
+    diagnostic('order_latest_tab_found', { element: safeElementSummary(latestOrders) }, 'debug');
+    latestOrders.click();
+    phase = 'find_personal_orders';
+    const personalOrders = await waitForVisibleTextElement('个人订单', selectors.personalOrdersTab);
+    if (!personalOrders) throw new Error('personal_orders_tab_not_found');
+    diagnostic('order_personal_tab_found', {
+      element: safeElementSummary(personalOrders),
+      label_candidates: orderLabelCandidates(),
+    }, 'debug');
+    personalOrders.click();
+    phase = 'wait_personal_orders';
+    await sleep(2000);
+    const personalPanel = await waitForPersonalOrdersStable();
+    diagnostic('order_personal_panel_stabilized', personalPanel, personalPanel.ready ? 'info' : 'warn');
+    if (!personalPanel.ready) throw new Error('personal_orders_panel_not_stable');
+    phase = 'read_order_cards';
+
+    const configuredCards = queryCandidates(document, selectors.orderCards).filter(visibleElement);
+    const fallbackCards = fallbackOrderCards();
+    const candidates = configuredCards.length ? configuredCards : fallbackCards;
+    const orders = candidates.map(readOrderCard).filter(Boolean);
+    const uniqueOrders = [...new Map(orders.map((order) => [order.platform_order_id, order])).values()];
+    diagnostic('order_cards_scanned', {
+      configured_selector_hits: selectorHitCounts(selectors.orderCards),
+      configured_visible_count: configuredCards.length,
+      fallback_card_count: fallbackCards.length,
+      selected_card_source: configuredCards.length ? 'configured' : 'fallback',
+      selected_card_count: candidates.length,
+      parsed_order_count: uniqueOrders.length,
+      parsed_statuses: uniqueOrders.map((order) => order.status),
+      candidate_shapes: candidates.slice(0, 5).map((element) => {
+        const value = text(element.innerText || element.textContent, MAX_TEXT) || '';
+        return {
+          has_order_id: /订单编号\s*[：:]?\s*[\d-]{8,}/.test(value),
+          has_order_time: /下单时间/.test(value),
+          has_paid_amount: /实付\s*[：:]|实收\s*[：:]/.test(value),
+          normalized_status: normalizeOrderStatus(value),
+          text_length: value.length,
+        };
+      }),
+      ...(!candidates.length ? { order_marker_diagnostics: orderMarkerDiagnostics() } : {}),
+    }, uniqueOrders.length ? 'info' : 'warn');
+    if (uniqueOrders.length) {
+      diagnostic('order_collection_succeeded', {
+        order_count: uniqueOrders.length,
+        statuses: uniqueOrders.map((order) => order.status),
+      });
+      return {
+        collection_status: 'success',
+        observed_at: observedAt,
+        orders: uniqueOrders,
+        page_summary: { visible_count: uniqueOrders.length, total_count: uniqueOrders.length, has_more: false },
+      };
+    }
+    const panelText = text(document.body?.innerText, 12000) || '';
+    const hasUnparsedOrder = /订单编号\s*[：:]?\s*[\d-]{8,}/.test(panelText);
+    // The pagination footer is an empty-state signal only when no order marker is present.
+    const explicitEmpty = !hasUnparsedOrder
+      && /暂无(?:个人)?订单|当前客户(?:暂无|没有)订单|该客户(?:暂无|没有)订单|近\d+天没有更多订单/.test(panelText);
+    diagnostic(explicitEmpty ? 'order_collection_empty' : 'order_collection_unavailable', {
+      phase,
+      error: explicitEmpty ? null : 'order_cards_and_empty_state_not_found',
+      has_unparsed_order: hasUnparsedOrder,
+      body_has_latest_orders_label: panelText.includes('最新订单'),
+      body_has_personal_orders_label: panelText.includes('个人订单'),
+      label_candidates: orderLabelCandidates(),
+    }, explicitEmpty ? 'info' : 'warn');
+    return {
+      collection_status: explicitEmpty ? 'empty' : 'unavailable',
+      observed_at: observedAt,
+      orders: [],
+      page_summary: { visible_count: 0, total_count: 0, has_more: false },
+      ...(!explicitEmpty ? { error: 'order_cards_and_empty_state_not_found' } : {}),
+    };
+  } catch (error) {
+    diagnostic('order_collection_unavailable', {
+      phase,
+      error: error?.message || String(error),
+      latest_selector_hits: selectorHitCounts(selectors.latestOrdersTab),
+      personal_selector_hits: selectorHitCounts(selectors.personalOrdersTab),
+      label_candidates: orderLabelCandidates(),
+      iframe_count: document.querySelectorAll('iframe').length,
+    }, 'warn');
+    return {
+      collection_status: 'unavailable',
+      observed_at: observedAt,
+      orders: [],
+      page_summary: { visible_count: 0, total_count: 0, has_more: false },
+      error: error?.message || String(error),
+    };
+  }
 }
 
 function emit(type, payload = {}, observedAt = new Date().toISOString()) {
@@ -637,7 +1069,18 @@ function unreadVersion(entry) {
 
 function unreadEntryBlockedReason(entry, now) {
   const version = unreadVersion(entry);
-  if (handledUnread.get(entry.key)?.version === version) return 'already_handled_preview';
+  const handledState = handledUnread.get(entry.key);
+  if (handledState?.version === version) {
+    if (now - handledState.at < HANDLED_UNREAD_RETRY_MS) return 'already_handled_preview';
+    handledUnread.delete(entry.key);
+    diagnostic('unread_handled_retry_elapsed', {
+      conversation_key: entry.key,
+      preview_text: entry.conversation.latest_message_text || '',
+      unread_count: entry.conversation.unread_count,
+      unread_version: version,
+      elapsed_ms: now - handledState.at,
+    }, 'debug');
+  }
   const failedState = failedUnread.get(entry.key);
   if (
     failedState?.version === version
@@ -846,19 +1289,37 @@ async function processConversationEntry(entry, entries, { markUnread = false, em
     }, 'warn');
     return null;
   }
-  if (emitMessages) emitSnapshot(verifiedEntries, entry.key, true);
+  const orderSnapshot = await collectCustomerOrders();
+  const activeEntry = verifiedEntries.find((candidate) => candidate.key === entry.key);
+  if (activeEntry) activeEntry.conversation.customer_orders = orderSnapshot;
+  const snapshotEmitted = emitMessages ? emitSnapshot(verifiedEntries, entry.key, true) : false;
   if (markUnread) {
-    handledUnread.set(entry.key, {
-      version: unreadVersion(entry),
-      at: Date.now(),
-    });
-    failedUnread.delete(entry.key);
+    if (snapshotEmitted) {
+      handledUnread.set(entry.key, {
+        version: unreadVersion(entry),
+        at: Date.now(),
+      });
+      failedUnread.delete(entry.key);
+    } else {
+      failedUnread.set(entry.key, {
+        version: unreadVersion(entry),
+        at: Date.now(),
+      });
+      diagnostic('unread_processing_not_marked_handled', {
+        conversation_key: entry.key,
+        customer_name: entry.conversation.customer_name,
+        reason: 'snapshot_not_emitted',
+        retry_cooldown_ms: FAILED_SWITCH_COOLDOWN_MS,
+      }, 'warn');
+    }
   }
   diagnostic(markUnread ? 'unread_processing_succeeded' : 'conversation_collection_succeeded', {
     conversation_key: entry.key,
     customer_name: entry.conversation.customer_name,
     unread_count: entry.conversation.unread_count,
     message_count: readMessages(queryCandidates(document, selectors.messageItems), new Date().toISOString()).length,
+    order_collection_status: orderSnapshot.collection_status,
+    order_count: orderSnapshot.orders.length,
   });
   return verifiedEntries;
 }
@@ -1548,6 +2009,9 @@ async function scan() {
       sequence: entry.sequence,
       conversation_key: entry.key,
       customer_name: entry.conversation.customer_name,
+      preview_text: entry.conversation.latest_message_text || '',
+      preview_text_length: (entry.conversation.latest_message_text || '').length,
+      unread_version: unreadVersion(entry),
       unread_count: entry.conversation.unread_count,
       active: entry.conversation.active,
       visible: entry.visible,
@@ -1591,6 +2055,11 @@ async function scan() {
           .filter((entry) => entry.conversation.unread_count > 0)
           .map((entry) => ({
             conversation_key: entry.key,
+            preview_text: entry.conversation.latest_message_text || '',
+            unread_count: entry.conversation.unread_count,
+            unread_version: unreadVersion(entry),
+            handled_version: handledUnread.get(entry.key)?.version || null,
+            handled_at: handledUnread.get(entry.key)?.at || null,
             reason: unreadEntryBlockedReason(entry, now),
           }))
           .slice(0, 30),

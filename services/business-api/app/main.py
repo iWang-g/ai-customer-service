@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from app.core.config import get_settings
 from app.db.session import engine, init_db
 from app.models import Base
 from app.services.auth_service import bootstrap_admin_user
+from app.services.order_service import schedule_due_outreach_rechecks
+from app.db.session import SessionLocal
 from sqlalchemy.orm import Session
 
 
@@ -54,8 +57,17 @@ def create_app() -> FastAPI:
     app.include_router(ai_config_router, prefix=settings.api_prefix)
     app.include_router(ws_router)
 
+    async def outreach_scheduler() -> None:
+        while True:
+            try:
+                with SessionLocal() as db:
+                    schedule_due_outreach_rechecks(db)
+            except Exception:  # noqa: BLE001
+                logging.exception("customer outreach scheduler failed")
+            await asyncio.sleep(5)
+
     @app.on_event("startup")
-    def on_startup() -> None:
+    async def on_startup() -> None:
         logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
         if settings.database_url.startswith("sqlite"):
             db_path = settings.database_url.replace("sqlite:///", "", 1)
@@ -64,6 +76,18 @@ def create_app() -> FastAPI:
         init_db()
         with Session(engine) as db:
             bootstrap_admin_user(db, settings)
+        app.state.outreach_scheduler = asyncio.create_task(outreach_scheduler())
+
+    @app.on_event("shutdown")
+    async def on_shutdown() -> None:
+        scheduler = getattr(app.state, "outreach_scheduler", None)
+        if scheduler is None:
+            return
+        scheduler.cancel()
+        try:
+            await scheduler
+        except asyncio.CancelledError:
+            pass
 
     return app
 

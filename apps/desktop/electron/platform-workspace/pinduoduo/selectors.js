@@ -73,6 +73,22 @@ export const PDD_SELECTORS = Object.freeze({
     '[class*="shop-name"]',
     '[class*="store-name"]',
   ],
+  latestOrdersTab: [
+    '[data-role="latest-orders"]',
+    '[class*="LatestOrder"]',
+    '[class*="latest-order"]',
+  ],
+  personalOrdersTab: [
+    '[data-role="personal-orders"]',
+    '[class*="PersonalOrder"]',
+    '[class*="personal-order"]',
+  ],
+  orderCards: [
+    '[data-order-id]',
+    '[class*="OrderCard"]',
+    '[class*="order-card"]',
+    '[class*="OrderItem"]',
+  ],
 });
 
 export function serializedSelectorArgument() {

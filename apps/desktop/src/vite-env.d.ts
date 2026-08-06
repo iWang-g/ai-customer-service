@@ -7,8 +7,8 @@ interface PddWorkspaceAccount {
   createdAt: string;
   lastOpenedAt: string | null;
   platformAccountId: string | null;
-  loginStatus: 'unknown' | 'login_required' | 'online' | 'offline' | 'risk_control' | 'error' | 'paused';
-  runtimeStatus: 'idle' | 'loading' | 'ready' | 'error' | 'paused';
+  loginStatus: 'unknown' | 'login_required' | 'online' | 'offline' | 'risk_control' | 'account_mismatch' | 'error' | 'paused';
+  runtimeStatus: 'idle' | 'queued' | 'loading' | 'ready' | 'error' | 'paused';
   collectionStatus: 'idle' | 'watching' | 'collecting' | 'login_required' | 'risk_control' | 'error' | 'paused';
   lastCollectedAt: string | null;
 }
@@ -56,6 +56,15 @@ interface Window {
     closePlatformWorkspaces(): Promise<void>;
     getPddImportCandidates(): Promise<PddImportCandidate[]>;
     importPddConversation(accountId: string, conversationKey: string): Promise<{
+      status: 'collected';
+      conversation_key: string;
+      customer_name: string | null;
+    }>;
+    refreshPddCustomerOrders(payload: {
+      platformAccountId: string;
+      externalConversationId: string | null;
+      customerName: string;
+    }): Promise<{
       status: 'collected';
       conversation_key: string;
       customer_name: string | null;

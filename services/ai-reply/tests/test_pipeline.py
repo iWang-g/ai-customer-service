@@ -93,6 +93,54 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("客户称呼：小伙伴", generation_call.kwargs["system"])
         self.assertIn("客服自称：小助手", generation_call.kwargs["system"])
         self.assertIn("额外要求：每次回复最多两句话", generation_call.kwargs["system"])
+        self.assertIn("禁止使用 Markdown 格式", generation_call.kwargs["system"])
+        self.assertIn("禁止标题、列表、表格、代码块、引用块、加粗或斜体符号", generation_call.kwargs["system"])
+
+    async def test_intent_prompt_constrains_direct_reply_style_and_markdown(self) -> None:
+        request = ReplyRequest(
+            message="好的",
+            tone_base_id="tone-1",
+            reply_config={
+                "base_style": "温柔",
+                "answer_length": "简短",
+                "customer_address": "亲亲",
+                "self_address": "小客服",
+                "advanced_instruction": "语气自然一点",
+                "email_trigger_scenarios": "客户想要店铺链接地址、想要定制",
+            },
+        )
+        provider = AsyncMock(return_value=(intent_json(
+            "direct_reply",
+            direct_reply_text="好的亲亲～",
+            need_doc_search=False,
+            next_action="send_direct_reply",
+        ), "deepseek"))
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch(
+                "app.pipeline.get_knowledge_base",
+                AsyncMock(return_value={
+                    "kind": "tone",
+                    "enabled": True,
+                    "persona": "活泼亲切，像朋友一样自然交流",
+                }),
+            ),
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "好的亲亲～")
+        self.assertEqual(provider.await_count, 1)
+        intent_call = provider.await_args_list[0]
+        self.assertIn("direct_reply_text 是最终可发送给客户的内容", intent_call.kwargs["system"])
+        self.assertIn("必须遵守基础风格、回答长度、客户称呼、客服自称、虚拟人设和额外要求", intent_call.kwargs["system"])
+        self.assertIn("禁止 Markdown 格式", intent_call.kwargs["system"])
+        self.assertIn("禁止标题、列表、表格、代码块、引用块、加粗或斜体符号", intent_call.kwargs["system"])
+        self.assertIn("虚拟人设：活泼亲切，像朋友一样自然交流", intent_call.kwargs["user"])
+        self.assertIn("基础风格：温柔", intent_call.kwargs["user"])
+        self.assertIn("客服自称：小客服", intent_call.kwargs["user"])
+        self.assertIn("邮件触发场景", intent_call.kwargs["user"])
+        self.assertIn("客户想要店铺链接地址、想要定制", intent_call.kwargs["user"])
+        self.assertIn("客户消息符合任一场景时必须使用 email_link_request", intent_call.kwargs["system"])
 
     async def test_qa_hit_short_circuits_both_model_calls(self) -> None:
         request = ReplyRequest(
@@ -373,6 +421,20 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.intent.template_id, "")
         self.assertEqual(result.intent.template_key, "")
+
+    async def test_local_fallback_uses_configured_email_trigger_scenarios(self) -> None:
+        request = ReplyRequest(
+            message="客户想要定制",
+            reply_config={"email_trigger_scenarios": "客户想要定制"},
+        )
+        provider = AsyncMock(side_effect=RuntimeError("model unavailable"))
+
+        with patch("app.pipeline.generate_with_provider", provider):
+            result = await build_reply(request)
+
+        self.assertEqual(result.intent.intent, "email_link_request")
+        self.assertEqual(result.action_plan.workflow, "collect_email_for_link")
+        self.assertEqual(result.model_calls["intent"], "local-fallback")
 
     async def test_direct_reply_intent_returns_first_model_text_without_second_model_call(self) -> None:
         request = ReplyRequest(message="好的，谢谢")

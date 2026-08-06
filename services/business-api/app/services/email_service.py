@@ -4,6 +4,7 @@ import base64
 from email.message import EmailMessage
 import hashlib
 import logging
+import re
 import smtplib
 import ssl
 import time
@@ -17,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.security import utcnow
-from app.models import EmailProviderConfig, EmailSendTask, EmailTemplate, User
+from app.models import EmailProviderConfig, EmailSendTask, EmailTemplate, PlatformAccount, User
 from app.schemas.email import (
     EmailConfigRead,
     EmailConfigUpdate,
@@ -34,6 +35,10 @@ PROVIDER_DEFAULTS = {
     "gmail": {"smtp_host": "smtp.gmail.com", "smtp_port": 587, "security": "starttls"},
     "custom": {"smtp_host": "", "smtp_port": 465, "security": "ssl"},
 }
+DEFAULT_TRIGGER_SCENARIOS = "客户索要不适合在平台聊天中直接发送的内容，例如店铺链接地址、资料地址、下载内容、联系方式或定制沟通入口。"
+DEFAULT_ASK_EMAIL_TEXT = "亲，请提供一下邮箱哦~"
+DEFAULT_EMAIL_SUCCESS_TEXT = "亲，资料已发送到您的邮箱，请注意查收哦~"
+DEFAULT_MISSING_TEMPLATE_TEXT = "亲，这边先为您转接人工客服进一步处理，请稍等~"
 
 
 def provider_defaults(provider: str) -> dict[str, object]:
@@ -94,6 +99,10 @@ def read_config(config: EmailProviderConfig | None) -> EmailConfigRead:
             smtp_port=int(defaults["smtp_port"]),
             security=str(defaults["security"]),
             auth_code_saved=False,
+            trigger_scenarios=DEFAULT_TRIGGER_SCENARIOS,
+            ask_email_text=DEFAULT_ASK_EMAIL_TEXT,
+            success_text=DEFAULT_EMAIL_SUCCESS_TEXT,
+            missing_template_text=DEFAULT_MISSING_TEMPLATE_TEXT,
         )
     return EmailConfigRead(
         enabled=config.enabled,
@@ -104,6 +113,10 @@ def read_config(config: EmailProviderConfig | None) -> EmailConfigRead:
         smtp_port=config.smtp_port,
         security=config.security,
         auth_code_saved=bool(config.auth_secret_encrypted),
+        trigger_scenarios=config.trigger_scenarios or DEFAULT_TRIGGER_SCENARIOS,
+        ask_email_text=config.ask_email_text or DEFAULT_ASK_EMAIL_TEXT,
+        success_text=config.success_text or DEFAULT_EMAIL_SUCCESS_TEXT,
+        missing_template_text=config.missing_template_text or DEFAULT_MISSING_TEMPLATE_TEXT,
         updated_at=config.updated_at,
     )
 
@@ -123,6 +136,10 @@ def save_config(db: Session, user: User, request: EmailConfigUpdate) -> EmailCon
     config.smtp_host = request.smtp_host.strip()
     config.smtp_port = request.smtp_port
     config.security = request.security
+    config.trigger_scenarios = request.trigger_scenarios.strip()
+    config.ask_email_text = request.ask_email_text.strip()
+    config.success_text = request.success_text.strip()
+    config.missing_template_text = request.missing_template_text.strip()
     if request.auth_code:
         config.auth_secret_encrypted = encrypt_secret(request.auth_code)
     if request.enabled and not config.auth_secret_encrypted:
@@ -141,6 +158,39 @@ def save_config(db: Session, user: User, request: EmailConfigUpdate) -> EmailCon
         bool(config.auth_secret_encrypted),
     )
     return read_config(config)
+
+
+def _template_key_from_name(name: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9_.:-]+", "-", name.strip().lower()).strip("-_.:")
+    return (base or f"email-template-{uuid.uuid4().hex[:8]}")[:80]
+
+
+def _unique_template_key(db: Session, user: User, name: str) -> str:
+    base = _template_key_from_name(name)
+    candidate = base
+    suffix = 1
+    while db.scalar(select(EmailTemplate.id).where(
+        EmailTemplate.user_id == user.id,
+        EmailTemplate.template_key == candidate,
+    )):
+        suffix += 1
+        tail = f"-{suffix}"
+        candidate = f"{base[:80 - len(tail)]}{tail}"
+    return candidate
+
+
+def _validate_platform_account(db: Session, user: User, platform_account_id: str | None) -> str | None:
+    value = (platform_account_id or "").strip()
+    if not value:
+        return None
+    account = db.scalar(select(PlatformAccount).where(
+        PlatformAccount.id == value,
+        PlatformAccount.user_id == user.id,
+        PlatformAccount.is_active.is_(True),
+    ))
+    if account is None:
+        raise HTTPException(status_code=404, detail="绑定店铺不存在或已停用")
+    return value
 
 
 def _send_message(
@@ -336,13 +386,17 @@ def list_templates(db: Session, user: User) -> list[EmailTemplateRead]:
 
 
 def create_template(db: Session, user: User, request: EmailTemplateCreate) -> EmailTemplateRead:
-    row = EmailTemplate(user_id=user.id, **request.model_dump())
+    values = request.model_dump()
+    values["template_key"] = (values.get("template_key") or "").strip() or _unique_template_key(db, user, request.name)
+    values["platform_account_id"] = _validate_platform_account(db, user, values.get("platform_account_id"))
+    values["aliases"] = list(dict.fromkeys(value.strip() for value in values.get("aliases", []) if value.strip()))
+    row = EmailTemplate(user_id=user.id, **values)
     db.add(row)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="模板 ID 已存在") from exc
+        raise HTTPException(status_code=409, detail="模板 ID 已存在，或该店铺已绑定其他邮件模板") from exc
     db.refresh(row)
     return EmailTemplateRead.model_validate(row)
 
@@ -359,13 +413,20 @@ def update_template(
     values = request.model_dump(exclude_unset=True)
     if "aliases" in values and values["aliases"] is not None:
         values["aliases"] = list(dict.fromkeys(value.strip() for value in values["aliases"] if value.strip()))
+    if "platform_account_id" in values:
+        values["platform_account_id"] = _validate_platform_account(db, user, values.get("platform_account_id"))
+    if "template_key" in values:
+        if values["template_key"] is None:
+            values.pop("template_key")
+        else:
+            values["template_key"] = values["template_key"].strip()
     for key, value in values.items():
         setattr(row, key, value)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="模板 ID 已存在") from exc
+        raise HTTPException(status_code=409, detail="模板 ID 已存在，或该店铺已绑定其他邮件模板") from exc
     db.refresh(row)
     return EmailTemplateRead.model_validate(row)
 

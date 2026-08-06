@@ -12,7 +12,7 @@ import {
 import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 
-type RuntimeStatus = 'idle' | 'loading' | 'ready' | 'error' | 'paused';
+type RuntimeStatus = 'idle' | 'queued' | 'loading' | 'ready' | 'error' | 'paused';
 type CollectionStatus = 'idle' | 'watching' | 'collecting' | 'login_required' | 'risk_control' | 'error' | 'paused';
 
 interface WorkspaceAccount {
@@ -22,7 +22,7 @@ interface WorkspaceAccount {
   createdAt: string;
   lastOpenedAt: string | null;
   platformAccountId: string | null;
-  loginStatus: 'unknown' | 'login_required' | 'online' | 'offline' | 'risk_control' | 'error' | 'paused';
+  loginStatus: 'unknown' | 'login_required' | 'online' | 'offline' | 'risk_control' | 'account_mismatch' | 'error' | 'paused';
   runtimeStatus: RuntimeStatus;
   collectionStatus: CollectionStatus;
   lastCollectedAt: string | null;
@@ -75,6 +75,7 @@ const rpaLabels: Record<WorkspaceState['rpa']['status'], string> = {
 
 const statusLabels: Record<RuntimeStatus, string> = {
   idle: '待打开',
+  queued: '排队加载中',
   loading: '加载中',
   ready: '页面已加载',
   error: '页面异常',
@@ -83,6 +84,7 @@ const statusLabels: Record<RuntimeStatus, string> = {
 
 const statusColors: Record<RuntimeStatus, string> = {
   idle: 'bg-slate-300',
+  queued: 'bg-sky-400',
   loading: 'bg-amber-400',
   ready: 'bg-emerald-500',
   error: 'bg-rose-500',
@@ -98,6 +100,7 @@ const collectionLabels: Record<CollectionStatus, string> = {
   error: '采集异常',
   paused: '采集已暂停',
 };
+
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': /, '') : '操作失败';
@@ -150,7 +153,7 @@ export default function PinduoduoWorkspaceApp() {
     try {
       const nextState = await operation();
       setState(nextState);
-      return true;
+      return nextState;
     } catch (reason) {
       setError(errorMessage(reason));
       return false;
@@ -209,7 +212,9 @@ export default function PinduoduoWorkspaceApp() {
               <div className="text-sm font-bold">拼多多工作区</div>
               <div className="text-[11px] text-slate-500">
                 {activeAccount
-                  ? `${statusLabels[activeAccount.runtimeStatus]} · ${collectionLabels[activeAccount.collectionStatus]}`
+                  ? activeAccount.loginStatus === 'account_mismatch'
+                    ? '登录店铺不匹配 · 已停止自动化'
+                    : `${statusLabels[activeAccount.runtimeStatus]} · ${collectionLabels[activeAccount.collectionStatus]}`
                   : '未选择店铺'}
               </div>
             </div>

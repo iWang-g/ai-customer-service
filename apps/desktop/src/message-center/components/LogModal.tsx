@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { Filter, MessageSquare, Search, Terminal, X, Zap } from 'lucide-react';
 import { useMemo, useState } from 'react';
+import { parseApiDateTime } from '../../shared/dateTime';
 import type { LogEntry } from '../types';
 
 interface LogModalProps {
@@ -11,7 +12,7 @@ interface LogModalProps {
 }
 
 function formatTimestamp(value: string): string {
-  const date = new Date(value);
+  const date = parseApiDateTime(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString('zh-CN', { hour12: false });
 }

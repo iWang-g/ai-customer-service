@@ -146,6 +146,23 @@ function registerIpcHandlers() {
     }
     return pddWorkspaceManager.importConversation(payload.accountId, payload.conversationKey);
   });
+  ipcMain.handle('pdd-workspace:refresh-customer-orders', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (payload.externalConversationId !== null && payload.externalConversationId !== undefined
+      && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
+      throw new Error('目标会话参数无效');
+    }
+    if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
+      throw new Error('客户名称参数无效');
+    }
+    return pddWorkspaceManager.refreshCustomerOrders({
+      platformAccountId: payload.platformAccountId,
+      externalConversationId: payload.externalConversationId || null,
+      customerName: payload.customerName,
+    });
+  });
   ipcMain.handle('pdd-workspace:send-message', (_event, payload) => {
     if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
       throw new Error('平台店铺参数无效');
@@ -256,13 +273,15 @@ app.whenReady().then(() => {
 });
 
 app.on('before-quit', (event) => {
-  pddWorkspaceManager?.prepareToQuit();
   if (shutdownComplete) return;
   event.preventDefault();
   if (shutdownStarted) return;
   shutdownStarted = true;
-  const stopPromise = rpaProcessManager ? rpaProcessManager.stop() : Promise.resolve();
-  void stopPromise.finally(() => {
+  const shutdownPromise = Promise.allSettled([
+    pddWorkspaceManager ? pddWorkspaceManager.prepareToQuit() : Promise.resolve(),
+    rpaProcessManager ? rpaProcessManager.stop() : Promise.resolve(),
+  ]);
+  void shutdownPromise.finally(() => {
     shutdownComplete = true;
     app.quit();
   });

@@ -76,6 +76,9 @@ export default function App() {
       isLoadingMonitoring={controller.isLoadingMonitoring}
       onMonitoringModelChange={controller.handleMonitoringModelChange}
       connectionStatus={controller.connectionStatus}
+      customerOrders={controller.customerOrders}
+      isLoadingCustomerOrders={controller.isLoadingCustomerOrders}
+      onRefreshCustomerOrders={controller.handleRefreshCustomerOrders}
       onViewLogs={() => controller.setIsLogModalOpen(true)}
       isLogModalOpen={controller.isLogModalOpen}
       onCloseLogModal={() => controller.setIsLogModalOpen(false)}

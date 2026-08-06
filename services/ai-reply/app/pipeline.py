@@ -18,7 +18,7 @@ from app.schemas import ActionPlan, IntentDecision, ReplyRequest, ReplyResponse
 
 
 RISK_WORDS = ("退款", "退货", "投诉", "赔偿", "隐私", "地址", "手机号", "转人工")
-EMAIL_WORDS = ("邮箱", "邮件", "链接", "地址", "网址", "看图", "下载", "资料")
+EMAIL_WORDS = ("邮箱", "邮件")
 DIRECT_REPLY_WORDS = (
     "你好", "您好", "嗨", "哈喽", "hello", "hi", "好", "好的", "嗯", "行", "可以",
     "知道了", "明白了", "收到", "谢谢", "感谢", "不用了", "不需要了", "再见",
@@ -59,9 +59,26 @@ def _email_template_prompt_items(request: ReplyRequest) -> list[dict[str, Any]]:
                 "name": name,
                 "scene": scene,
                 "aliases": aliases,
+                "platform_account_id": clean_reply(str(item.get("platform_account_id") or "")),
             }
         )
     return items[:50]
+
+
+def _email_trigger_scenarios(request: ReplyRequest) -> str:
+    return clean_reply(str(request.reply_config.get("email_trigger_scenarios") or ""))
+
+
+def _matches_email_trigger_scenario(message: str, scenarios: str) -> bool:
+    normalized_message = clean_reply(message).casefold()
+    if not normalized_message:
+        return False
+    terms = [
+        clean_reply(item).casefold()
+        for item in re.split(r"[、,，;；\n]", scenarios or "")
+        if len(clean_reply(item)) >= 2
+    ]
+    return any(term in normalized_message for term in terms)
 
 
 def clean_reply(value: str) -> str:
@@ -340,13 +357,18 @@ def _extract_json(value: str) -> dict[str, Any]:
     return parsed
 
 
-def _local_intent(message: str, risk_flags: list[str], reason: str) -> IntentDecision:
+def _local_intent(
+    message: str,
+    risk_flags: list[str],
+    reason: str,
+    email_trigger_scenarios: str = "",
+) -> IntentDecision:
     if any(word in message for word in HUMAN_WORDS):
         intent = "human_handoff"
         reply_route = "human_handoff"
         next_action = "send_handoff_reply"
         confidence = 0.9
-    elif any(word in message for word in EMAIL_WORDS):
+    elif any(word in message for word in EMAIL_WORDS) or _matches_email_trigger_scenario(message, email_trigger_scenarios):
         intent = "email_link_request"
         reply_route = "email_workflow"
         next_action = "defer_email_workflow"
@@ -392,6 +414,7 @@ async def classify_intent(
 intent: direct_reply | normal_question | email_link_request | human_handoff | unknown
 reply_route: direct | retrieve_product | email_workflow | human_handoff
 direct_reply_text: 仅 direct 或 human_handoff 时填写可直接发给客户的简短回复，其他路由必须为空
+direct_reply_text 是最终可发送给客户的内容，必须遵守基础风格、回答长度、客户称呼、客服自称、虚拟人设和额外要求。
 confidence: 0 到 1
 need_customer_reply: 必须为 true
 need_doc_search: 仅 retrieve_product 为 true
@@ -403,10 +426,21 @@ template_id: 可选，仅可返回下方可用邮件模板中的 id，不能编�
 template_key: 可选，仅可返回下方可用邮件模板中的 template_key，不能编造
 risk_flags: 字符串数组
 reason: 一句简短理由
+purchase_intent: none | weak | strong
+outreach_suggestion: none | create_order_follow_up_candidate
+outreach_confidence: 0 到 1
+outreach_reason: 一句简短理由
 只有问候、致谢、简单确认、结束语、情绪回应等不涉及业务事实的消息才允许 direct。
 产品规格、价格、库存、适配、安装、物流、售后、退款、保修等事实问题必须 retrieve_product，禁止凭模型自身知识回答。
-判断不确定时必须 retrieve_product。客户索要链接、地址、资料、下载内容或要求通过邮箱接收时使用 email_link_request。
-每条客户入站消息都必须回复，禁止返回无需回复或空回复。"""
+判断不确定时必须 retrieve_product。客户请求不适合在平台聊天中直接发送、需要通过邮箱承接、或符合邮件触发场景时使用 email_link_request。
+如果配置了邮件触发场景，客户消息符合任一场景时必须使用 email_link_request；不要把这些场景当普通产品咨询处理。
+如果未配置邮件触发场景，仅在客户明确要求通过邮箱接收资料，或索要不适合在平台聊天中直接发送的外部内容时使用 email_link_request。
+每条客户入站消息都必须回复，禁止返回无需回复或空回复。
+客户订单信息是唯一可使用的订单事实来源。只有 collection_status=empty 才表示明确未下单；
+not_collected 或 unavailable 都表示未知，不得推断未下单。已存在待支付及后续状态订单时不得建议追单。
+只有客户表达明确购买意向，且订单明确为空时，才允许返回 create_order_follow_up_candidate；
+该字段只表示建立延迟候选，程序会在发送前重新核对订单。
+所有可发送给客户的回复内容都必须是纯文本，禁止 Markdown 格式，禁止标题、列表、表格、代码块、引用块、加粗或斜体符号。"""
     email_templates = _email_template_prompt_items(request)
     templates_text = (
         json.dumps(email_templates, ensure_ascii=False)
@@ -422,6 +456,8 @@ reason: 一句简短理由
         f"客服自称：{request.reply_config.get('self_address') or '客服'}\n"
         f"虚拟人设：{persona or '未配置'}\n"
         f"额外要求：{request.reply_config.get('advanced_instruction') or '无'}\n"
+        f"客户订单信息（仅此处可作为订单事实来源）：{json.dumps(request.customer_orders, ensure_ascii=False)}\n"
+        f"邮件触发场景（用户配置，符合时走 email_link_request）：{_email_trigger_scenarios(request) or '未配置'}\n"
         f"可用邮件模板元数据（只可从中选择 template_id/template_key）：{templates_text}\n"
         f"最近对话（按时间正序）：\n{conversation_prompt(request)}\n"
         f"最新客户消息：{request.message}"
@@ -482,6 +518,7 @@ reason: 一句简短理由
                 request.message,
                 decision.risk_flags,
                 "模型路由不明确，采用本地保守规则",
+                _email_trigger_scenarios(request),
             )
         logger.info(
             "intent classified trace_id=%s intent=%s confidence=%.2f provider=%s",
@@ -497,14 +534,24 @@ reason: 一句简短理由
             trace_id,
             type(exc).__name__,
         )
-        return _local_intent(request.message, risk_flags, "意图模型不可用，采用本地保守规则"), "local-fallback"
+        return _local_intent(
+            request.message,
+            risk_flags,
+            "意图模型不可用，采用本地保守规则",
+            _email_trigger_scenarios(request),
+        ), "local-fallback"
     except Exception as exc:
         logger.warning(
             "intent provider unavailable trace_id=%s error_type=%s",
             trace_id,
             type(exc).__name__,
         )
-        return _local_intent(request.message, risk_flags, "意图模型调用失败，采用本地保守规则"), "local-fallback"
+        return _local_intent(
+            request.message,
+            risk_flags,
+            "意图模型调用失败，采用本地保守规则",
+            _email_trigger_scenarios(request),
+        ), "local-fallback"
 
 
 def build_action_plan(intent: IntentDecision, has_product_bases: bool) -> ActionPlan:
@@ -585,7 +632,8 @@ def _generation_prompts(
     system = (
         "你是电商客服，请生成一段可以直接发送给客户的纯文本回复。"
         "优先回答最新问题，不输出分析过程，不编造知识片段中不存在的事实；"
-        "没有执行结果时不得声称邮件或图片已经发送。\n"
+        "没有执行结果时不得声称邮件或图片已经发送；"
+        "禁止使用 Markdown 格式，禁止标题、列表、表格、代码块、引用块、加粗或斜体符号。\n"
         f"基础风格：{config.get('base_style') or '专业'}\n"
         f"回答长度：{config.get('answer_length') or '适中'}\n"
         f"客户称呼：{config.get('customer_address') or '亲亲'}\n"
@@ -601,6 +649,7 @@ def _generation_prompts(
         f"平台：{request.platform or '未知'}\n"
         f"店铺：{request.shop_name or '未知'}\n"
         f"客户：{request.customer_name or '未知'}\n"
+        f"客户订单信息（仅此处可作为订单事实来源）：{json.dumps(request.customer_orders, ensure_ascii=False)}\n"
         f"最近对话（按时间正序）：\n{conversation_prompt(request)}\n"
         f"结构化意图：{intent.model_dump_json()}\n"
         f"执行计划：{action_plan.model_dump_json()}\n"

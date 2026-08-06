@@ -10,6 +10,7 @@ class DashboardMetrics(BaseModel):
     message_count: int
     independent_reception_rate: float
     average_response_seconds: float | None
+    transfer_to_human_rate: float
 
 
 class TrafficPoint(BaseModel):

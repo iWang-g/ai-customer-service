@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from app.models import Base, EmailProviderConfig, User
+from app.models import Base, EmailProviderConfig, PlatformAccount, User
 from app.schemas.email import EmailConfigUpdate, EmailTemplateCreate, EmailTemplateUpdate
 from app.services.email_service import (
     create_template,
@@ -116,10 +116,18 @@ class EmailServiceTests(unittest.TestCase):
             smtp_port=465,
             security="ssl",
             auth_code="smtp-secret",
+            trigger_scenarios="客户想要定制",
+            ask_email_text="亲，请提供邮箱",
+            success_text="亲，邮件已发送",
+            missing_template_text="亲，转人工处理",
         )
         saved = save_config(self.db, self.user, request)
         row = self.db.scalar(select(EmailProviderConfig).where(EmailProviderConfig.user_id == self.user.id))
         self.assertTrue(saved.auth_code_saved)
+        self.assertEqual(saved.trigger_scenarios, "客户想要定制")
+        self.assertEqual(saved.ask_email_text, "亲，请提供邮箱")
+        self.assertEqual(saved.success_text, "亲，邮件已发送")
+        self.assertEqual(saved.missing_template_text, "亲，转人工处理")
         self.assertIsNotNone(row)
         self.assertNotIn("smtp-secret", row.auth_secret_encrypted)
         encrypted = row.auth_secret_encrypted
@@ -153,6 +161,45 @@ class EmailServiceTests(unittest.TestCase):
         self.assertEqual(len(list_templates(self.db, self.user)), 1)
         delete_template(self.db, self.user, created.id)
         self.assertEqual(list_templates(self.db, self.user), [])
+
+    def test_template_key_can_be_generated_and_platform_binding_is_unique(self) -> None:
+        account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            platform_name="拼多多",
+            local_account_id="shop-1",
+            account_name="测试店铺",
+            account_alias="测试店铺",
+            is_active=True,
+        )
+        self.db.add(account)
+        self.db.commit()
+        self.db.refresh(account)
+
+        created = create_template(
+            self.db,
+            self.user,
+            EmailTemplateCreate(
+                name="店铺资料",
+                subject="资料主题",
+                body="资料正文",
+                platform_account_id=account.id,
+            ),
+        )
+        self.assertTrue(created.template_key)
+        self.assertEqual(created.platform_account_id, account.id)
+        with self.assertRaises(HTTPException) as context:
+            create_template(
+                self.db,
+                self.user,
+                EmailTemplateCreate(
+                    name="另一个模板",
+                    subject="资料主题",
+                    body="资料正文",
+                    platform_account_id=account.id,
+                ),
+            )
+        self.assertEqual(context.exception.status_code, 409)
 
 
 if __name__ == "__main__":

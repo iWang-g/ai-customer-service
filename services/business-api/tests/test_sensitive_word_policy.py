@@ -47,6 +47,7 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
                 "allow_auto_send": True,
                 "inbound_sensitive_words": ["投诉", "差评"],
                 "sensitive_word_action": "mark_human",
+                "sensitive_word_reply_text": "亲，已收到，马上帮您转人工处理。",
             },
         )
         self.db.add_all([self.conversation, self.robot])
@@ -93,10 +94,14 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.conversation.human_required_reason, "sensitive_word")
         self.assertEqual(self.conversation.human_required_word, "投诉")
         self.assertEqual(result["decision"], "auto_send")
-        self.assertTrue(result["text"])
+        self.assertEqual(result["text"], "亲，已收到，马上帮您转人工处理。")
+        self.assertEqual(result["intent"]["direct_reply_text"], "亲，已收到，马上帮您转人工处理。")
         self.assertEqual(result["qa_match"]["status"], "skipped")
         self.assertEqual(len(result["task_ids"]), 1)
         self.assertEqual(self.db.query(RpaTask).count(), 1)
+        task = self.db.scalar(select(RpaTask))
+        self.assertIsNotNone(task)
+        self.assertEqual(task.payload_json["content"], "亲，已收到，马上帮您转人工处理。")
         run = self.db.scalar(select(AutomationReplyRun))
         self.assertIsNotNone(run)
         self.assertEqual(run.intent, "human_handoff")
@@ -132,7 +137,7 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         execute_reply.assert_not_awaited()
         self.assertEqual(result["provider"], "human-required-rule")
-        self.assertTrue(result["text"])
+        self.assertEqual(result["text"], "亲，已收到，马上帮您转人工处理。")
         self.assertEqual(len(result["task_ids"]), 1)
         self.assertEqual(self.db.query(RpaTask).count(), 1)
         self.assertEqual(self.db.query(AutomationReplyRun).count(), 0)
@@ -155,8 +160,24 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         decide_reply.assert_not_awaited()
         self.assertEqual(result["decision"], "auto_send")
-        self.assertTrue(result["text"])
+        self.assertEqual(result["text"], "亲，已收到，马上帮您转人工处理。")
         self.assertEqual(result["provider"], "sensitive-word-rule")
+
+    async def test_sensitive_word_reply_uses_default_when_config_is_blank(self) -> None:
+        self.robot.config_json = {
+            **self.robot.config_json,
+            "sensitive_word_reply_text": "   ",
+        }
+        self.db.add(self.robot)
+        self.db.commit()
+
+        result = await run_test_reply(
+            self.db,
+            self.user,
+            TestReplyRequest(robot_id=self.robot.id, message="我要给差评"),
+        )
+
+        self.assertEqual(result["text"], "已收到您的消息，正在为您转接人工客服，请稍等～")
 
     async def test_fallback_reply_is_queued_before_conversation_is_marked_human_required(self) -> None:
         self.robot.config_json = {

@@ -141,30 +141,32 @@ def list_messages(
     conversation = db.get(Conversation, conversation_id)
     if not conversation or conversation.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    stmt = (
-        select(Message)
-        .where(and_(Message.conversation_id == conversation_id, Message.user_id == user.id))
-        .order_by(
-            func.coalesce(
-                Message.observed_at,
-                Message.sent_at,
-                Message.created_at,
-            ).asc(),
-            case((Message.snapshot_sequence.is_(None), 1), else_=0).asc(),
-            Message.snapshot_sequence.asc(),
-            Message.created_at.asc(),
-            Message.id.asc(),
-        )
-        .offset(offset)
-        .limit(limit)
-    )
     count_stmt = (
         select(func.count())
         .select_from(Message)
         .where(and_(Message.conversation_id == conversation_id, Message.user_id == user.id))
     )
     total = db.scalar(count_stmt) or 0
-    items = list(db.scalars(stmt).all())
+    # Query newest-first so offset pages backwards through history, then restore
+    # chronological order for chat rendering.
+    stmt = (
+        select(Message)
+        .where(and_(Message.conversation_id == conversation_id, Message.user_id == user.id))
+        .order_by(
+            desc(func.coalesce(
+                Message.observed_at,
+                Message.sent_at,
+                Message.created_at,
+            )),
+            case((Message.snapshot_sequence.is_(None), 1), else_=0).desc(),
+            Message.snapshot_sequence.desc(),
+            Message.created_at.desc(),
+            Message.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    items = list(reversed(db.scalars(stmt).all()))
     return MessageListResponse(
         items=[MessageRead.model_validate(item) for item in items],
         meta=PageMeta(total=total, limit=limit, offset=offset),

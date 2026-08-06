@@ -70,6 +70,40 @@ export interface ApiMessage {
   sent_at: string;
 }
 
+export interface CustomerOrder {
+  id: string;
+  platform_order_id: string;
+  status: string;
+  raw_status: string;
+  products_json: Array<Record<string, unknown>>;
+  order_amount: number | null;
+  discount_amount: number | null;
+  paid_amount: number | null;
+  ordered_at: string | null;
+  paid_at: string | null;
+  signed_at: string | null;
+  after_sale_json: Record<string, unknown>;
+  last_observed_at: string;
+}
+
+export interface CustomerOrdersResponse {
+  conversation_id: string;
+  collection_status: 'not_collected' | 'success' | 'empty' | 'unavailable';
+  collection_error: string | null;
+  observed_at: string | null;
+  customer_key: string;
+  total_count: number;
+  has_more: boolean;
+  orders: CustomerOrder[];
+  outreach: Array<{
+    strategy_type: string;
+    status: string;
+    due_at: string;
+    cancel_reason: string | null;
+    completed_at: string | null;
+  }>;
+}
+
 export interface AiConfig {
   provider: 'deepseek';
   base_url: string;
@@ -105,6 +139,10 @@ export interface EmailConfig {
   smtp_port: number;
   security: 'ssl' | 'starttls' | 'none';
   auth_code_saved: boolean;
+  trigger_scenarios: string;
+  ask_email_text: string;
+  success_text: string;
+  missing_template_text: string;
   updated_at: string | null;
 }
 
@@ -116,6 +154,10 @@ export interface EmailConfigInput {
   smtp_port: number;
   security: 'ssl' | 'starttls' | 'none';
   auth_code: string;
+  trigger_scenarios: string;
+  ask_email_text: string;
+  success_text: string;
+  missing_template_text: string;
 }
 
 export interface EmailTemplate {
@@ -127,11 +169,21 @@ export interface EmailTemplate {
   subject: string;
   body: string;
   enabled: boolean;
+  platform_account_id: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export type EmailTemplateInput = Omit<EmailTemplate, 'id' | 'created_at' | 'updated_at'>;
+export interface EmailTemplateInput {
+  template_key?: string | null;
+  name: string;
+  scene?: string;
+  aliases?: string[];
+  subject: string;
+  body: string;
+  enabled: boolean;
+  platform_account_id?: string | null;
+}
 
 export interface EmailTestResult {
   ok: boolean;
@@ -156,6 +208,7 @@ export interface DashboardAnalytics {
     message_count: number;
     independent_reception_rate: number;
     average_response_seconds: number | null;
+    transfer_to_human_rate: number;
   };
   traffic: Array<{ label: string; count: number }>;
   categories: Array<{
@@ -748,6 +801,12 @@ export function listPlatformAccounts(): Promise<{ items: PlatformAccount[] }> {
 
 export function listConversations(): Promise<PageResponse<ApiConversation>> {
   return apiRequest<PageResponse<ApiConversation>>('/conversations?limit=100');
+}
+
+export function getCustomerOrders(conversationId: string): Promise<CustomerOrdersResponse> {
+  return apiRequest<CustomerOrdersResponse>(
+    `/conversations/${encodeURIComponent(conversationId)}/orders`,
+  );
 }
 
 export function clearConversationHumanRequired(conversationId: string): Promise<{ conversation: ApiConversation }> {

@@ -5,7 +5,7 @@ import StatusPanel from '../components/StatusPanel';
 import LogModal from '../components/LogModal';
 import ImportModal from '../components/ImportModal';
 import type { Conversation, BotStatus, LogEntry, Shop, StatusEvent } from '../types';
-import type { ApiUser } from '../../shared/api/client';
+import type { ApiUser, CustomerOrdersResponse } from '../../shared/api/client';
 
 interface MessageCenterWorkspaceProps {
   lang: 'zh' | 'en';
@@ -37,6 +37,9 @@ interface MessageCenterWorkspaceProps {
   isLoadingMonitoring: boolean;
   onMonitoringModelChange: (model: string) => void;
   connectionStatus: 'connecting' | 'connected' | 'disconnected';
+  customerOrders: CustomerOrdersResponse | null;
+  isLoadingCustomerOrders: boolean;
+  onRefreshCustomerOrders: () => Promise<void>;
   onViewLogs: () => void;
   isLogModalOpen: boolean;
   onCloseLogModal: () => void;
@@ -79,6 +82,9 @@ export default function MessageCenterWorkspace({
   isLoadingMonitoring,
   onMonitoringModelChange,
   connectionStatus,
+  customerOrders,
+  isLoadingCustomerOrders,
+  onRefreshCustomerOrders,
   onViewLogs,
   isLogModalOpen,
   onCloseLogModal,
@@ -137,6 +143,9 @@ export default function MessageCenterWorkspace({
         onModelChange={onMonitoringModelChange}
         onViewLogs={onViewLogs}
         connectionStatus={connectionStatus}
+        customerOrders={customerOrders}
+        isLoadingCustomerOrders={isLoadingCustomerOrders}
+        onRefreshCustomerOrders={onRefreshCustomerOrders}
       />
 
       <LogModal isOpen={isLogModalOpen} onClose={onCloseLogModal} logs={logs} isLoading={isLoadingMonitoring} />

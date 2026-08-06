@@ -254,6 +254,10 @@ export function useAdminController() {
     smtp_port: 465,
     security: 'ssl',
     auth_code: '',
+    trigger_scenarios: '',
+    ask_email_text: '',
+    success_text: '',
+    missing_template_text: '',
   });
   const [emailAuthCodeSaved, setEmailAuthCodeSaved] = useState(false);
   const [emailTemplates, setEmailTemplates] = useState<EmailTemplate[]>([]);
@@ -424,8 +428,8 @@ export function useAdminController() {
     let cancelled = false;
     setIsLoadingEmail(true);
     setEmailNotice('');
-    Promise.all([getEmailConfig(), listEmailTemplates()])
-      .then(([config, templates]) => {
+    Promise.all([getEmailConfig(), listEmailTemplates(), listPlatformAccounts()])
+      .then(([config, templates, accounts]) => {
         if (cancelled) return;
         setEmailConfig({
           enabled: config.enabled,
@@ -435,9 +439,14 @@ export function useAdminController() {
           smtp_port: config.smtp_port,
           security: config.security,
           auth_code: '',
+          trigger_scenarios: config.trigger_scenarios,
+          ask_email_text: config.ask_email_text,
+          success_text: config.success_text,
+          missing_template_text: config.missing_template_text,
         });
         setEmailAuthCodeSaved(config.auth_code_saved);
         setEmailTemplates(templates);
+        setPlatformAccounts(accounts.items);
       })
       .catch((error: Error) => !cancelled && setEmailNotice(error.message))
       .finally(() => !cancelled && setIsLoadingEmail(false));

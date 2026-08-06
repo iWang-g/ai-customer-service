@@ -19,6 +19,7 @@ from app.schemas.rpa import (
     RpaTaskRead,
     TaskCompleteRequest,
 )
+from app.services.order_service import apply_orders_snapshot
 
 
 def _node_token(settings: Settings, user: User, node: RpaNode) -> str:
@@ -133,6 +134,8 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
     conversation = _upsert_conversation_from_event(db, user.id, request)
     if conversation:
         conversations.append(conversation)
+        if request.event_type == "customer_orders_snapshot":
+            apply_orders_snapshot(db, conversation, request.payload_json, request.received_at)
     message, is_new_reply_source = _upsert_message_from_event(db, user.id, conversation, request)
     if conversation and message:
         _refresh_awaiting_reply(db, conversation)
@@ -173,7 +176,10 @@ def _upsert_conversation_from_event(
         or payload.get("customer_name")
         or request.platform_message_id
     )
-    if not external_id and request.event_type not in {"customer_message", "message_received", "agent_message", "message_sent"}:
+    if not external_id and request.event_type not in {
+        "customer_message", "message_received", "agent_message", "message_sent",
+        "customer_orders_snapshot",
+    }:
         return None
     conversation = db.scalar(
         select(Conversation).where(
@@ -382,6 +388,11 @@ def _upsert_message_from_event(
                     and candidate.platform_message_id != request.platform_message_id
                 )
                 and (
+                    (
+                        request.platform_message_id
+                        and not candidate.platform_message_id
+                    )
+                    or
                     not platform_sent_at
                     or not candidate.platform_sent_at
                     or candidate.platform_sent_at == platform_sent_at
@@ -391,6 +402,13 @@ def _upsert_message_from_event(
         None,
     )
     if snapshot_match:
+        platform_time_corrected = bool(
+            request.platform_message_id
+            and not snapshot_match.platform_message_id
+            and platform_sent_at
+            and snapshot_match.platform_sent_at
+            and snapshot_match.platform_sent_at != platform_sent_at
+        )
         if request.platform_message_id and not snapshot_match.platform_message_id:
             snapshot_match.platform_message_id = request.platform_message_id
         snapshot_match.sender_name = payload.get("sender_name") or snapshot_match.sender_name
@@ -398,7 +416,7 @@ def _upsert_message_from_event(
         _apply_collection_metadata(snapshot_match, payload, request, preserve_existing=True)
         db.add(snapshot_match)
         db.flush()
-        return snapshot_match, False
+        return snapshot_match, platform_time_corrected and _is_live_reply_source(payload, request)
 
     if request.platform_message_id and platform_sent_at:
         recent_observation = (observed_at or utcnow()) - timedelta(seconds=10)
@@ -532,6 +550,47 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
     task.result_json = request.result_json
     task.error_message = request.error_message
     task.completed_at = utcnow()
+    if task.task_type == "send_message" and task.idempotency_key and task.idempotency_key.startswith("customer-outreach:"):
+        from app.models import CustomerOutreachRun
+
+        outreach = db.scalar(select(CustomerOutreachRun).where(CustomerOutreachRun.send_task_id == task.id))
+        if outreach:
+            text_sent = request.result_json.get("text_sent") is True
+            outreach_completed_now = (
+                (request.status == "completed" or text_sent)
+                and outreach.status != "completed"
+            )
+            if request.status == "completed" or text_sent:
+                outreach.status = "completed"
+                outreach.completed_at = utcnow()
+                outreach.cancel_reason = None
+                decision = outreach.decision_json if isinstance(outreach.decision_json, dict) else {}
+                if (
+                    outreach_completed_now
+                    and text_sent
+                    and decision.get("mark_human_required_after_send") is True
+                ):
+                    conversation = db.get(Conversation, outreach.conversation_id)
+                    if conversation:
+                        conversation.human_required = True
+                        conversation.human_required_reason = f"{outreach.strategy_type}_outreach"
+                        conversation.human_required_word = None
+                        conversation.human_required_at = utcnow()
+                        db.add(conversation)
+            else:
+                outreach.status = "failed"
+                outreach.cancel_reason = "send_failed"
+            db.add(outreach)
+    if task.task_type == "refresh_customer_orders" and request.status == "failed":
+        from app.models import CustomerOutreachRun
+
+        outreach_id = str((task.payload_json or {}).get("outreach_run_id") or "")
+        outreach = db.get(CustomerOutreachRun, outreach_id) if outreach_id else None
+        if outreach and outreach.status == "rechecking":
+            outreach.status = "scheduled"
+            outreach.due_at = utcnow() + timedelta(minutes=10)
+            outreach.cancel_reason = "order_status_unknown"
+            db.add(outreach)
     if task.message_id:
         message = db.get(Message, task.message_id)
         if message:

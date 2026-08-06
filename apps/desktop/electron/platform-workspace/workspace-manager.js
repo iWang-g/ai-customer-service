@@ -17,6 +17,8 @@ const MESSAGE_PREPARATION_TIMEOUT_MS = 15000;
 const IMAGE_PREPARATION_TIMEOUT_MS = 15000;
 const STORE_SCAN_TIMEOUT_MS = 10000;
 const UNREAD_COLLECTION_TIMEOUT_MS = 15000;
+const BACKGROUND_ACCOUNT_LOAD_TIMEOUT_MS = 30000;
+const UNAVAILABLE_LOGIN_STATUSES = new Set(['login_required', 'risk_control', 'account_mismatch']);
 export const PDD_PENDING_ACCOUNT_ALIAS = '待识别店铺名称';
 const GENERIC_ACCOUNT_ALIAS = /^(拼多多|拼多多商家后台|拼多多商家管理后台|拼多多客服平台|商家后台|客服平台)$/;
 const NUMBERED_PDD_ACCOUNT_ALIAS = /^拼多多店铺\s*\d+$/;
@@ -90,6 +92,9 @@ export class PddWorkspaceManager {
     pddPreloadPath = null,
     rpaManager = null,
     diagnosticLogger = null,
+    homeUrl = PDD_HOME_URL,
+    workspaceShellUrl = null,
+    loadWorkspaceShell = true,
   }) {
     this.registry = registry;
     this.devServerUrl = devServerUrl;
@@ -98,6 +103,9 @@ export class PddWorkspaceManager {
     this.pddPreloadPath = pddPreloadPath;
     this.rpaManager = rpaManager;
     this.diagnosticLogger = diagnosticLogger;
+    this.homeUrl = homeUrl;
+    this.workspaceShellUrl = workspaceShellUrl;
+    this.loadWorkspaceShell = loadWorkspaceShell;
     this.window = null;
     this.userId = null;
     this.activeAccountId = null;
@@ -114,6 +122,12 @@ export class PddWorkspaceManager {
     this.storeActors = new Map();
     this.clipboardQueue = new SerialTaskQueue();
     this.configuredPartitions = new Set();
+    this.initialViewLoads = new Map();
+    this.backgroundLoadQueue = [];
+    this.queuedBackgroundAccounts = new Set();
+    this.backgroundLoadRunning = false;
+    this.backgroundLoadGeneration = 0;
+    this.verifiedAccountIdentities = new Set();
     this.overlayOpen = false;
     this.isQuitting = false;
     this.rpaManager?.on('state-changed', () => this.#publishState());
@@ -156,6 +170,7 @@ export class PddWorkspaceManager {
     this.window.focus();
     this.#syncRpaAccounts();
     await this.#ensureInitialAccount();
+    this.#scheduleBackgroundAccountLoads();
     this.#publishState();
   }
 
@@ -196,7 +211,11 @@ export class PddWorkspaceManager {
       this.window = null;
     });
 
-    if (this.devServerUrl) {
+    if (!this.loadWorkspaceShell) {
+      return;
+    } else if (this.workspaceShellUrl) {
+      await this.window.loadURL(this.workspaceShellUrl);
+    } else if (this.devServerUrl) {
       const workspaceUrl = new URL(this.devServerUrl);
       workspaceUrl.searchParams.set('view', 'pinduoduo-workspace');
       await this.window.loadURL(workspaceUrl.toString());
@@ -207,7 +226,17 @@ export class PddWorkspaceManager {
 
   async #ensureInitialAccount() {
     if (!this.userId || this.activeAccountId) return;
-    const account = this.registry.list(this.userId).find((item) => !item.paused);
+    const account = this.registry
+      .list(this.userId)
+      .filter((item) => !item.paused)
+      .sort((left, right) => {
+        if (left.lastOpenedAt && right.lastOpenedAt) {
+          return right.lastOpenedAt.localeCompare(left.lastOpenedAt);
+        }
+        if (left.lastOpenedAt) return -1;
+        if (right.lastOpenedAt) return 1;
+        return left.createdAt.localeCompare(right.createdAt);
+      })[0];
     if (account) await this.selectAccount(account.id);
   }
 
@@ -220,10 +249,18 @@ export class PddWorkspaceManager {
     }
     const accounts = this.registry
       .list(this.userId)
-      .map((account) => publicAccount(account, this.runtime.get(account.id), this.collectors.get(account.id)));
+      .map((account) => publicAccount(
+        account,
+        this.runtime.get(account.id),
+        this.collectors.get(account.id),
+      ));
     const archivedAccounts = this.registry
       .list(this.userId, { archived: true })
-      .map((account) => publicAccount(account, this.runtime.get(account.id), this.collectors.get(account.id)));
+      .map((account) => publicAccount(
+        account,
+        this.runtime.get(account.id),
+        this.collectors.get(account.id),
+      ));
     const activeView = this.views.get(this.activeAccountId);
     const contents = activeView?.webContents;
     return {
@@ -252,6 +289,7 @@ export class PddWorkspaceManager {
     if (!account || account.archivedAt) throw new Error('店铺账号不存在');
     if (account.paused) throw new Error('请先恢复已暂停的店铺');
 
+    this.#dequeueBackgroundAccount(accountId);
     const view = this.#ensureView(account);
     this.activeAccountId = accountId;
     this.registry.update(this.userId, accountId, { lastOpenedAt: new Date().toISOString() });
@@ -306,6 +344,7 @@ export class PddWorkspaceManager {
       const view = this.#ensureView(account);
       try {
         await this.#waitForViewReady(view.webContents);
+        if (!this.#isAccountIdentityVerified(account)) return [];
         const requestId = randomUUID();
         const candidates = await new Promise((resolve, reject) => {
           const timer = setTimeout(() => {
@@ -361,6 +400,7 @@ export class PddWorkspaceManager {
     }
     const account = this.registry.get(this.userId, accountId);
     if (!account || account.archivedAt || account.paused) throw new Error('店铺账号不可用');
+    if (!this.#isAccountIdentityVerified(account)) throw new Error('店铺身份尚未确认，请等待页面识别完成');
     return this.#getStoreActor(account).enqueue('collect_unread', () => (
       this.#importConversationNow(account, conversationKey.trim().slice(0, 128))
     ));
@@ -393,7 +433,8 @@ export class PddWorkspaceManager {
     const account = this.registry.list(this.userId).find(
       (candidate) => candidate.platformAccountId === platformAccountId
         && !candidate.paused
-        && !['login_required', 'risk_control'].includes(candidate.loginStatus),
+        && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
+        && this.#isAccountIdentityVerified(candidate),
     );
     if (!account) throw new Error('未找到消息对应的拼多多店铺，请确认店铺已登录');
     return this.#getStoreActor(account).enqueue('send_message', ({ setState }) => (
@@ -434,7 +475,8 @@ export class PddWorkspaceManager {
     const account = this.registry.list(this.userId).find(
       (candidate) => candidate.platformAccountId === platformAccountId
         && !candidate.paused
-        && !['login_required', 'risk_control'].includes(candidate.loginStatus),
+        && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
+        && this.#isAccountIdentityVerified(candidate),
     );
     if (!account) throw new Error('未找到消息对应的拼多多店铺，请确认店铺已登录');
     return this.#getStoreActor(account).enqueue('send_image', async ({ setState, signal }) => {
@@ -599,7 +641,8 @@ export class PddWorkspaceManager {
     const account = this.registry.list(this.userId).find(
       (candidate) => candidate.platformAccountId === platformAccountId
         && !candidate.paused
-        && !['login_required', 'risk_control'].includes(candidate.loginStatus),
+        && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
+        && this.#isAccountIdentityVerified(candidate),
     );
     if (!account) {
       void this.#executeRpaTask(task, null);
@@ -607,10 +650,15 @@ export class PddWorkspaceManager {
     }
     let started = false;
     void this.#getStoreActor(account)
-      .enqueue(task.task_type === 'send_message' ? 'send_reply_bundle' : 'send_image', ({ setState, signal }) => {
+      .enqueue(
+        task.task_type === 'send_message'
+          ? 'send_reply_bundle'
+          : task.task_type === 'refresh_customer_orders' ? 'collect_unread' : 'send_image',
+        ({ setState, signal }) => {
         started = true;
         return this.#executeRpaTask(task, account, setState, signal);
-      })
+        },
+      )
       .catch((error) => {
         if (!started) {
           this.rpaManager?.completeTask(task.id, 'failed', {}, error?.message || String(error));
@@ -714,6 +762,12 @@ export class PddWorkspaceManager {
           setState,
         );
         this.rpaManager.completeTask(task.id, 'completed', result);
+      } else if (task.task_type === 'refresh_customer_orders') {
+        if (!account) throw new Error('未找到订单对应的拼多多店铺，请确认店铺已登录');
+        const conversationKey = payload.external_conversation_id || `name:${payload.customer_name || ''}`;
+        const result = await this.#importConversationNow(account, conversationKey.slice(0, 128));
+        if (result?.status !== 'collected') throw new Error('重新读取客户订单失败');
+        this.rpaManager.completeTask(task.id, 'completed', result);
       } else {
         this.rpaManager.completeTask(task.id, 'failed', {}, `Unsupported RPA task: ${task.task_type}`);
       }
@@ -737,6 +791,7 @@ export class PddWorkspaceManager {
     });
 
     if (paused) {
+      this.#dequeueBackgroundAccount(accountId);
       this.#destroyView(accountId);
       if (this.activeAccountId === accountId) this.activeAccountId = null;
       await this.#ensureInitialAccount();
@@ -752,6 +807,7 @@ export class PddWorkspaceManager {
     this.#requireUser();
     const account = this.registry.get(this.userId, accountId);
     if (!account || account.archivedAt) throw new Error('店铺账号不存在');
+    this.#dequeueBackgroundAccount(accountId);
     this.#destroyView(accountId);
     if (this.activeAccountId === accountId) this.activeAccountId = null;
 
@@ -808,6 +864,8 @@ export class PddWorkspaceManager {
   }
 
   async closeForLogout() {
+    this.#cancelBackgroundAccountLoads();
+    await this.#flushAccountStorage();
     for (const accountId of [...this.views.keys()]) this.#destroyView(accountId);
     this.activeAccountId = null;
     this.runtime.clear();
@@ -821,9 +879,116 @@ export class PddWorkspaceManager {
     this.userId = null;
   }
 
-  prepareToQuit() {
+  async prepareToQuit() {
     this.isQuitting = true;
+    this.#cancelBackgroundAccountLoads();
+    await this.#flushAccountStorage();
     for (const accountId of [...this.views.keys()]) this.#destroyView(accountId);
+  }
+
+  async #flushAccountStorage() {
+    if (!this.userId) return;
+    const accounts = [
+      ...this.registry.list(this.userId),
+      ...this.registry.list(this.userId, { archived: true }),
+    ];
+    await Promise.allSettled(accounts.map(async (account) => {
+      try {
+        await session.fromPartition(account.partition).flushStorageData();
+      } catch (error) {
+        this.#writeDiagnostic(account.id, 'partition_flush_failed', {
+          error: error?.message || String(error),
+        }, 'warn');
+      }
+    }));
+  }
+
+  #scheduleBackgroundAccountLoads() {
+    if (!this.userId) return;
+    for (const account of this.registry.list(this.userId)) {
+      if (
+        account.paused
+        || account.archivedAt
+        || this.views.has(account.id)
+        || this.queuedBackgroundAccounts.has(account.id)
+      ) continue;
+      this.backgroundLoadQueue.push(account.id);
+      this.queuedBackgroundAccounts.add(account.id);
+      this.#patchRuntime(account.id, { status: 'queued' });
+      this.#writeDiagnostic(account.id, 'background_load_queued');
+    }
+    this.#publishState();
+    this.#startBackgroundAccountLoads();
+  }
+
+  #startBackgroundAccountLoads() {
+    if (this.backgroundLoadRunning || !this.backgroundLoadQueue.length) return;
+    const generation = this.backgroundLoadGeneration;
+    this.backgroundLoadRunning = true;
+    void this.#drainBackgroundAccountLoads(generation).finally(() => {
+      if (generation !== this.backgroundLoadGeneration) return;
+      this.backgroundLoadRunning = false;
+      if (this.backgroundLoadQueue.length) this.#startBackgroundAccountLoads();
+    });
+  }
+
+  async #drainBackgroundAccountLoads(generation) {
+    while (generation === this.backgroundLoadGeneration && this.backgroundLoadQueue.length) {
+      await this.#waitForInitialViewLoads(generation);
+      if (generation !== this.backgroundLoadGeneration) return;
+
+      const accountId = this.backgroundLoadQueue.shift();
+      this.queuedBackgroundAccounts.delete(accountId);
+      const account = this.userId ? this.registry.get(this.userId, accountId) : null;
+      if (!account || account.paused || account.archivedAt || this.views.has(accountId)) {
+        if (this.runtime.get(accountId)?.status === 'queued') this.runtime.delete(accountId);
+        continue;
+      }
+
+      this.#writeDiagnostic(accountId, 'background_load_started');
+      this.#ensureView(account);
+      this.#publishState();
+    }
+  }
+
+  async #waitForInitialViewLoads(generation) {
+    const loads = [...this.initialViewLoads.entries()];
+    if (!loads.length) return;
+    await Promise.all(loads.map(([accountId, loadPromise]) => new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.initialViewLoads.get(accountId) === loadPromise) {
+          this.initialViewLoads.delete(accountId);
+          if (this.runtime.get(accountId)?.status === 'loading') {
+            this.#patchRuntime(accountId, { status: 'error', detail: '后台页面加载超时' });
+          }
+          this.#writeDiagnostic(accountId, 'background_load_timeout', {}, 'warn');
+          this.#publishState();
+        }
+        resolve();
+      }, BACKGROUND_ACCOUNT_LOAD_TIMEOUT_MS);
+      loadPromise.finally(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    })));
+    if (generation !== this.backgroundLoadGeneration) return;
+  }
+
+  #dequeueBackgroundAccount(accountId) {
+    if (!this.queuedBackgroundAccounts.delete(accountId)) return;
+    this.backgroundLoadQueue = this.backgroundLoadQueue.filter((id) => id !== accountId);
+    if (this.runtime.get(accountId)?.status === 'queued') this.runtime.delete(accountId);
+  }
+
+  #cancelBackgroundAccountLoads() {
+    this.backgroundLoadGeneration += 1;
+    this.backgroundLoadRunning = false;
+    this.backgroundLoadQueue = [];
+    for (const accountId of this.queuedBackgroundAccounts) {
+      if (this.runtime.get(accountId)?.status === 'queued') this.runtime.delete(accountId);
+    }
+    this.queuedBackgroundAccounts.clear();
+    this.initialViewLoads.clear();
   }
 
   #ensureView(account) {
@@ -851,18 +1016,24 @@ export class PddWorkspaceManager {
     this.#bindViewEvents(account.id, view);
     this.#layoutViews();
 
-    this.runtime.set(account.id, { status: 'loading' });
+    this.#patchRuntime(account.id, { status: 'loading' });
     this.#writeDiagnostic(account.id, 'view_created', {
-      page_path: PDD_HOME_URL,
+      page_path: this.homeUrl,
       partition: account.partition,
     });
-    void view.webContents.loadURL(PDD_HOME_URL).catch((error) => {
-      this.runtime.set(account.id, { status: 'error', detail: error.message });
+    const initialLoad = view.webContents.loadURL(this.homeUrl).catch((error) => {
+      if (this.views.get(account.id) !== view) return;
+      this.#patchRuntime(account.id, { status: 'error', detail: error.message });
       this.#writeDiagnostic(account.id, 'view_load_rejected', {
         error: error.message,
       }, 'error');
       this.#publishState();
+    }).finally(() => {
+      if (this.initialViewLoads.get(account.id) === initialLoad) {
+        this.initialViewLoads.delete(account.id);
+      }
     });
+    this.initialViewLoads.set(account.id, initialLoad);
     return view;
   }
 
@@ -878,7 +1049,7 @@ export class PddWorkspaceManager {
     const contents = view.webContents;
     let mainFrameLoadFailed = false;
     const setStatus = (status, detail) => {
-      this.runtime.set(accountId, { status, detail });
+      this.#patchRuntime(accountId, { status, detail });
       this.#publishState();
     };
 
@@ -974,7 +1145,7 @@ export class PddWorkspaceManager {
           !account
           || account.paused
           || account.archivedAt
-          || ['login_required', 'risk_control'].includes(account.loginStatus)
+          || UNAVAILABLE_LOGIN_STATUSES.has(account.loginStatus)
         ) return;
         void this.#getStoreActor(account)
           .enqueue(
@@ -1066,6 +1237,8 @@ export class PddWorkspaceManager {
 
   #destroyView(accountId) {
     this.#cancelStoreActor(accountId, '店铺页面已关闭，任务已取消');
+    this.verifiedAccountIdentities.delete(accountId);
+    this.initialViewLoads.delete(accountId);
     const view = this.views.get(accountId);
     if (!view) return;
     try {
@@ -1211,6 +1384,31 @@ export class PddWorkspaceManager {
     this.window.webContents.send('pdd-workspace:state-changed', this.getState());
   }
 
+  #patchRuntime(accountId, updates) {
+    this.runtime.set(accountId, { ...this.runtime.get(accountId), ...updates });
+  }
+
+  async refreshCustomerOrders({ platformAccountId, externalConversationId, customerName }) {
+    this.#requireUser();
+    const account = this.registry.list(this.userId).find(
+      (candidate) => candidate.platformAccountId === platformAccountId
+        && !candidate.paused
+        && !candidate.archivedAt
+        && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
+        && this.#isAccountIdentityVerified(candidate),
+    );
+    if (!account) throw new Error('未找到订单对应的拼多多店铺，请确认店铺已登录');
+    const conversationKey = externalConversationId || `name:${customerName}`;
+    return this.#getStoreActor(account).enqueue('collect_unread', () => (
+      this.#importConversationNow(account, conversationKey.slice(0, 128))
+    ));
+  }
+
+  #isAccountIdentityVerified(account) {
+    if (!account.externalAccountId) return Boolean(account.platformAccountId);
+    return this.verifiedAccountIdentities.has(account.id);
+  }
+
   #updateLoginStatus(accountId, value) {
     try {
       const status = classifyPddPage(value);
@@ -1225,8 +1423,8 @@ export class PddWorkspaceManager {
   #setAccountLoginStatus(accountId, loginStatus) {
     if (!this.userId) return;
     const account = this.registry.get(this.userId, accountId);
-    if (!account || account.loginStatus === loginStatus) return;
-    this.registry.update(this.userId, accountId, { loginStatus });
+    if (!account) return;
+    if (account.loginStatus !== loginStatus) this.registry.update(this.userId, accountId, { loginStatus });
     if (loginStatus === 'login_required' || loginStatus === 'risk_control') {
       this.#cancelStoreActor(accountId, '店铺登录状态不可用，任务已取消');
     }
@@ -1248,12 +1446,50 @@ export class PddWorkspaceManager {
       lastCollectedAt: null,
       runtime: new PddCollectionRuntime({
         localAccountId: accountId,
-        getPlatformAccountId: () => this.registry.get(this.userId, accountId)?.platformAccountId || null,
+        getPlatformAccountId: () => {
+          const account = this.registry.get(this.userId, accountId);
+          return account && this.#isAccountIdentityVerified(account) ? account.platformAccountId || null : null;
+        },
         enqueueEvent: (event) => {
+          const account = this.registry.get(this.userId, accountId);
+          const identityVerified = account ? this.#isAccountIdentityVerified(account) : false;
+          if (!account || !identityVerified) {
+            this.#writeDiagnostic(accountId, 'runtime_event_dropped_before_rpa_enqueue', {
+              reason: !account ? 'account_missing' : 'identity_not_verified',
+              event_id: event?.event_id || null,
+              event_type: event?.event_type || null,
+              platform_message_id: event?.platform_message_id || null,
+              conversation_external_id: event?.conversation_external_id || null,
+              sender_role: event?.payload_json?.sender_role || null,
+              content_preview: String(event?.payload_json?.content || '').slice(0, 128),
+              has_platform_account_id: Boolean(account?.platformAccountId),
+              has_external_account_id: Boolean(account?.externalAccountId),
+              login_status: account?.loginStatus || null,
+            }, 'warn');
+            return;
+          }
           collector.status = 'collecting';
           collector.lastCollectedAt = new Date().toISOString();
+          this.#writeDiagnostic(accountId, 'runtime_event_forwarding_to_rpa', {
+            event_id: event?.event_id || null,
+            event_type: event?.event_type || null,
+            platform_account_id: event?.platform_account_id || null,
+            platform_message_id: event?.platform_message_id || null,
+            conversation_external_id: event?.conversation_external_id || null,
+            sender_role: event?.payload_json?.sender_role || null,
+            content_preview: String(event?.payload_json?.content || '').slice(0, 128),
+            rpa_state: this.rpaManager?.getState?.().status || null,
+            ...(event?.event_type === 'customer_orders_snapshot' ? {
+              order_collection_status: event?.payload_json?.collection_status || null,
+              order_collection_error: event?.payload_json?.error || null,
+              order_count: Array.isArray(event?.payload_json?.orders) ? event.payload_json.orders.length : 0,
+            } : {}),
+          });
           this.rpaManager?.enqueueEvent(event);
           this.#publishState();
+        },
+        onDiagnostic: (stage, details = {}, level = 'debug') => {
+          this.#writeDiagnostic(accountId, stage, details, level);
         },
         onStatus: (status) => {
           collector.status = status === 'online' ? 'watching' : status;
@@ -1269,6 +1505,37 @@ export class PddWorkspaceManager {
         }) => {
           const current = this.registry.get(this.userId, accountId);
           if (!current) return;
+          if (
+            current.externalAccountId
+            && externalAccountId
+            && current.externalAccountId !== externalAccountId
+          ) {
+            this.registry.update(this.userId, accountId, { loginStatus: 'account_mismatch' });
+            collector.status = 'error';
+            this.#cancelStoreActor(accountId, '登录账号与原店铺不匹配，任务已取消');
+            this.#writeDiagnostic(accountId, 'account_identity_mismatch', {
+              expected_present: true,
+              actual_present: true,
+            }, 'error');
+            this.#syncRpaAccounts();
+            this.#publishState();
+            return;
+          }
+          const canVerifyIdentity = externalAccountId
+            ? (!current.externalAccountId || current.externalAccountId === externalAccountId)
+            : (!current.externalAccountId && Boolean(current.platformAccountId));
+          if (canVerifyIdentity) {
+            const wasVerified = this.verifiedAccountIdentities.has(accountId);
+            this.verifiedAccountIdentities.add(accountId);
+            if (!wasVerified) {
+              this.#writeDiagnostic(accountId, 'account_identity_verified', {
+                method: externalAccountId ? 'external_account_id' : 'bound_platform_account',
+                has_platform_account_id: Boolean(current.platformAccountId),
+                has_external_account_id: Boolean(externalAccountId),
+              });
+            }
+            collector.runtime.accountBindingChanged();
+          }
           const identifiedAlias = detectedAlias(platformAccountName);
           const shouldIdentifyAlias = isAutoReplaceableAlias(current.alias) && identifiedAlias;
           if (

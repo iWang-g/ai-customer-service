@@ -46,7 +46,19 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "qa_match_type": "VARCHAR(32)",
             "document_retrieval_used": "BOOLEAN NOT NULL DEFAULT 0",
             "retrieval_count": "INTEGER NOT NULL DEFAULT 0",
+            "human_required_marked": "BOOLEAN NOT NULL DEFAULT 0",
+            "human_required_reason": "VARCHAR(64)",
+            "human_required_marked_at": "DATETIME",
             "reply_generation_duration_ms": "INTEGER",
+        },
+        "email_provider_configs": {
+            "trigger_scenarios": "TEXT NOT NULL DEFAULT ''",
+            "ask_email_text": "TEXT NOT NULL DEFAULT ''",
+            "success_text": "TEXT NOT NULL DEFAULT ''",
+            "missing_template_text": "TEXT NOT NULL DEFAULT ''",
+        },
+        "email_templates": {
+            "platform_account_id": "VARCHAR(32)",
         },
     }
     inspector = inspect(engine)
@@ -129,6 +141,13 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 "ON messages (conversation_id, platform_message_id)"
             )
         )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_email_template_user_platform_account "
+                "ON email_templates (user_id, platform_account_id) "
+                "WHERE platform_account_id IS NOT NULL"
+            )
+        )
         connection.execute(text(
             """CREATE TABLE IF NOT EXISTS robot_qa_knowledge_bases (
                 id VARCHAR(32) PRIMARY KEY,
@@ -184,6 +203,10 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 smtp_port INTEGER NOT NULL DEFAULT 465,
                 security VARCHAR(32) NOT NULL DEFAULT 'ssl',
                 auth_secret_encrypted TEXT NOT NULL DEFAULT '',
+                trigger_scenarios TEXT NOT NULL DEFAULT '',
+                ask_email_text TEXT NOT NULL DEFAULT '',
+                success_text TEXT NOT NULL DEFAULT '',
+                missing_template_text TEXT NOT NULL DEFAULT '',
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL
             )"""
@@ -208,9 +231,11 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 subject VARCHAR(256) NOT NULL,
                 body TEXT NOT NULL,
                 enabled BOOLEAN NOT NULL DEFAULT 1,
+                platform_account_id VARCHAR(32) REFERENCES platform_accounts(id) ON DELETE SET NULL,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
-                CONSTRAINT uq_email_template_user_key UNIQUE (user_id, template_key)
+                CONSTRAINT uq_email_template_user_key UNIQUE (user_id, template_key),
+                CONSTRAINT uq_email_template_user_platform_account UNIQUE (user_id, platform_account_id)
             )"""
         ))
         connection.execute(text(
@@ -269,6 +294,9 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 qa_match_type VARCHAR(32),
                 document_retrieval_used BOOLEAN NOT NULL DEFAULT 0,
                 retrieval_count INTEGER NOT NULL DEFAULT 0,
+                human_required_marked BOOLEAN NOT NULL DEFAULT 0,
+                human_required_reason VARCHAR(64),
+                human_required_marked_at DATETIME,
                 reply_generation_duration_ms INTEGER,
                 trace_id VARCHAR(128),
                 reply_message_id VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL,
@@ -302,6 +330,59 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 updated_at DATETIME NOT NULL
             )"""
         ))
+        connection.execute(text(
+            """CREATE TABLE IF NOT EXISTS customer_orders (
+                id VARCHAR(32) PRIMARY KEY,
+                user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform_account_id VARCHAR(32) NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                customer_key VARCHAR(160) NOT NULL,
+                platform_order_id VARCHAR(128) NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'unknown',
+                raw_status VARCHAR(128) NOT NULL DEFAULT '',
+                products_json JSON NOT NULL DEFAULT '[]',
+                order_amount FLOAT,
+                discount_amount FLOAT,
+                paid_amount FLOAT,
+                ordered_at DATETIME,
+                paid_at DATETIME,
+                signed_at DATETIME,
+                after_sale_json JSON NOT NULL DEFAULT '{}',
+                first_observed_at DATETIME NOT NULL,
+                last_observed_at DATETIME NOT NULL,
+                raw_payload JSON NOT NULL DEFAULT '{}',
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_customer_order_platform_order
+                    UNIQUE (platform_account_id, platform_order_id)
+            )"""
+        ))
+        connection.execute(text(
+            """CREATE TABLE IF NOT EXISTS customer_outreach_runs (
+                id VARCHAR(32) PRIMARY KEY,
+                user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                robot_id VARCHAR(32) NOT NULL REFERENCES robots(id) ON DELETE CASCADE,
+                platform_account_id VARCHAR(32) NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                customer_key VARCHAR(160) NOT NULL,
+                strategy_type VARCHAR(64) NOT NULL,
+                order_id VARCHAR(32) REFERENCES customer_orders(id) ON DELETE SET NULL,
+                source_message_id VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+                due_at DATETIME NOT NULL,
+                decision_json JSON NOT NULL DEFAULT '{}',
+                message_text TEXT NOT NULL DEFAULT '',
+                message_id VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL,
+                send_task_id VARCHAR(32) REFERENCES rpa_tasks(id) ON DELETE SET NULL,
+                idempotency_key VARCHAR(160) NOT NULL UNIQUE,
+                cancel_reason VARCHAR(64),
+                completed_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_customer_outreach_customer_strategy
+                    UNIQUE (platform_account_id, customer_key, strategy_type)
+            )"""
+        ))
         for table, index, column in (
             ("robot_qa_knowledge_bases", "ix_robot_qa_kb_robot_id", "robot_id"),
             ("robot_product_knowledge_bases", "ix_robot_product_kb_robot_id", "robot_id"),
@@ -311,6 +392,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             ("email_provider_configs", "ix_email_provider_configs_user_id", "user_id"),
             ("email_templates", "ix_email_templates_user_id", "user_id"),
             ("email_templates", "ix_email_templates_template_key", "template_key"),
+            ("email_templates", "ix_email_templates_platform_account_id", "platform_account_id"),
             ("conversation_workflows", "ix_conversation_workflows_user_id", "user_id"),
             ("conversation_workflows", "ix_conversation_workflows_conversation_id", "conversation_id"),
             ("conversation_workflows", "ix_conversation_workflows_status", "status"),
@@ -332,5 +414,22 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             ("ai_model_calls", "ix_ai_model_calls_trace_id", "trace_id"),
             ("ai_model_calls", "ix_ai_model_calls_model", "model"),
             ("ai_model_calls", "ix_ai_model_calls_status", "status"),
+            ("customer_orders", "ix_customer_orders_user_id", "user_id"),
+            ("customer_orders", "ix_customer_orders_platform_account_id", "platform_account_id"),
+            ("customer_orders", "ix_customer_orders_conversation_id", "conversation_id"),
+            ("customer_orders", "ix_customer_orders_customer_key", "customer_key"),
+            ("customer_orders", "ix_customer_orders_platform_order_id", "platform_order_id"),
+            ("customer_orders", "ix_customer_orders_status", "status"),
+            ("customer_outreach_runs", "ix_customer_outreach_user_id", "user_id"),
+            ("customer_outreach_runs", "ix_customer_outreach_robot_id", "robot_id"),
+            ("customer_outreach_runs", "ix_customer_outreach_platform_account_id", "platform_account_id"),
+            ("customer_outreach_runs", "ix_customer_outreach_conversation_id", "conversation_id"),
+            ("customer_outreach_runs", "ix_customer_outreach_customer_key", "customer_key"),
+            ("customer_outreach_runs", "ix_customer_outreach_strategy_type", "strategy_type"),
+            ("customer_outreach_runs", "ix_customer_outreach_order_id", "order_id"),
+            ("customer_outreach_runs", "ix_customer_outreach_source_message_id", "source_message_id"),
+            ("customer_outreach_runs", "ix_customer_outreach_status", "status"),
+            ("customer_outreach_runs", "ix_customer_outreach_due_at", "due_at"),
+            ("customer_outreach_runs", "ix_customer_outreach_idempotency_key", "idempotency_key"),
         ):
             connection.execute(text(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({column})"))

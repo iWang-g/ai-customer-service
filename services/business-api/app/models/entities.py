@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, relationship, mapped_column
 
 from app.models.base import Base, TimestampMixin, generate_id, utcnow
@@ -47,6 +47,12 @@ class User(Base, TimestampMixin):
     automation_reply_runs: Mapped[list["AutomationReplyRun"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    customer_orders: Mapped[list["CustomerOrder"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    customer_outreach_runs: Mapped[list["CustomerOutreachRun"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class AiProviderConfig(Base, TimestampMixin):
@@ -86,13 +92,20 @@ class EmailProviderConfig(Base, TimestampMixin):
     smtp_port: Mapped[int] = mapped_column(Integer, default=465, nullable=False)
     security: Mapped[str] = mapped_column(String(32), default="ssl", nullable=False)
     auth_secret_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    trigger_scenarios: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    ask_email_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    success_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    missing_template_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="email_provider_configs")
 
 
 class EmailTemplate(Base, TimestampMixin):
     __tablename__ = "email_templates"
-    __table_args__ = (UniqueConstraint("user_id", "template_key", name="uq_email_template_user_key"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "template_key", name="uq_email_template_user_key"),
+        UniqueConstraint("user_id", "platform_account_id", name="uq_email_template_user_platform_account"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
@@ -103,8 +116,12 @@ class EmailTemplate(Base, TimestampMixin):
     subject: Mapped[str] = mapped_column(String(256), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    platform_account_id: Mapped[str | None] = mapped_column(
+        ForeignKey("platform_accounts.id", ondelete="SET NULL"), index=True, nullable=True
+    )
 
     user: Mapped["User"] = relationship(back_populates="email_templates")
+    platform_account: Mapped["PlatformAccount | None"] = relationship()
     workflows: Mapped[list["ConversationWorkflow"]] = relationship(back_populates="template")
     send_tasks: Mapped[list["EmailSendTask"]] = relationship(back_populates="template")
 
@@ -133,6 +150,9 @@ class Robot(Base, TimestampMixin):
         back_populates="robot", cascade="all, delete-orphan"
     )
     automation_reply_runs: Mapped[list["AutomationReplyRun"]] = relationship(
+        back_populates="robot", cascade="all, delete-orphan"
+    )
+    customer_outreach_runs: Mapped[list["CustomerOutreachRun"]] = relationship(
         back_populates="robot", cascade="all, delete-orphan"
     )
 
@@ -235,6 +255,10 @@ class PlatformAccount(Base, TimestampMixin):
     events: Mapped[list["RpaEvent"]] = relationship(back_populates="platform_account")
     tasks: Mapped[list["RpaTask"]] = relationship(back_populates="platform_account")
     robot_scopes: Mapped[list["RobotPlatformScope"]] = relationship(back_populates="platform_account")
+    customer_orders: Mapped[list["CustomerOrder"]] = relationship(back_populates="platform_account")
+    customer_outreach_runs: Mapped[list["CustomerOutreachRun"]] = relationship(
+        back_populates="platform_account"
+    )
 
 
 class Conversation(Base, TimestampMixin):
@@ -273,6 +297,12 @@ class Conversation(Base, TimestampMixin):
     automation_reply_runs: Mapped[list["AutomationReplyRun"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
+    customer_orders: Mapped[list["CustomerOrder"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+    customer_outreach_runs: Mapped[list["CustomerOutreachRun"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
 
 
 class Message(Base, TimestampMixin):
@@ -307,6 +337,96 @@ class Message(Base, TimestampMixin):
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+
+
+class CustomerOrder(Base, TimestampMixin):
+    __tablename__ = "customer_orders"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform_account_id", "platform_order_id", name="uq_customer_order_platform_order"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    platform_account_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_accounts.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    customer_key: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
+    platform_order_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="unknown", nullable=False)
+    raw_status: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    products_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    order_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    discount_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    paid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ordered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    after_sale_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    first_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="customer_orders")
+    platform_account: Mapped["PlatformAccount"] = relationship(back_populates="customer_orders")
+    conversation: Mapped["Conversation"] = relationship(back_populates="customer_orders")
+
+
+class CustomerOutreachRun(Base, TimestampMixin):
+    __tablename__ = "customer_outreach_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform_account_id", "customer_key", "strategy_type",
+            name="uq_customer_outreach_customer_strategy",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    robot_id: Mapped[str] = mapped_column(
+        ForeignKey("robots.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    platform_account_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_accounts.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    customer_key: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
+    strategy_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    order_id: Mapped[str | None] = mapped_column(
+        ForeignKey("customer_orders.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    source_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(32), index=True, default="candidate", nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    decision_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    message_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    send_task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("rpa_tasks.id", ondelete="SET NULL"), nullable=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(160), unique=True, index=True, nullable=False)
+    cancel_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="customer_outreach_runs")
+    robot: Mapped["Robot"] = relationship(back_populates="customer_outreach_runs")
+    platform_account: Mapped["PlatformAccount"] = relationship(back_populates="customer_outreach_runs")
+    conversation: Mapped["Conversation"] = relationship(back_populates="customer_outreach_runs")
+    order: Mapped["CustomerOrder | None"] = relationship()
 
 
 class ConversationWorkflow(Base, TimestampMixin):
@@ -480,6 +600,9 @@ class AutomationReplyRun(Base, TimestampMixin):
     qa_match_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     document_retrieval_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     retrieval_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    human_required_marked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    human_required_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    human_required_marked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reply_generation_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     trace_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
     reply_message_id: Mapped[str | None] = mapped_column(

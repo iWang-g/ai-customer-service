@@ -8,7 +8,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
-from app.models import AutomationReplyRun, Message, RpaTask, User
+from app.models import AutomationReplyRun, Conversation, Message, RpaTask, User
 from app.models.base import utcnow
 from app.schemas.analytics import (
     ConsultationCategory,
@@ -104,6 +104,10 @@ def _categories(runs: list[AutomationReplyRun]) -> list[ConsultationCategory]:
     ]
 
 
+def _run_completion_time():
+    return func.coalesce(AutomationReplyRun.completed_at, AutomationReplyRun.updated_at, AutomationReplyRun.created_at)
+
+
 def get_dashboard_analytics(
     db: Session,
     user: User,
@@ -125,34 +129,66 @@ def get_dashboard_analytics(
         ).all()
     )
     inbound_messages = [message for message in valid_messages if message.sender_role == "customer"]
-    agent_messages = [message for message in valid_messages if message.sender_role == "agent"]
+    inbound_conversation_ids = {message.conversation_id for message in inbound_messages}
 
-    reply_message_ids = {message.id for message in agent_messages}
-    robot_reply_ids: set[str] = set()
-    if reply_message_ids:
-        robot_reply_ids = set(
-            db.scalars(
-                select(AutomationReplyRun.reply_message_id)
-                .join(RpaTask, AutomationReplyRun.send_task_id == RpaTask.id)
-                .where(
-                    AutomationReplyRun.user_id == user.id,
-                    AutomationReplyRun.reply_message_id.in_(reply_message_ids),
-                    RpaTask.status == "completed",
-                )
-            ).all()
-        )
-        robot_reply_ids.discard(None)
-
-    replied_conversations: dict[str, list[Message]] = {}
-    for message in agent_messages:
-        replied_conversations.setdefault(message.conversation_id, []).append(message)
-    independent_count = sum(
-        bool(messages) and all(message.id in robot_reply_ids for message in messages)
-        for messages in replied_conversations.values()
+    completed_runs = list(
+        db.scalars(
+            select(AutomationReplyRun)
+            .join(RpaTask, AutomationReplyRun.send_task_id == RpaTask.id)
+            .where(
+                AutomationReplyRun.user_id == user.id,
+                AutomationReplyRun.status == "succeeded",
+                AutomationReplyRun.decision == "auto_send",
+                AutomationReplyRun.human_required_marked.is_(False),
+                AutomationReplyRun.reply_message_id.is_not(None),
+                AutomationReplyRun.send_task_id.is_not(None),
+                RpaTask.status == "completed",
+                RpaTask.completed_at >= start_at,
+                RpaTask.completed_at < end_at,
+            )
+        ).all()
     )
+
+    run_timestamp = _run_completion_time()
+    handoff_run_rows = db.execute(
+        select(AutomationReplyRun.conversation_id).where(
+            AutomationReplyRun.user_id == user.id,
+            AutomationReplyRun.human_required_marked.is_(True),
+            run_timestamp >= start_at,
+            run_timestamp < end_at,
+        )
+    ).all()
+    handoff_conversation_ids = {conversation_id for (conversation_id,) in handoff_run_rows}
+
+    # Compatibility for rows created before AutomationReplyRun stored handoff summaries.
+    legacy_handoff_rows = db.execute(
+        select(Message.conversation_id)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Message.user_id == user.id,
+            Message.sender_role == "customer",
+            Message.source != "demo",
+            Message.message_status == "sent",
+            timestamp >= start_at,
+            timestamp < end_at,
+            Conversation.human_required.is_(True),
+            Conversation.human_required_at >= start_at,
+            Conversation.human_required_at < end_at,
+        )
+    ).all()
+    handoff_conversation_ids.update(conversation_id for (conversation_id,) in legacy_handoff_rows)
+
+    robot_reply_count = len(completed_runs)
+    handoff_count = len(handoff_conversation_ids)
+    total_processing_count = robot_reply_count + handoff_count
     reception_rate = (
-        round(independent_count * 100 / len(replied_conversations), 1)
-        if replied_conversations
+        round(robot_reply_count * 100 / total_processing_count, 1)
+        if total_processing_count
+        else 0.0
+    )
+    transfer_to_human_rate = (
+        round(handoff_count * 100 / len(inbound_conversation_ids), 1)
+        if inbound_conversation_ids
         else 0.0
     )
 
@@ -201,6 +237,7 @@ def get_dashboard_analytics(
             message_count=len(valid_messages),
             independent_reception_rate=reception_rate,
             average_response_seconds=average_response,
+            transfer_to_human_rate=transfer_to_human_rate,
         ),
         traffic=_traffic_points(inbound_messages, start_date, end_date, zone),
         categories=_categories(category_runs),

@@ -9,6 +9,10 @@ contextBridge.exposeInMainWorld('desktopBridge', {
     'pdd-workspace:import-conversation',
     { accountId, conversationKey },
   ),
+  refreshPddCustomerOrders: (payload) => ipcRenderer.invoke(
+    'pdd-workspace:refresh-customer-orders',
+    payload,
+  ),
   sendPddMessage: (payload) => ipcRenderer.invoke('pdd-workspace:send-message', payload),
   sendPddImage: (payload) => ipcRenderer.invoke('pdd-workspace:send-image', payload),
 });

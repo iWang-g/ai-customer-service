@@ -5,6 +5,7 @@ import {
   connectRealtime,
   getQaImageUrl,
   getCurrentUser,
+  getCustomerOrders,
   getMonitoringOverview,
   getStoredSession,
   listConversations,
@@ -20,6 +21,7 @@ import {
   type ApiConversation,
   type ApiMessage,
   type AuthSession,
+  type CustomerOrdersResponse,
   type MonitoringEvent,
   type MonitoringLog,
 } from '../../shared/api/client';
@@ -133,6 +135,8 @@ export function useMessageCenterController() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
   const [isLoadingMonitoring, setIsLoadingMonitoring] = useState(false);
+  const [customerOrders, setCustomerOrders] = useState<CustomerOrdersResponse | null>(null);
+  const [isLoadingCustomerOrders, setIsLoadingCustomerOrders] = useState(false);
   const monitoringModelRef = useRef('deepseek-chat');
 
   const mapMonitoringLog = (item: MonitoringLog): LogEntry => ({
@@ -224,6 +228,30 @@ export function useMessageCenterController() {
     }
   }, []);
 
+  const loadCustomerOrders = useCallback(async (conversationId: string) => {
+    setIsLoadingCustomerOrders(true);
+    try {
+      const response = await getCustomerOrders(conversationId);
+      console.info('[customer-orders] loaded', {
+        conversationId,
+        collectionStatus: response.collection_status,
+        collectionError: response.collection_error,
+        observedAt: response.observed_at,
+        totalCount: response.total_count,
+        visibleOrderCount: response.orders.length,
+        outreachCount: response.outreach.length,
+      });
+      if (selectedIdRef.current === conversationId) setCustomerOrders(response);
+      return response;
+    } catch (error) {
+      console.error('加载客户订单失败:', error);
+      if (selectedIdRef.current === conversationId) setCustomerOrders(null);
+      return null;
+    } finally {
+      if (selectedIdRef.current === conversationId) setIsLoadingCustomerOrders(false);
+    }
+  }, []);
+
   const loadConversationData = useCallback(async () => {
     setIsLoadingConversations(true);
     setDataError('');
@@ -239,7 +267,10 @@ export function useMessageCenterController() {
         });
         return mapped;
       });
-      if (targetId) await loadMessagesForConversation(targetId);
+      if (targetId) await Promise.all([
+        loadMessagesForConversation(targetId),
+        loadCustomerOrders(targetId),
+      ]);
       else {
         selectedIdRef.current = '';
         setSelectedId('');
@@ -251,7 +282,7 @@ export function useMessageCenterController() {
     } finally {
       setIsLoadingConversations(false);
     }
-  }, [loadMessagesForConversation]);
+  }, [loadCustomerOrders, loadMessagesForConversation]);
 
   const loadImportCandidates = useCallback(async () => {
     setIsLoadingImportCandidates(true);
@@ -468,6 +499,29 @@ export function useMessageCenterController() {
     )));
   };
 
+  const handleRefreshCustomerOrders = useCallback(async () => {
+    const conversation = conversations.find((item) => item.id === selectedIdRef.current);
+    if (!conversation) return;
+    if (conversation.platform !== 'pinduoduo') {
+      throw new Error('当前平台暂不支持自动读取客户订单');
+    }
+    if (!window.desktopBridge) throw new Error('当前运行环境不支持拼多多订单采集');
+    const previousObservedAt = customerOrders?.conversation_id === conversation.id
+      ? customerOrders.observed_at
+      : null;
+    setIsLoadingCustomerOrders(true);
+    await window.desktopBridge.refreshPddCustomerOrders({
+      platformAccountId: conversation.shopId,
+      externalConversationId: conversation.externalConversationId || null,
+      customerName: conversation.userName,
+    });
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const response = await loadCustomerOrders(conversation.id);
+      if (response?.observed_at && response.observed_at !== previousObservedAt) break;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+  }, [conversations, customerOrders, loadCustomerOrders]);
+
   const handleImportCandidate = useCallback(async (candidate: PddImportCandidate) => {
     if (!window.desktopBridge) throw new Error('当前运行环境不支持桌面客服窗口导入');
     await window.desktopBridge.importPddConversation(candidate.accountId, candidate.conversationKey);
@@ -516,7 +570,10 @@ export function useMessageCenterController() {
     logs,
     statusEvents,
     isLoadingMonitoring,
+    customerOrders,
+    isLoadingCustomerOrders,
     handleMonitoringModelChange,
+    handleRefreshCustomerOrders,
     loadMonitoring,
     handleLogin,
     handleRegister,
@@ -530,7 +587,9 @@ export function useMessageCenterController() {
     setAuthMode,
     setCurrentView,
     setIsImportModalOpen,
-    setSelectedId: (id: string) => void loadMessagesForConversation(id),
+    setSelectedId: (id: string) => {
+      void Promise.all([loadMessagesForConversation(id), loadCustomerOrders(id)]);
+    },
     setSelectedPlatform: (platform: string) => {
       setSelectedShop('all');
       setSelectedPlatform(platform);

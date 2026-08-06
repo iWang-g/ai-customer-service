@@ -15,6 +15,7 @@ from app.models import (
     EmailSendTask,
     EmailTemplate,
     Message,
+    PlatformAccount,
     Robot,
     User,
 )
@@ -22,6 +23,7 @@ from app.services.email_service import decrypt_recipient, encrypt_secret, send_t
 from app.services.email_workflow_service import (
     ASK_EMAIL_TEXT,
     FAILURE_TEXT,
+    MISSING_TEMPLATE_TEXT,
     SUCCESS_TEXT,
     active_workflow,
     extract_email,
@@ -123,6 +125,42 @@ class EmailWorkflowServiceTests(unittest.TestCase):
         self.assertEqual(workflow.status, "waiting_for_email")
         self.assertEqual(workflow.template_id, self.template.id)
         self.assertEqual(workflow.missing_slots_json, ["email"])
+
+    def test_missing_bound_template_replies_and_marks_human_action(self) -> None:
+        account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            platform_name="拼多多",
+            local_account_id="shop-1",
+            account_name="测试店铺",
+            account_alias="测试店铺",
+            is_active=True,
+        )
+        self.db.add(account)
+        self.db.commit()
+        self.db.refresh(account)
+        self.conversation.platform_account_id = account.id
+        self.db.commit()
+        source = self.customer_message("把店铺链接发我邮箱")
+
+        result = start_or_resume_email_workflow(
+            self.db,
+            self.user,
+            self.conversation,
+            self.robot,
+            message=source.content,
+            source_message=source,
+            templates=[self.template],
+        )
+
+        workflow = self.db.scalar(select(ConversationWorkflow).where(
+            ConversationWorkflow.conversation_id == self.conversation.id,
+        ))
+        self.assertEqual(result["text"], MISSING_TEMPLATE_TEXT)
+        self.assertEqual(result["action_plan"]["workflow"], "human_review")
+        self.assertEqual(result["action_plan"]["next_action"], "mark_needs_human")
+        self.assertIn("missing_bound_email_template", result["risk_flags"])
+        self.assertEqual(workflow.status, "failed")
 
     def test_resume_with_email_sends_template_and_completes_workflow(self) -> None:
         first = self.customer_message("把安装资料发我邮箱")

@@ -83,12 +83,13 @@ class RpaMessageDedupTests(unittest.TestCase):
         self.assertEqual(first_messages, [])
         self.assertEqual(second_messages, [])
         self.assertEqual(len(identified_messages), 1)
-        self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), 2)
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), 1)
         identified = self.db.scalar(
             select(Message).where(Message.platform_message_id == "middlePanel_list_100")
         )
         self.assertIsNotNone(identified)
         self.assertEqual(identified.snapshot_sequence, 14)
+        self.assertEqual(identified.observed_at, datetime(2026, 7, 31, 2, 49, 41, 587000))
 
     def test_repeated_content_with_distinct_platform_ids_stays_distinct(self) -> None:
         create_event(

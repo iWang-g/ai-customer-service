@@ -73,6 +73,8 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+const DEFAULT_SENSITIVE_WORD_REPLY_TEXT = '已收到您的消息，正在为您转接人工客服，请稍等～';
+
 const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat('sv-SE', {
   timeZone: 'Asia/Shanghai',
   year: 'numeric',
@@ -284,7 +286,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [emailTestTemplateId, setEmailTestTemplateId] = useState('');
   const [emailTemplateModalId, setEmailTemplateModalId] = useState<string | null | undefined>(undefined);
   const emptyEmailTemplate: EmailTemplateInput = {
-    template_key: '', name: '', scene: 'store_view_link', aliases: [], subject: '', body: '', enabled: true,
+    template_key: null, name: '', scene: 'email_service', aliases: [], subject: '', body: '', enabled: true, platform_account_id: null,
   };
   const [emailTemplateForm, setEmailTemplateForm] = useState<EmailTemplateInput>(emptyEmailTemplate);
   const [robotName, setRobotName] = useState('');
@@ -303,6 +305,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [advancedInstruction, setAdvancedInstruction] = useState('善用 emoji 表情符号和分点，直观呈现重点信息，提升亲和力。');
   const [inboundSensitiveWords, setInboundSensitiveWords] = useState<string[]>([]);
   const [sensitiveWordDraft, setSensitiveWordDraft] = useState('');
+  const [sensitiveWordReplyText, setSensitiveWordReplyText] = useState(DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
   const [outboundBlockRules, setOutboundBlockRules] = useState<OutboundBlockRule[]>([]);
   const [outboundBlockWordDraft, setOutboundBlockWordDraft] = useState('');
   const [outboundReplacementDraft, setOutboundReplacementDraft] = useState('');
@@ -311,6 +314,14 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [timeoutEnabled, setTimeoutEnabled] = useState(true);
   const [timeoutSeconds, setTimeoutSeconds] = useState(10);
   const [timeoutReplyText, setTimeoutReplyText] = useState('专项客服正在赶来的路上请稍等~~');
+  const [orderFollowUpEnabled, setOrderFollowUpEnabled] = useState(false);
+  const [orderFollowUpText, setOrderFollowUpText] = useState('');
+  const [orderFollowUpDelayMinutes, setOrderFollowUpDelayMinutes] = useState(60);
+  const [orderFollowUpMarkHumanRequired, setOrderFollowUpMarkHumanRequired] = useState(false);
+  const [postReceiptCareEnabled, setPostReceiptCareEnabled] = useState(false);
+  const [postReceiptCareText, setPostReceiptCareText] = useState('');
+  const [postReceiptCareDelayDays, setPostReceiptCareDelayDays] = useState(2);
+  const [postReceiptCareMarkHumanRequired, setPostReceiptCareMarkHumanRequired] = useState(false);
   const [selectedToneKB, setSelectedToneKB] = useState('');
   const platformOptions = ['全部平台', '千牛', '拼多多', '个人微信', 'QQ', '抖音', '快手', '小红书'];
   const platformCodeByLabel: Record<string, string> = {
@@ -391,6 +402,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       setAdvancedInstruction('善用 emoji 表情符号和分点，直观呈现重点信息，提升亲和力。');
       setInboundSensitiveWords([]);
       setSensitiveWordDraft('');
+      setSensitiveWordReplyText(DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
       setOutboundBlockRules([]);
       setOutboundBlockWordDraft('');
       setOutboundReplacementDraft('');
@@ -399,6 +411,14 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       setTimeoutEnabled(true);
       setTimeoutSeconds(10);
       setTimeoutReplyText('专项客服正在赶来的路上请稍等~~');
+      setOrderFollowUpEnabled(false);
+      setOrderFollowUpText('');
+      setOrderFollowUpDelayMinutes(60);
+      setOrderFollowUpMarkHumanRequired(false);
+      setPostReceiptCareEnabled(false);
+      setPostReceiptCareText('');
+      setPostReceiptCareDelayDays(2);
+      setPostReceiptCareMarkHumanRequired(false);
       setSelectedQaKBIds([]);
       setSelectedProductKBIds([]);
       setSelectedToneKB('');
@@ -427,6 +447,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       ? config.inbound_sensitive_words.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
       : []);
     setSensitiveWordDraft('');
+    setSensitiveWordReplyText(typeof config.sensitive_word_reply_text === 'string' && config.sensitive_word_reply_text.trim()
+      ? config.sensitive_word_reply_text
+      : DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
     const configuredBlockRules: OutboundBlockRule[] = Array.isArray(config.outbound_block_rules)
       ? config.outbound_block_rules.flatMap((item) => {
         if (!item || typeof item !== 'object') return [];
@@ -461,6 +484,18 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setTimeoutReplyText(typeof config.timeout_reply_text === 'string' && config.timeout_reply_text.trim()
       ? config.timeout_reply_text
       : '专项客服正在赶来的路上请稍等~~');
+    setOrderFollowUpEnabled(config.order_follow_up_enabled === true);
+    setOrderFollowUpText(typeof config.order_follow_up_text === 'string' ? config.order_follow_up_text : '');
+    setOrderFollowUpDelayMinutes(typeof config.order_follow_up_delay_minutes === 'number'
+      ? Math.max(1, Math.min(4320, Math.round(config.order_follow_up_delay_minutes)))
+      : 60);
+    setOrderFollowUpMarkHumanRequired(config.order_follow_up_mark_human_required === true);
+    setPostReceiptCareEnabled(config.post_receipt_care_enabled === true);
+    setPostReceiptCareText(typeof config.post_receipt_care_text === 'string' ? config.post_receipt_care_text : '');
+    setPostReceiptCareDelayDays(typeof config.post_receipt_care_delay_days === 'number'
+      ? Math.max(0, Math.min(30, Math.round(config.post_receipt_care_delay_days)))
+      : 2);
+    setPostReceiptCareMarkHumanRequired(config.post_receipt_care_mark_human_required === true);
     setSelectedQaKBIds(selectedRobot.api.qa_knowledge_base_ids);
     setSelectedProductKBIds(selectedRobot.api.product_knowledge_base_ids);
     setSelectedToneKB(selectedRobot.api.tone_knowledge_base_id || '');
@@ -544,6 +579,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         advanced_instruction: advancedInstruction.trim(),
         inbound_sensitive_words: inboundSensitiveWords,
         sensitive_word_action: 'mark_human',
+        sensitive_word_reply_text: sensitiveWordReplyText.trim() || DEFAULT_SENSITIVE_WORD_REPLY_TEXT,
         outbound_block_rules: outboundBlockRules
           .filter((rule) => rule.word.trim() && rule.replacement.trim())
           .map((rule) => ({ word: rule.word.trim(), replacement: rule.replacement.trim(), enabled: rule.enabled })),
@@ -556,6 +592,16 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         timeout_enabled: timeoutEnabled,
         timeout_seconds: timeoutSeconds,
         timeout_reply_text: timeoutReplyText.trim(),
+        order_follow_up_enabled: orderFollowUpEnabled,
+        order_follow_up_text: orderFollowUpText.trim(),
+        order_follow_up_delay_minutes: orderFollowUpDelayMinutes,
+        order_follow_up_confidence: 0.8,
+        order_follow_up_mark_human_required: orderFollowUpMarkHumanRequired,
+        post_receipt_care_enabled: postReceiptCareEnabled,
+        post_receipt_care_text: postReceiptCareText.trim(),
+        post_receipt_care_delay_days: postReceiptCareDelayDays,
+        post_receipt_care_max_order_age_days: 30,
+        post_receipt_care_mark_human_required: postReceiptCareMarkHumanRequired,
         routing_cards: routingCards,
       },
       qa_knowledge_base_ids: selectedQaKBIds,
@@ -619,11 +665,18 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       subject: template.subject,
       body: template.body,
       enabled: template.enabled,
+      platform_account_id: template.platform_account_id,
     } : emptyEmailTemplate);
     setEmailTemplateModalId(id);
   };
   const submitEmailTemplate = async () => {
-    await handleSaveEmailTemplate(emailTemplateModalId ?? null, emailTemplateForm);
+    await handleSaveEmailTemplate(emailTemplateModalId ?? null, {
+      ...emailTemplateForm,
+      template_key: emailTemplateForm.template_key || null,
+      scene: emailTemplateForm.scene || 'email_service',
+      aliases: emailTemplateForm.aliases || [],
+      platform_account_id: emailTemplateForm.platform_account_id || null,
+    });
     setEmailTemplateModalId(undefined);
   };
 
@@ -661,7 +714,11 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     },
     { title: '订单转化率', value: '--', ready: false },
     { title: '满意度', value: '--', ready: false },
-    { title: '转人工率', value: '--', ready: false },
+    {
+      title: '转人工率',
+      value: dashboardData ? `${dashboardData.metrics.transfer_to_human_rate.toFixed(1)}%` : '--',
+      ready: true,
+    },
     { title: '撤回率', value: '--', ready: false },
   ];
   const categoryColors = ['bg-indigo-500', 'bg-rose-500', 'bg-amber-500', 'bg-emerald-500', 'bg-sky-500'];
@@ -1720,6 +1777,18 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                               </div>
                             </div>
 
+                            <div className="space-y-3">
+                              <label className="text-sm font-bold text-slate-700">命中敏感词后默认回复的话术</label>
+                              <textarea
+                                value={sensitiveWordReplyText}
+                                maxLength={500}
+                                onChange={(event) => setSensitiveWordReplyText(event.target.value)}
+                                placeholder={DEFAULT_SENSITIVE_WORD_REPLY_TEXT}
+                                className="w-full h-24 px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all resize-none"
+                              />
+                              <p className="text-xs text-slate-400">为空时使用系统默认转人工安抚话术；命中敏感词和已待人工会话的后续入站回复都会使用该话术。</p>
+                            </div>
+
                             <div className="pt-2">
                               <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
                                 <span className="text-sm font-bold text-slate-700">命中后标记待人工处理，并停止机器人处理该会话</span>
@@ -1789,6 +1858,71 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                   <span className="text-sm font-bold text-slate-700">启用超时安抚（只发送一次，不打断正式回复）</span>
                                   <button type="button" onClick={() => setTimeoutEnabled((value) => !value)} className={cn("w-12 h-6 rounded-full relative shadow-inner transition-colors", timeoutEnabled ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="space-y-4 pt-2">
+                              <div>
+                                <h3 className="text-base font-bold text-slate-900">其他话术策略</h3>
+                                <p className="mt-1 text-sm text-slate-500">基于客户订单状态延迟触发，同一客户每类话术最多成功发送一次。</p>
+                              </div>
+
+                              <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-5">
+                                <div className="flex items-center justify-between">
+                                  <div>
+                                    <h4 className="text-sm font-bold text-slate-800">未下单追单话术</h4>
+                                    <p className="mt-1 text-xs text-slate-400">仅在 AI 判断购买意向强、订单明确为空，且延迟复查后仍未下单时发送。</p>
+                                  </div>
+                                  <button type="button" onClick={() => setOrderFollowUpEnabled((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", orderFollowUpEnabled ? "bg-indigo-500" : "bg-slate-300")}>
+                                    <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", orderFollowUpEnabled ? "right-1" : "left-1")}></div>
+                                  </button>
+                                </div>
+                                <div className="space-y-2">
+                                  <label className="text-sm font-bold text-slate-700">输入追单话术</label>
+                                  <textarea value={orderFollowUpText} onChange={(event) => setOrderFollowUpText(event.target.value)} maxLength={2000} className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none" placeholder="例如：亲亲，刚才咨询的商品还需要我帮您确认吗？" />
+                                </div>
+                                <div className="space-y-2">
+                                  <label className="text-sm font-bold text-slate-700">正常回复后延迟发送（分钟）</label>
+                                  <input type="number" min="1" max="4320" value={orderFollowUpDelayMinutes} onChange={(event) => setOrderFollowUpDelayMinutes(Math.max(1, Math.min(4320, Number(event.target.value) || 1)))} className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                                </div>
+                                <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-4 py-3">
+                                  <div>
+                                    <p className="text-sm font-bold text-slate-700">发出话术后标记待人工处理</p>
+                                    <p className="mt-1 text-xs text-slate-400">话术确认发送成功后，停止机器人处理该会话。</p>
+                                  </div>
+                                  <button type="button" onClick={() => setOrderFollowUpMarkHumanRequired((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", orderFollowUpMarkHumanRequired ? "bg-indigo-500" : "bg-slate-300")}>
+                                    <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", orderFollowUpMarkHumanRequired ? "right-1" : "left-1")}></div>
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-5">
+                                <div className="flex items-center justify-between">
+                                  <div>
+                                    <h4 className="text-sm font-bold text-slate-800">签收后关怀话术</h4>
+                                    <p className="mt-1 text-xs text-slate-400">订单首次变为已签收后创建任务；退款、售后和待人工会话固定排除。</p>
+                                  </div>
+                                  <button type="button" onClick={() => setPostReceiptCareEnabled((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", postReceiptCareEnabled ? "bg-indigo-500" : "bg-slate-300")}>
+                                    <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", postReceiptCareEnabled ? "right-1" : "left-1")}></div>
+                                  </button>
+                                </div>
+                                <div className="space-y-2">
+                                  <label className="text-sm font-bold text-slate-700">输入签收后关怀话术</label>
+                                  <textarea value={postReceiptCareText} onChange={(event) => setPostReceiptCareText(event.target.value)} maxLength={2000} className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none" placeholder="例如：亲亲，商品使用得还满意吗？欢迎反馈真实体验。" />
+                                </div>
+                                <div className="space-y-2">
+                                  <label className="text-sm font-bold text-slate-700">签收后延迟发送（天）</label>
+                                  <input type="number" min="0" max="30" value={postReceiptCareDelayDays} onChange={(event) => setPostReceiptCareDelayDays(Math.max(0, Math.min(30, Number(event.target.value) || 0)))} className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                                </div>
+                                <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-4 py-3">
+                                  <div>
+                                    <p className="text-sm font-bold text-slate-700">发出话术后标记待人工处理</p>
+                                    <p className="mt-1 text-xs text-slate-400">话术确认发送成功后，停止机器人处理该会话。</p>
+                                  </div>
+                                  <button type="button" onClick={() => setPostReceiptCareMarkHumanRequired((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", postReceiptCareMarkHumanRequired ? "bg-indigo-500" : "bg-slate-300")}>
+                                    <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", postReceiptCareMarkHumanRequired ? "right-1" : "left-1")}></div>
                                   </button>
                                 </div>
                               </div>
@@ -2326,6 +2460,15 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">安全方式</span><select value={emailConfig.security} onChange={(event) => updateEmailConfig('security', event.target.value as 'ssl' | 'starttls' | 'none')} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white"><option value="ssl">SSL</option><option value="starttls">STARTTLS</option><option value="none">无加密</option></select></label>
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">授权码 / 应用密码</span><input type="password" value={emailConfig.auth_code} onChange={(event) => updateEmailConfig('auth_code', event.target.value)} placeholder={emailAuthCodeSaved ? '已保存，留空保持不变' : '请输入 SMTP 授权码'} autoComplete="new-password" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                       </div>
+                      <div className="rounded-xl bg-slate-50 p-4 space-y-4">
+                        <div><h3 className="text-sm font-bold text-slate-900">邮件触发策略</h3><p className="text-xs text-slate-500 mt-1">用于第一轮模型判断是否进入邮件服务分支，命中后由程序发送固定话术。</p></div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          <label className="space-y-2 md:col-span-2"><span className="text-sm font-bold text-slate-700">需要走邮件服务的场景</span><textarea value={emailConfig.trigger_scenarios} onChange={(event) => updateEmailConfig('trigger_scenarios', event.target.value)} placeholder="例如：客户想要店铺链接地址、想要定制、索要不能在平台直接发送的资料" className="w-full h-24 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
+                          <label className="space-y-2"><span className="text-sm font-bold text-slate-700">触发时回复的话术</span><textarea value={emailConfig.ask_email_text} onChange={(event) => updateEmailConfig('ask_email_text', event.target.value)} placeholder="亲，请提供一下邮箱哦" className="w-full h-20 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
+                          <label className="space-y-2"><span className="text-sm font-bold text-slate-700">邮件发送后回复的话术</span><textarea value={emailConfig.success_text} onChange={(event) => updateEmailConfig('success_text', event.target.value)} placeholder="亲，资料已发送到您的邮箱，请注意查收哦~" className="w-full h-20 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
+                          <label className="space-y-2 md:col-span-2"><span className="text-sm font-bold text-slate-700">未绑定模板时回复的话术</span><textarea value={emailConfig.missing_template_text} onChange={(event) => updateEmailConfig('missing_template_text', event.target.value)} placeholder="亲，这边先为您转接人工客服进一步处理，请稍等~" className="w-full h-20 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
+                        </div>
+                      </div>
                       <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto_auto] md:items-end gap-4 rounded-xl bg-slate-50 p-4">
                         <label className="space-y-2 flex-1"><span className="text-sm font-bold text-slate-700">测试收件邮箱</span><input type="email" value={emailTestRecipient} onChange={(event) => setEmailTestRecipient(event.target.value)} placeholder="recipient@example.com" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white" /></label>
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">测试邮件模板</span><select value={emailTestTemplateId} onChange={(event) => setEmailTestTemplateId(event.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white"><option value="">使用默认测试正文</option>{emailTemplates.filter((item) => item.enabled).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
@@ -2336,8 +2479,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                     </div>
 
                     <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                      <div className="flex items-center justify-between px-6 py-5 border-b border-slate-100"><div><h2 className="text-lg font-bold text-slate-900">邮件模板</h2><p className="text-xs text-slate-500 mt-1">模板识别别名会在阶段 D 用于邮件意图路由</p></div><button onClick={() => openEmailTemplateModal(null)} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold"><Plus className="w-4 h-4" />新增模板</button></div>
-                      <div className="overflow-x-auto"><table className="w-full text-left"><thead><tr className="bg-slate-50 text-xs text-slate-500"><th className="px-6 py-4">模板名称 / ID</th><th className="px-6 py-4">业务场景</th><th className="px-6 py-4">识别别名</th><th className="px-6 py-4">主题</th><th className="px-6 py-4">状态</th><th className="px-6 py-4 text-right">操作</th></tr></thead><tbody className="divide-y divide-slate-100">{emailTemplates.map((template) => <tr key={template.id}><td className="px-6 py-4"><p className="text-sm font-bold text-slate-900">{template.name}</p><p className="text-xs font-mono text-slate-400 mt-1">{template.template_key}</p></td><td className="px-6 py-4 text-sm text-slate-600">{template.scene}</td><td className="px-6 py-4 text-xs text-slate-500 max-w-[220px]">{template.aliases.join('、') || '无'}</td><td className="px-6 py-4 text-sm text-slate-600 max-w-[260px] truncate">{template.subject}</td><td className="px-6 py-4"><span className={cn('px-2 py-1 rounded-full text-xs font-bold', template.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500')}>{template.enabled ? '启用' : '停用'}</span></td><td className="px-6 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => openEmailTemplateModal(template.id)} className="text-indigo-500 font-bold text-xs">编辑</button><button onClick={() => requestConfirm(`确定删除“${template.name}”吗？`, () => void handleDeleteEmailTemplate(template.id))} className="text-rose-500 font-bold text-xs">删除</button></div></td></tr>)}{emailTemplates.length === 0 && <tr><td colSpan={6} className="px-6 py-10 text-center text-sm text-slate-400">暂无邮件模板</td></tr>}</tbody></table></div>
+                      <div className="flex items-center justify-between px-6 py-5 border-b border-slate-100"><div><h2 className="text-lg font-bold text-slate-900">邮件模板</h2><p className="text-xs text-slate-500 mt-1">每个店铺最多绑定一个邮件模板，客户提供邮箱后按店铺发送。</p></div><button onClick={() => openEmailTemplateModal(null)} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold"><Plus className="w-4 h-4" />新增模板</button></div>
+                      <div className="overflow-x-auto"><table className="w-full text-left"><thead><tr className="bg-slate-50 text-xs text-slate-500"><th className="px-6 py-4">模板名称</th><th className="px-6 py-4">绑定店铺</th><th className="px-6 py-4">邮件主题</th><th className="px-6 py-4">邮件正文</th><th className="px-6 py-4">状态</th><th className="px-6 py-4 text-right">操作</th></tr></thead><tbody className="divide-y divide-slate-100">{emailTemplates.map((template) => { const boundAccount = platformAccounts.find((account) => account.id === template.platform_account_id); return <tr key={template.id}><td className="px-6 py-4"><p className="text-sm font-bold text-slate-900">{template.name}</p></td><td className="px-6 py-4 text-sm text-slate-600">{boundAccount ? (boundAccount.account_alias || boundAccount.account_name) : '未绑定'}</td><td className="px-6 py-4 text-sm text-slate-600 max-w-[220px] truncate">{template.subject}</td><td className="px-6 py-4 text-sm text-slate-600 max-w-[320px] truncate">{template.body}</td><td className="px-6 py-4"><span className={cn('px-2 py-1 rounded-full text-xs font-bold', template.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500')}>{template.enabled ? '启用' : '停用'}</span></td><td className="px-6 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => openEmailTemplateModal(template.id)} className="text-indigo-500 font-bold text-xs">编辑</button><button onClick={() => requestConfirm(`确定删除“${template.name}”吗？`, () => void handleDeleteEmailTemplate(template.id))} className="text-rose-500 font-bold text-xs">删除</button></div></td></tr>; })}{emailTemplates.length === 0 && <tr><td colSpan={6} className="px-6 py-10 text-center text-sm text-slate-400">暂无邮件模板</td></tr>}</tbody></table></div>
                     </div>
                   </>
                 )}
@@ -2593,15 +2736,13 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
               <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto custom-scrollbar">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <label className="space-y-2"><span className="text-sm font-bold text-slate-700">模板名称</span><input value={emailTemplateForm.name} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, name: event.target.value }))} placeholder="例如：店铺看图地址" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
-                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">模板 ID</span><input value={emailTemplateForm.template_key} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, template_key: event.target.value }))} placeholder="store-view-link" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-mono" /></label>
-                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">业务场景</span><input value={emailTemplateForm.scene} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, scene: event.target.value }))} placeholder="store_view_link" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
-                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">识别别名</span><input value={emailTemplateForm.aliases.join('、')} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, aliases: event.target.value.split(/[、,，\n]/).map((value) => value.trim()).filter(Boolean) }))} placeholder="看图地址、店铺链接" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
+                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">绑定店铺</span><select value={emailTemplateForm.platform_account_id || ''} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, platform_account_id: event.target.value || null }))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white"><option value="">未绑定店铺</option>{platformAccounts.filter((account) => account.platform_code === 'pinduoduo' && account.is_active).map((account) => <option key={account.id} value={account.id}>{account.account_alias || account.account_name}</option>)}</select></label>
                 </div>
                 <label className="space-y-2 block"><span className="text-sm font-bold text-slate-700">邮件主题</span><input value={emailTemplateForm.subject} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, subject: event.target.value }))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                 <label className="space-y-2 block"><span className="text-sm font-bold text-slate-700">邮件正文</span><textarea value={emailTemplateForm.body} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, body: event.target.value }))} className="w-full h-48 rounded-xl border border-slate-200 p-4 text-sm resize-none" /></label>
                 <label className="flex items-center gap-3 text-sm font-bold text-slate-700"><input type="checkbox" checked={emailTemplateForm.enabled} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, enabled: event.target.checked }))} className="w-4 h-4 accent-indigo-600" />启用模板</label>
               </div>
-              <div className="flex items-center justify-end gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100"><button onClick={() => setEmailTemplateModalId(undefined)} className="px-4 py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-sm font-bold">取消</button><button onClick={() => void submitEmailTemplate()} disabled={isSavingEmail || !emailTemplateForm.name || !emailTemplateForm.template_key || !emailTemplateForm.subject || !emailTemplateForm.body} className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold disabled:opacity-50">{isSavingEmail ? '保存中...' : '保存模板'}</button></div>
+              <div className="flex items-center justify-end gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100"><button onClick={() => setEmailTemplateModalId(undefined)} className="px-4 py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-sm font-bold">取消</button><button onClick={() => void submitEmailTemplate()} disabled={isSavingEmail || !emailTemplateForm.name || !emailTemplateForm.subject || !emailTemplateForm.body} className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold disabled:opacity-50">{isSavingEmail ? '保存中...' : '保存模板'}</button></div>
             </motion.div>
           </motion.div>
         )}

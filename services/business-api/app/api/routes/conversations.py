@@ -5,7 +5,9 @@ from app.api.deps import get_current_user, get_db_session
 from app.models import User
 from app.schemas.conversation import ConversationDetailResponse, ConversationListResponse
 from app.schemas.message import MessageListResponse
+from app.schemas.order import CustomerOrdersResponse
 from app.services.message_service import clear_human_required, get_conversation, list_conversations, list_messages
+from app.services.order_service import customer_orders_response
 from app.services.realtime import realtime_manager
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -55,3 +57,12 @@ def conversation_messages(
     db: Session = Depends(get_db_session),
 ) -> MessageListResponse:
     return list_messages(db, user, conversation_id, limit=limit, offset=offset)
+
+
+@router.get("/{conversation_id}/orders", response_model=CustomerOrdersResponse)
+def conversation_orders(
+    conversation_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> CustomerOrdersResponse:
+    return customer_orders_response(db, user, conversation_id)
