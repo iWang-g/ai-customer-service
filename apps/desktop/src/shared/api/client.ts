@@ -60,6 +60,12 @@ export interface ApiMessage {
   message_status: string;
   source: string;
   raw_payload: Record<string, unknown>;
+  conversation_sequence: number;
+  collected_at: string;
+  first_observation_id: string | null;
+  first_dom_sequence: number | null;
+  collection_kind: string;
+  automation_eligible: boolean;
   platform_sent_at: string | null;
   observed_at: string | null;
   snapshot_id: string | null;

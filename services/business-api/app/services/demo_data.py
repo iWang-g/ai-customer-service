@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import utcnow
 from app.models import Conversation, Message, User
+from app.services.message_queue_service import append_messages
 
 
 def seed_demo_conversations(db: Session, user: User) -> None:
@@ -62,8 +63,9 @@ def seed_demo_conversations(db: Session, user: User) -> None:
         )
         db.add(conversation)
         db.flush()
+        messages = []
         for sender_role, sender_name, content, sent_at in sample["messages"]:
-            db.add(
+            messages.append(
                 Message(
                     conversation_id=conversation.id,
                     user_id=user.id,
@@ -73,7 +75,9 @@ def seed_demo_conversations(db: Session, user: User) -> None:
                     content=content,
                     message_status="sent",
                     source="demo",
+                    collected_at=sent_at,
                     sent_at=sent_at,
                 )
             )
+        append_messages(db, messages)
     db.commit()

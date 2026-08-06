@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     heartbeat_timeout_seconds: int = Field(default=120, alias="HEARTBEAT_TIMEOUT_SECONDS")
     ai_reply_base_url: str = Field(default="http://127.0.0.1:8020", alias="AI_REPLY_BASE_URL")
     knowledge_base_url: str = Field(default="http://127.0.0.1:8010", alias="KNOWLEDGE_BASE_URL")
+    pdd_message_snapshot_shadow_enabled: bool = Field(
+        default=True,
+        alias="PDD_MESSAGE_SNAPSHOT_SHADOW_ENABLED",
+    )
 
     @property
     def cors_origins(self) -> list[str]:

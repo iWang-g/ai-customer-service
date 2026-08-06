@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 class RpaNodeRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -70,6 +70,48 @@ class RpaEventCreate(BaseModel):
 
 class RpaEventBatchCreate(BaseModel):
     events: list[RpaEventCreate] = Field(default_factory=list)
+
+
+class SnapshotMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dom_sequence: int = Field(ge=0, le=9999)
+    sender_role: Literal["customer", "agent"]
+    message_type: str = Field(min_length=1, max_length=32)
+    content: str = Field(default="", max_length=100_000)
+    image_url: str | None = Field(default=None, max_length=8192)
+    image_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+    media_resource_id: str | None = Field(default=None, max_length=512)
+    platform_message_id: str | None = Field(default=None, max_length=128)
+
+
+class MessageSnapshotPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: str = Field(min_length=1, max_length=128)
+    collected_at: datetime
+    unread: bool = False
+    payload_hash: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    message_count: int | None = Field(default=None, ge=0, le=200)
+    batch_index: int = Field(default=0, ge=0, le=99)
+    batch_count: int = Field(default=1, ge=1, le=100)
+    message_offset: int = Field(default=0, ge=0, le=200)
+    messages: list[SnapshotMessage] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_batch_metadata(self) -> "MessageSnapshotPayload":
+        if self.batch_index >= self.batch_count:
+            raise ValueError("batch_index must be smaller than batch_count")
+        if self.batch_count > 1 and self.message_count is None:
+            raise ValueError("message_count is required for split snapshots")
+        total = len(self.messages) if self.message_count is None else self.message_count
+        if self.message_offset + len(self.messages) > total:
+            raise ValueError("batch messages exceed message_count")
+        expected = list(range(self.message_offset, self.message_offset + len(self.messages)))
+        actual = [message.dom_sequence for message in self.messages]
+        if actual != expected:
+            raise ValueError("dom_sequence must be continuous from message_offset")
+        return self
 
 
 class RpaEventRead(BaseModel):

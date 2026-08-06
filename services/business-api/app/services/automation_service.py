@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException, status
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -479,27 +479,14 @@ async def _execute_bound_reply(
         return result
 
     context_length = _context_length(robot)
-    source_timestamp = (
-        source_message.platform_sent_at or source_message.observed_at or source_message.sent_at
-    )
     history_rows = list(
         db.scalars(
             select(Message)
             .where(
                 Message.conversation_id == conversation.id,
-                Message.created_at <= source_message.created_at,
-                func.coalesce(
-                    Message.platform_sent_at,
-                    Message.observed_at,
-                    Message.sent_at,
-                ) <= source_timestamp,
+                Message.conversation_sequence <= source_message.conversation_sequence,
             )
-            .order_by(
-                desc(func.coalesce(Message.platform_sent_at, Message.observed_at, Message.sent_at)),
-                desc(Message.snapshot_sequence),
-                desc(Message.created_at),
-                desc(Message.id),
-            )
+            .order_by(desc(Message.conversation_sequence))
             # The source message is part of the query, while context_length
             # represents prior messages. Fetch one extra row for the source.
             .limit(context_length + 1)

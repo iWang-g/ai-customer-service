@@ -83,6 +83,41 @@ class MessageServiceTests(unittest.TestCase):
             "message-6",
         ])
 
+    def test_permanent_sequence_controls_order_instead_of_message_time(self) -> None:
+        start = datetime(2026, 8, 5, tzinfo=timezone.utc)
+        first_collected = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="first-collected",
+            sent_at=start + timedelta(hours=1),
+            observed_at=start + timedelta(hours=1),
+        )
+        second_collected = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="second-collected",
+            sent_at=start,
+            observed_at=start,
+        )
+        self.db.add_all([first_collected, second_collected])
+        self.db.commit()
+
+        response = list_messages(self.db, self.user, self.conversation.id)
+
+        self.assertEqual(
+            [item.content for item in response.items],
+            ["first-collected", "second-collected"],
+        )
+        self.assertEqual(
+            [item.conversation_sequence for item in response.items],
+            [1, 2],
+        )
+        self.assertEqual(response.items[0].collected_at, first_collected.observed_at)
+
 
 if __name__ == "__main__":
     unittest.main()

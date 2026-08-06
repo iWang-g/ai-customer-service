@@ -23,6 +23,12 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "idempotency_key": "VARCHAR(160)",
         },
         "messages": {
+            "conversation_sequence": "INTEGER",
+            "collected_at": "DATETIME",
+            "first_observation_id": "VARCHAR(128)",
+            "first_dom_sequence": "INTEGER",
+            "collection_kind": "VARCHAR(32) NOT NULL DEFAULT 'legacy'",
+            "automation_eligible": "BOOLEAN NOT NULL DEFAULT 1",
             "platform_sent_at": "DATETIME",
             "observed_at": "DATETIME",
             "snapshot_id": "VARCHAR(128)",
@@ -32,6 +38,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "time_label": "VARCHAR(64)",
         },
         "conversations": {
+            "last_message_sequence": "INTEGER NOT NULL DEFAULT 0",
             "awaiting_reply": "BOOLEAN NOT NULL DEFAULT 0",
             "human_required": "BOOLEAN NOT NULL DEFAULT 0",
             "human_required_reason": "VARCHAR(64)",
@@ -87,6 +94,57 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 ) = 'customer' THEN 1 ELSE 0 END"""
             ))
 
+        # Freeze the legacy display order as the permanent per-conversation queue order.
+        connection.execute(text(
+            """WITH conversation_tails AS (
+                SELECT conversation_id, COALESCE(MAX(conversation_sequence), 0) AS tail
+                FROM messages
+                GROUP BY conversation_id
+            ),
+            ranked_messages AS (
+                SELECT id, conversation_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY conversation_id
+                           ORDER BY COALESCE(observed_at, sent_at, created_at) ASC,
+                                    CASE WHEN snapshot_sequence IS NULL THEN 1 ELSE 0 END ASC,
+                                    snapshot_sequence ASC,
+                                    created_at ASC,
+                                    id ASC
+                       ) AS sequence_number
+                FROM messages
+                WHERE conversation_sequence IS NULL
+            )
+            UPDATE messages
+            SET conversation_sequence = COALESCE((
+                    SELECT tail
+                    FROM conversation_tails
+                    WHERE conversation_tails.conversation_id = messages.conversation_id
+                ), 0) + (
+                    SELECT sequence_number
+                    FROM ranked_messages
+                    WHERE ranked_messages.id = messages.id
+                )
+            WHERE conversation_sequence IS NULL"""
+        ))
+        connection.execute(text(
+            """UPDATE messages
+            SET collected_at = COALESCE(observed_at, sent_at, created_at, CURRENT_TIMESTAMP)
+            WHERE collected_at IS NULL"""
+        ))
+        connection.execute(text(
+            """UPDATE conversations
+            SET last_message_sequence = COALESCE((
+                SELECT MAX(messages.conversation_sequence)
+                FROM messages
+                WHERE messages.conversation_id = conversations.id
+            ), 0)
+            WHERE last_message_sequence < COALESCE((
+                SELECT MAX(messages.conversation_sequence)
+                FROM messages
+                WHERE messages.conversation_id = conversations.id
+            ), 0)"""
+        ))
+
         connection.execute(
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_platform_accounts_user_platform_local "
@@ -135,12 +193,21 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 "ON conversations (awaiting_reply)"
             )
         )
-        connection.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_conversation_platform_message "
-                "ON messages (conversation_id, platform_message_id)"
-            )
-        )
+        connection.execute(text(
+            "DROP INDEX IF EXISTS uq_messages_conversation_platform_message"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_messages_conversation_platform_message "
+            "ON messages (conversation_id, platform_message_id)"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_conversation_sequence "
+            "ON messages (conversation_id, conversation_sequence)"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_first_observation_sequence "
+            "ON messages (first_observation_id, first_dom_sequence)"
+        ))
         connection.execute(
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_email_template_user_platform_account "
@@ -383,6 +450,35 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                     UNIQUE (platform_account_id, customer_key, strategy_type)
             )"""
         ))
+        connection.execute(text(
+            """CREATE TABLE IF NOT EXISTS message_observations (
+                id VARCHAR(32) PRIMARY KEY,
+                observation_id VARCHAR(128) NOT NULL UNIQUE,
+                user_id VARCHAR(32) NOT NULL REFERENCES users(id),
+                node_id VARCHAR(32) REFERENCES rpa_nodes(id),
+                platform_account_id VARCHAR(32) NOT NULL REFERENCES platform_accounts(id),
+                conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id),
+                platform_code VARCHAR(32) NOT NULL,
+                conversation_external_id VARCHAR(128) NOT NULL,
+                collected_at DATETIME NOT NULL,
+                unread BOOLEAN NOT NULL DEFAULT 0,
+                payload_hash VARCHAR(64) NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                batch_count INTEGER NOT NULL DEFAULT 1,
+                received_batch_count INTEGER NOT NULL DEFAULT 0,
+                alignment_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                alignment_method VARCHAR(32),
+                overlap_size INTEGER NOT NULL DEFAULT 0,
+                projected_append_count INTEGER NOT NULL DEFAULT 0,
+                appended_count INTEGER NOT NULL DEFAULT 0,
+                raw_payload JSON NOT NULL DEFAULT '{}',
+                diagnostics_json JSON NOT NULL DEFAULT '{}',
+                processed_at DATETIME,
+                error_message TEXT,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )"""
+        ))
         for table, index, column in (
             ("robot_qa_knowledge_bases", "ix_robot_qa_kb_robot_id", "robot_id"),
             ("robot_product_knowledge_bases", "ix_robot_product_kb_robot_id", "robot_id"),
@@ -431,5 +527,16 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             ("customer_outreach_runs", "ix_customer_outreach_status", "status"),
             ("customer_outreach_runs", "ix_customer_outreach_due_at", "due_at"),
             ("customer_outreach_runs", "ix_customer_outreach_idempotency_key", "idempotency_key"),
+            ("message_observations", "ix_message_observations_user_id", "user_id"),
+            ("message_observations", "ix_message_observations_node_id", "node_id"),
+            ("message_observations", "ix_message_observations_platform_account_id", "platform_account_id"),
+            ("message_observations", "ix_message_observations_conversation_id", "conversation_id"),
+            ("message_observations", "ix_message_observations_platform_code", "platform_code"),
+            ("message_observations", "ix_message_observations_external_id", "conversation_external_id"),
+            ("message_observations", "ix_message_observations_alignment_status", "alignment_status"),
         ):
             connection.execute(text(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({column})"))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_message_observations_conversation_collected "
+            "ON message_observations (conversation_id, collected_at)"
+        ))

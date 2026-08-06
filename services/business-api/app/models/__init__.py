@@ -11,6 +11,7 @@ from app.models.entities import (
     EmailSendTask,
     EmailTemplate,
     Message,
+    MessageObservation,
     PlatformAccount,
     Robot,
     RobotPlatformScope,
@@ -23,6 +24,7 @@ from app.models.entities import (
     User,
     UserSettings,
 )
+from app.models import message_queue_events as _message_queue_events  # noqa: F401, E402
 
 __all__ = [
     "Base",
@@ -48,6 +50,7 @@ __all__ = [
     "EmailSendTask",
     "EmailTemplate",
     "Message",
+    "MessageObservation",
     "RpaNode",
     "RpaEvent",
     "RpaTask",

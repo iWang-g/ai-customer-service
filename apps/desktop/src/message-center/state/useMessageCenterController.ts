@@ -63,7 +63,7 @@ function mapMessage(message: ApiMessage): Message {
     id: message.id,
     sender,
     content: message.content,
-    timestamp: formatTime(message.observed_at || message.sent_at),
+    timestamp: formatTime(message.collected_at),
     ...(mediaType === 'image' && rawImageUrl
       ? { media: { type: 'image' as const, url: getQaImageUrl(rawImageUrl) } }
       : {}),

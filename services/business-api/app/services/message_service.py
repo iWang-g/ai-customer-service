@@ -4,7 +4,7 @@ from datetime import timedelta
 import re
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -20,6 +20,7 @@ from app.schemas.message import (
     SendMessageRequest,
     SendMessageResponse,
 )
+from app.services.message_queue_service import append_message
 
 
 PLATFORM_DISPLAY_NAMES = {
@@ -147,22 +148,11 @@ def list_messages(
         .where(and_(Message.conversation_id == conversation_id, Message.user_id == user.id))
     )
     total = db.scalar(count_stmt) or 0
-    # Query newest-first so offset pages backwards through history, then restore
-    # chronological order for chat rendering.
+    # Page backwards from the permanent queue tail, then restore chat order.
     stmt = (
         select(Message)
         .where(and_(Message.conversation_id == conversation_id, Message.user_id == user.id))
-        .order_by(
-            desc(func.coalesce(
-                Message.observed_at,
-                Message.sent_at,
-                Message.created_at,
-            )),
-            case((Message.snapshot_sequence.is_(None), 1), else_=0).desc(),
-            Message.snapshot_sequence.desc(),
-            Message.created_at.desc(),
-            Message.id.desc(),
-        )
+        .order_by(desc(Message.conversation_sequence))
         .offset(offset)
         .limit(limit)
     )
@@ -200,7 +190,7 @@ def create_send_task(
         observed_at=now,
         sent_at=now,
     )
-    db.add(message)
+    append_message(db, message, collected_at=now)
     db.flush()
     task = RpaTask(
         user_id=user.id,
@@ -282,7 +272,7 @@ def record_sent_message(
         observed_at=now,
         sent_at=now,
     )
-    db.add(message)
+    append_message(db, message, collected_at=now)
     conversation.latest_message_text = request.content
     conversation.latest_message_at = now
     conversation.status = "active"

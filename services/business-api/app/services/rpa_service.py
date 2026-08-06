@@ -4,10 +4,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.security import create_token, utcnow
 from app.models import Conversation, Message, PlatformAccount, RpaEvent, RpaNode, RpaTask, User
 from app.schemas.rpa import (
@@ -20,6 +20,11 @@ from app.schemas.rpa import (
     TaskCompleteRequest,
 )
 from app.services.order_service import apply_orders_snapshot
+from app.services.message_queue_service import append_message
+from app.services.message_observation_service import (
+    SnapshotProtocolError,
+    process_message_snapshot_shadow,
+)
 
 
 def _node_token(settings: Settings, user: User, node: RpaNode) -> str:
@@ -130,6 +135,20 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
     db.add(event)
     messages: list[Message] = []
     conversations: list[Conversation] = []
+
+    if request.event_type == "message_snapshot":
+        if get_settings().pdd_message_snapshot_shadow_enabled:
+            try:
+                observation = process_message_snapshot_shadow(db, user, node, request)
+                if observation.alignment_status == "failed":
+                    event.status = "failed"
+                    event.error_message = observation.error_message
+            except SnapshotProtocolError as exc:
+                event.status = "failed"
+                event.error_message = str(exc)
+        db.commit()
+        db.refresh(event)
+        return event, messages, conversations
 
     conversation = _upsert_conversation_from_event(db, user.id, request)
     if conversation:
@@ -250,16 +269,7 @@ def _refresh_awaiting_reply(db: Session, conversation: Conversation) -> None:
             Message.conversation_id == conversation.id,
             Message.message_status == "sent",
         )
-        .order_by(
-            desc(func.coalesce(
-                Message.platform_sent_at,
-                Message.observed_at,
-                Message.sent_at,
-                Message.created_at,
-            )),
-            desc(Message.created_at),
-            desc(Message.id),
-        )
+        .order_by(desc(Message.conversation_sequence))
         .limit(1)
     )
     conversation.awaiting_reply = latest_sender == "customer"
@@ -506,7 +516,7 @@ def _upsert_message_from_event(
         raw_payload=payload,
     )
     _apply_collection_metadata(message, payload, request)
-    db.add(message)
+    append_message(db, message, collected_at=message.observed_at)
     db.flush()
     return message, _is_live_reply_source(payload, request)
 
@@ -640,7 +650,7 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
                     observed_at=now,
                     sent_at=now,
                 )
-                db.add(image_message)
+                append_message(db, image_message, collected_at=now)
                 conversation = db.get(Conversation, task.conversation_id)
                 if conversation:
                     conversation.latest_message_text = "[图片]"
@@ -683,7 +693,7 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
                     observed_at=now,
                     sent_at=now,
                 )
-                db.add(image_message)
+                append_message(db, image_message, collected_at=now)
                 db.flush()
                 db.add(RpaTask(
                     user_id=task.user_id,

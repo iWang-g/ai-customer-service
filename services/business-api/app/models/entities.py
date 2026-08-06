@@ -278,6 +278,7 @@ class Conversation(Base, TimestampMixin):
     latest_message_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     latest_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     unread_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_message_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     awaiting_reply: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
     human_required: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
@@ -305,14 +306,65 @@ class Conversation(Base, TimestampMixin):
     )
 
 
+class MessageObservation(Base, TimestampMixin):
+    __tablename__ = "message_observations"
+    __table_args__ = (
+        UniqueConstraint("observation_id", name="uq_message_observations_observation_id"),
+        Index(
+            "ix_message_observations_conversation_collected",
+            "conversation_id",
+            "collected_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    observation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    node_id: Mapped[str | None] = mapped_column(ForeignKey("rpa_nodes.id"), index=True, nullable=True)
+    platform_account_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_accounts.id"), index=True, nullable=False
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id"), index=True, nullable=False
+    )
+    platform_code: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    conversation_external_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    unread: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    batch_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    received_batch_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    alignment_status: Mapped[str] = mapped_column(
+        String(32), default="pending", index=True, nullable=False
+    )
+    alignment_method: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    overlap_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    projected_append_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    appended_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    diagnostics_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class Message(Base, TimestampMixin):
     __tablename__ = "messages"
     __table_args__ = (
         Index(
-            "uq_messages_conversation_platform_message",
+            "ix_messages_conversation_platform_message",
             "conversation_id",
             "platform_message_id",
-            unique=True,
+        ),
+        UniqueConstraint(
+            "conversation_id",
+            "conversation_sequence",
+            name="uq_messages_conversation_sequence",
+        ),
+        UniqueConstraint(
+            "first_observation_id",
+            "first_dom_sequence",
+            name="uq_messages_first_observation_sequence",
         ),
     )
 
@@ -327,6 +379,14 @@ class Message(Base, TimestampMixin):
     message_status: Mapped[str] = mapped_column(String(32), default="sent", nullable=False)
     source: Mapped[str] = mapped_column(String(32), default="platform", nullable=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    conversation_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    collected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=True
+    )
+    first_observation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    first_dom_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    collection_kind: Mapped[str] = mapped_column(String(32), default="legacy", nullable=False)
+    automation_eligible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     platform_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     snapshot_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

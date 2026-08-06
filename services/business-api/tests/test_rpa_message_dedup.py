@@ -159,6 +159,7 @@ class RpaMessageDedupTests(unittest.TestCase):
         self.assertIsNotNone(message)
         self.assertEqual(message.platform_sent_at, datetime(2026, 7, 31, 2, 40, 0))
         self.assertEqual(message.sent_at, datetime(2026, 7, 31, 2, 49, 42))
+        self.assertEqual(message.collected_at, datetime(2026, 7, 31, 2, 49, 42))
 
     def test_latest_sender_controls_awaiting_reply(self) -> None:
         create_event(

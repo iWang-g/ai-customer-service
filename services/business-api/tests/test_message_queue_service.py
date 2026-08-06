@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import threading
+import unittest
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import Session
+
+from app.db.migrations import apply_compatibility_migrations
+from app.models import Base, Conversation, Message, User
+from app.services.message_queue_service import append_message
+
+
+class MessageQueueServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = Session(self.engine)
+        self.user = User(
+            username="message-queue",
+            display_name="Message Queue",
+            password_hash="not-used",
+        )
+        self.db.add(self.user)
+        self.db.flush()
+        self.conversation = Conversation(
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            external_conversation_id="queue-customer",
+        )
+        self.db.add(self.conversation)
+        self.db.flush()
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self.engine.dispose()
+
+    def test_direct_inserts_receive_sequence_and_collection_time(self) -> None:
+        first = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="first",
+        )
+        second = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="second",
+        )
+        self.db.add_all([first, second])
+        self.db.commit()
+
+        self.assertEqual((first.conversation_sequence, second.conversation_sequence), (1, 2))
+        self.assertIsNotNone(first.collected_at)
+        self.assertEqual(self.conversation.last_message_sequence, 2)
+
+    def test_platform_message_id_is_supporting_evidence_not_unique_identity(self) -> None:
+        for content in ("same-id-first", "same-id-second"):
+            append_message(
+                self.db,
+                Message(
+                    conversation_id=self.conversation.id,
+                    user_id=self.user.id,
+                    platform_code="pinduoduo",
+                    platform_message_id="unstable-platform-id",
+                    sender_role="customer",
+                    content=content,
+                ),
+            )
+        self.db.commit()
+
+        rows = list(
+            self.db.scalars(
+                select(Message)
+                .where(Message.conversation_id == self.conversation.id)
+                .order_by(Message.conversation_sequence)
+            ).all()
+        )
+        self.assertEqual([row.content for row in rows], ["same-id-first", "same-id-second"])
+
+
+class MessageQueueMigrationTests(unittest.TestCase):
+    def test_backfill_is_ordered_and_idempotent(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        db = Session(engine)
+        user = User(username="migration", display_name="Migration", password_hash="not-used")
+        db.add(user)
+        db.flush()
+        conversation = Conversation(
+            user_id=user.id,
+            platform_code="pinduoduo",
+            external_conversation_id="migration-customer",
+        )
+        db.add(conversation)
+        db.flush()
+        start = datetime(2026, 8, 6, tzinfo=timezone.utc)
+        rows = [
+            Message(
+                conversation_id=conversation.id,
+                user_id=user.id,
+                platform_code="pinduoduo",
+                sender_role="customer",
+                content=content,
+                observed_at=observed_at,
+                sent_at=observed_at,
+            )
+            for content, observed_at in (
+                ("later", start + timedelta(minutes=1)),
+                ("earlier", start),
+            )
+        ]
+        db.add_all(rows)
+        db.commit()
+        ids = {row.content: row.id for row in rows}
+        conversation_id = conversation.id
+        db.close()
+
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE messages SET conversation_sequence = NULL, collected_at = NULL"))
+            connection.execute(text("UPDATE conversations SET last_message_sequence = 0"))
+
+        apply_compatibility_migrations(engine)
+        apply_compatibility_migrations(engine)
+
+        with engine.connect() as connection:
+            migrated = connection.execute(text(
+                "SELECT id, conversation_sequence, collected_at FROM messages "
+                "ORDER BY conversation_sequence"
+            )).all()
+            tail = connection.scalar(text(
+                "SELECT last_message_sequence FROM conversations WHERE id = :id"
+            ), {"id": conversation_id})
+        self.assertEqual([row.id for row in migrated], [ids["earlier"], ids["later"]])
+        self.assertEqual([row.conversation_sequence for row in migrated], [1, 2])
+        self.assertTrue(all(row.collected_at is not None for row in migrated))
+        self.assertEqual(tail, 2)
+        engine.dispose()
+
+    def test_parallel_append_allocates_unique_sequences(self) -> None:
+        database_name = f"queue-{uuid4().hex}"
+        engine = create_engine(
+            f"sqlite:///file:{database_name}?mode=memory&cache=shared&uri=true",
+            connect_args={"check_same_thread": False, "timeout": 10, "uri": True},
+        )
+        keeper = engine.connect()
+        try:
+            Base.metadata.create_all(engine)
+            with Session(engine) as db:
+                user = User(username="parallel", display_name="Parallel", password_hash="not-used")
+                db.add(user)
+                db.flush()
+                conversation = Conversation(
+                    user_id=user.id,
+                    platform_code="pinduoduo",
+                    external_conversation_id="parallel-customer",
+                )
+                db.add(conversation)
+                db.commit()
+                user_id = user.id
+                conversation_id = conversation.id
+
+            barrier = threading.Barrier(3)
+            errors: list[BaseException] = []
+
+            def insert_message(content: str) -> None:
+                try:
+                    with Session(engine) as worker_db:
+                        barrier.wait()
+                        append_message(
+                            worker_db,
+                            Message(
+                                conversation_id=conversation_id,
+                                user_id=user_id,
+                                platform_code="pinduoduo",
+                                sender_role="customer",
+                                content=content,
+                            ),
+                        )
+                        worker_db.commit()
+                except BaseException as exc:  # pragma: no cover - assertion reports details
+                    errors.append(exc)
+
+            workers = [
+                threading.Thread(target=insert_message, args=(f"parallel-{index}",))
+                for index in range(2)
+            ]
+            for worker in workers:
+                worker.start()
+            barrier.wait()
+            for worker in workers:
+                worker.join()
+
+            self.assertEqual(errors, [])
+            with Session(engine) as db:
+                sequences = list(db.scalars(
+                    select(Message.conversation_sequence)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.conversation_sequence)
+                ).all())
+                tail = db.get(Conversation, conversation_id).last_message_sequence
+            self.assertEqual(sequences, [1, 2])
+            self.assertEqual(tail, 2)
+        finally:
+            keeper.close()
+            engine.dispose()
+
+
+if __name__ == "__main__":
+    unittest.main()

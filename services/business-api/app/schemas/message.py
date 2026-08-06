@@ -22,6 +22,12 @@ class MessageRead(BaseModel):
     message_status: str
     source: str
     raw_payload: dict[str, Any] = Field(default_factory=dict)
+    conversation_sequence: int
+    collected_at: datetime
+    first_observation_id: str | None = None
+    first_dom_sequence: int | None = None
+    collection_kind: str
+    automation_eligible: bool
     platform_sent_at: datetime | None = None
     observed_at: datetime | None = None
     snapshot_id: str | None = None
