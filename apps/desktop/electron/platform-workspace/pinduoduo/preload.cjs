@@ -47,6 +47,15 @@ const FALLBACK_SELECTORS = {
     '[data-msg-id]',
     '[class*="message-item"]',
   ],
+  messageContainers: [
+    '#message-panel',
+    '.msg-list',
+    '[data-role="message-list"]',
+    '[class*="MessageList"]',
+    '[class*="message-list"]',
+    '[class*="messageList"]',
+    '[class*="msg-list"]',
+  ],
   messageContent: [
     '.kwaishop-cs-BizTextCard',
     '[class*="BizTextCard"]',
@@ -133,7 +142,7 @@ function queryFirst(root, catalog) {
   return null;
 }
 
-function queryCandidates(root, catalog) {
+function queryAllCandidates(root, catalog) {
   const matches = [];
   const seen = new Set();
   for (const selector of catalog || []) {
@@ -148,13 +157,65 @@ function queryCandidates(root, catalog) {
       // Continue with the remaining selectors.
     }
   }
-  return matches.filter((element) => !matches.some(
-    (candidate) => candidate !== element && candidate.contains(element),
-  )).sort((left, right) => {
+  return matches.sort((left, right) => {
     if (left === right) return 0;
     const position = left.compareDocumentPosition(right);
     return position & Node.DOCUMENT_POSITION_PRECEDING ? 1 : -1;
   });
+}
+
+function outermostCandidates(matches) {
+  return matches.filter((element) => !matches.some(
+    (candidate) => candidate !== element && candidate.contains(element),
+  ));
+}
+
+function queryCandidates(root, catalog) {
+  return outermostCandidates(queryAllCandidates(root, catalog));
+}
+
+function isCanonicalPlatformMessage(element) {
+  const id = element.getAttribute?.('id') || '';
+  return (
+    element.tagName === 'LI'
+    && (/^middlepanel_list_/i.test(id) || element.classList.contains('onemsg'))
+  );
+}
+
+function inspectMessageCandidates() {
+  const conversationItems = queryCandidates(document, selectors.conversationItems);
+  const containerCandidates = queryAllCandidates(document, selectors.messageContainers)
+    .filter((container) => !conversationItems.some(
+      (conversationItem) => conversationItem === container || conversationItem.contains(container),
+    ))
+    .map((container) => ({
+      container,
+      canonicalCount: queryAllCandidates(container, selectors.messageItems)
+        .filter(isCanonicalPlatformMessage).length,
+    }))
+    .filter((candidate) => candidate.canonicalCount > 0)
+    .sort((left, right) => (
+      Number(isVisible(right.container)) - Number(isVisible(left.container))
+      || right.canonicalCount - left.canonicalCount
+    ));
+  const root = containerCandidates[0]?.container || document;
+  const all = queryAllCandidates(root, selectors.messageItems);
+  const outsideConversationList = all.filter((element) => !conversationItems.some(
+    (conversationItem) => conversationItem === element || conversationItem.contains(element),
+  ));
+  const canonical = outsideConversationList.filter(isCanonicalPlatformMessage);
+  const selected = canonical.length ? canonical : outermostCandidates(outsideConversationList);
+  return {
+    elements: selected,
+    diagnostics: {
+      candidate_count: all.length,
+      conversation_preview_rejected_count: all.length - outsideConversationList.length,
+      canonical_count: canonical.length,
+      selected_count: selected.length,
+      fallback_used: canonical.length === 0,
+      scoped_to_message_container: root !== document,
+    },
+  };
 }
 
 function selectorHitCounts(catalog) {
@@ -528,6 +589,31 @@ function readMessages(elements, observedAt) {
   return entries.map(({ element, sequence, time }) => readMessage(element, sequence, time)).filter(Boolean);
 }
 
+function readSnapshotMessages(elements) {
+  const messages = [];
+  for (const element of elements) {
+    const timeElement = queryFirst(element, selectors.messageTime);
+    const timeLabel = attribute(timeElement || element, ['datetime', 'data-time', 'data-timestamp'])
+      || text(timeElement?.textContent, 64);
+    const message = readMessage(element, messages.length, {
+      platform_sent_at: null,
+      time_label: timeLabel,
+      has_explicit_time: Boolean(timeLabel),
+    });
+    if (!message) continue;
+    if (!['text', 'image'].includes(message.message_type)) continue;
+    messages.push({
+      dom_sequence: messages.length,
+      sender_role: message.sender_role,
+      message_type: message.message_type,
+      content: message.content,
+      image_url: message.image_url,
+      platform_message_id: message.platform_message_id,
+    });
+  }
+  return messages;
+}
+
 function accountNameCandidate() {
   const shopElement = queryFirst(document, selectors.shopName);
   for (const selector of selectors.shopName || []) {
@@ -578,7 +664,7 @@ function hasManualVerification() {
 }
 
 function messageAreaFingerprint() {
-  return JSON.stringify(queryCandidates(document, selectors.messageItems).slice(-200).map((element) => [
+  return JSON.stringify(inspectMessageCandidates().elements.slice(-200).map((element) => [
     attribute(element, ['data-message-id', 'data-msg-id', 'data-id', 'id']),
     `${element.className || ''}`.slice(0, 180),
     text(element.textContent, 600),
@@ -586,7 +672,7 @@ function messageAreaFingerprint() {
 }
 
 function hasVisibleMessages() {
-  return queryCandidates(document, selectors.messageItems).length > 0;
+  return inspectMessageCandidates().elements.length > 0;
 }
 
 function strictCurrentConversationName() {
@@ -616,8 +702,14 @@ function readSnapshot(observedAt, entries = collectConversationEntries(), verifi
     : conversations.find((conversation) => conversation.active);
   if (!active && conversations.length === 1) active = conversations[0];
   if (active) {
-    const messages = readMessages(queryCandidates(document, selectors.messageItems), observedAt);
+    const { elements } = inspectMessageCandidates();
+    const messages = readMessages(elements, observedAt);
     if (messages.length) active.messages = messages.slice(-200);
+    const snapshotMessages = readSnapshotMessages(elements).slice(-200);
+    active.snapshot_messages = snapshotMessages.map((message, domSequence) => ({
+      ...message,
+      dom_sequence: domSequence,
+    }));
   }
   return conversations;
 }
@@ -1050,12 +1142,14 @@ function emitSnapshot(entries, verifiedActiveKey = null, force = false) {
     conversations,
   }, observedAt);
   const active = conversations.find((conversation) => conversation.active) || null;
+  const messageCandidates = inspectMessageCandidates().diagnostics;
   diagnostic('snapshot_emitted', {
     force,
     conversation_count: conversations.length,
     active_conversation_key: active ? conversationKey(active) : null,
     active_message_count: active?.messages?.length || 0,
     verified_active_key: verifiedActiveKey,
+    message_candidates: messageCandidates,
   });
   return true;
 }
@@ -1317,7 +1411,7 @@ async function processConversationEntry(entry, entries, { markUnread = false, em
     conversation_key: entry.key,
     customer_name: entry.conversation.customer_name,
     unread_count: entry.conversation.unread_count,
-    message_count: readMessages(queryCandidates(document, selectors.messageItems), new Date().toISOString()).length,
+    message_count: readMessages(inspectMessageCandidates().elements, new Date().toISOString()).length,
     order_collection_status: orderSnapshot.collection_status,
     order_count: orderSnapshot.orders.length,
   });
@@ -2023,6 +2117,7 @@ async function scan() {
       conversations: entrySummary,
       conversation_selector_hits: selectorHitCounts(selectors.conversationItems),
       unread_selector_hits: selectorHitCounts(selectors.unreadBadge),
+      message_candidate_filter: inspectMessageCandidates().diagnostics,
     }, entries.length ? 'info' : 'warn');
     if (!entries.length) return;
     const unreadEntry = selectUnreadEntry(entries);

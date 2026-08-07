@@ -114,6 +114,7 @@ class MessageObservationServiceTests(unittest.TestCase):
         message_count: int | None = None,
         payload_hash: str | None = None,
         account_id: str | None = None,
+        legacy_projection: dict[str, object] | None = None,
     ) -> RpaEventCreate:
         batch_messages = self.messages() if messages is None else messages
         full_messages = self.messages()
@@ -133,6 +134,11 @@ class MessageObservationServiceTests(unittest.TestCase):
                 "batch_count": batch_count,
                 "message_offset": message_offset,
                 "messages": batch_messages,
+                **(
+                    {"source_snapshot_id": "desktop-snapshot-1", "legacy_projection": legacy_projection}
+                    if legacy_projection is not None
+                    else {}
+                ),
             },
         )
 
@@ -154,6 +160,31 @@ class MessageObservationServiceTests(unittest.TestCase):
         self.assertEqual(self.conversation.latest_message_text, "formal-summary")
         self.assertTrue(self.conversation.awaiting_reply)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(AutomationReplyRun)), 0)
+
+    def test_shadow_diagnostics_compare_legacy_and_ordered_snapshot(self) -> None:
+        messages = self.messages()
+        request = self.request(
+            "diagnostics",
+            legacy_projection={
+                "message_count": 2,
+                "direction_counts": {"customer": 1, "agent": 1},
+                "type_counts": {"text": 2, "image": 0, "product": 0, "order": 0},
+                "sequence_hash": "0" * 64,
+                "platform_id_missing_count": 0,
+                "platform_id_duplicate_count": 0,
+            },
+        )
+        observation = process_message_snapshot_shadow(self.db, self.user, self.node, request)
+        self.db.commit()
+
+        metrics = observation.diagnostics_json["snapshot_metrics"]
+        comparison = observation.diagnostics_json["legacy_snapshot_comparison"]
+        self.assertEqual(metrics["message_count"], len(messages))
+        self.assertEqual(metrics["direction_counts"], {"customer": 2, "agent": 1})
+        self.assertEqual(metrics["platform_id_missing_count"], 1)
+        self.assertFalse(comparison["message_count_matches"])
+        self.assertFalse(comparison["direction_counts_match"])
+        self.assertFalse(comparison["page_sequence_matches"])
 
     def test_empty_formal_queue_is_classified_as_bootstrap_without_appending(self) -> None:
         self.db.query(Message).delete()

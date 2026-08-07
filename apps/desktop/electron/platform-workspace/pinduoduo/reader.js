@@ -38,11 +38,33 @@ function cleanMessage(message) {
   };
 }
 
+function cleanSnapshotMessage(message, domSequence) {
+  if (!message || typeof message !== 'object') return null;
+  const messageType = ['text', 'image', 'product', 'order'].includes(message.message_type)
+    ? message.message_type
+    : 'text';
+  const content = cleanText(message.content) || (messageType === 'image' ? '[image]' : null);
+  if (!content) return null;
+  return {
+    dom_sequence: domSequence,
+    sender_role: message.sender_role === 'agent' ? 'agent' : 'customer',
+    message_type: messageType,
+    content,
+    image_url: cleanText(message.image_url, 8192),
+    image_sha256: cleanText(message.image_sha256, 64),
+    media_resource_id: cleanText(message.media_resource_id, 512),
+    platform_message_id: cleanId(message.platform_message_id),
+  };
+}
+
 function cleanConversation(conversation) {
   if (!conversation || typeof conversation !== 'object') return null;
   const externalId = cleanId(conversation.external_conversation_id);
   const customerName = cleanText(conversation.customer_name, 128);
   if (!externalId && !customerName) return null;
+  const snapshotMessages = Array.isArray(conversation.snapshot_messages)
+    ? conversation.snapshot_messages.slice(-200).map(cleanSnapshotMessage).filter(Boolean)
+    : null;
   return {
     external_conversation_id: externalId,
     customer_name: customerName,
@@ -55,6 +77,10 @@ function cleanConversation(conversation) {
     messages: Array.isArray(conversation.messages)
       ? conversation.messages.slice(-200).map(cleanMessage).filter(Boolean)
       : [],
+    snapshot_messages: snapshotMessages?.map((message, domSequence) => ({
+      ...message,
+      dom_sequence: domSequence,
+    })) || null,
   };
 }
 

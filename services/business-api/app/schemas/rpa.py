@@ -85,6 +85,17 @@ class SnapshotMessage(BaseModel):
     platform_message_id: str | None = Field(default=None, max_length=128)
 
 
+class SnapshotLegacyProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_count: int = Field(ge=0, le=200)
+    direction_counts: dict[str, int] = Field(default_factory=dict)
+    type_counts: dict[str, int] = Field(default_factory=dict)
+    sequence_hash: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    platform_id_missing_count: int = Field(ge=0, le=200)
+    platform_id_duplicate_count: int = Field(ge=0, le=200)
+
+
 class MessageSnapshotPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -97,6 +108,8 @@ class MessageSnapshotPayload(BaseModel):
     batch_count: int = Field(default=1, ge=1, le=100)
     message_offset: int = Field(default=0, ge=0, le=200)
     messages: list[SnapshotMessage] = Field(default_factory=list, max_length=200)
+    source_snapshot_id: str | None = Field(default=None, max_length=128)
+    legacy_projection: SnapshotLegacyProjection | None = None
 
     @model_validator(mode="after")
     def validate_batch_metadata(self) -> "MessageSnapshotPayload":
@@ -131,6 +144,29 @@ class RpaEventRead(BaseModel):
     received_at: datetime
     processed_at: datetime | None = None
     status: str
+    error_message: str | None = None
+
+
+class MessageObservationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    observation_id: str
+    platform_account_id: str
+    conversation_id: str
+    conversation_external_id: str
+    collected_at: datetime
+    unread: bool
+    payload_hash: str
+    message_count: int
+    batch_count: int
+    received_batch_count: int
+    alignment_status: str
+    alignment_method: str | None = None
+    overlap_size: int
+    projected_append_count: int
+    appended_count: int
+    diagnostics_json: dict[str, Any] = Field(default_factory=dict)
+    processed_at: datetime | None = None
     error_message: str | None = None
 
 

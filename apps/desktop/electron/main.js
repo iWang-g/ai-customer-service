@@ -163,6 +163,28 @@ function registerIpcHandlers() {
       customerName: payload.customerName,
     });
   });
+  ipcMain.handle('pdd-workspace:prepare-conversation-test-reset', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (
+      typeof payload?.externalConversationId !== 'string'
+      || !payload.externalConversationId
+      || payload.externalConversationId.length > 128
+    ) throw new Error('目标会话参数无效');
+    return pddWorkspaceManager.prepareConversationTestReset(payload);
+  });
+  ipcMain.handle('pdd-workspace:resume-conversation-after-test-reset', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (
+      typeof payload?.externalConversationId !== 'string'
+      || !payload.externalConversationId
+      || payload.externalConversationId.length > 128
+    ) throw new Error('目标会话参数无效');
+    return pddWorkspaceManager.resumeConversationAfterTestReset(payload);
+  });
   ipcMain.handle('pdd-workspace:send-message', (_event, payload) => {
     if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
       throw new Error('平台店铺参数无效');

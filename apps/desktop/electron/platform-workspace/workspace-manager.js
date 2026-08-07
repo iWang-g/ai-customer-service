@@ -1404,6 +1404,60 @@ export class PddWorkspaceManager {
     ));
   }
 
+  async prepareConversationTestReset({
+    platformAccountId,
+    externalConversationId,
+  }) {
+    this.#requireUser();
+    const account = this.registry.list(this.userId).find(
+      (candidate) => candidate.platformAccountId === platformAccountId
+        && !candidate.paused
+        && !candidate.archivedAt
+        && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
+        && this.#isAccountIdentityVerified(candidate),
+    );
+    if (!account) throw new Error('未找到会话对应的可用拼多多店铺');
+    if (!externalConversationId) throw new Error('会话缺少平台会话标识，无法安全重置');
+    const collector = this.#createCollector(account.id);
+    collector.runtime.suppressConversation(platformAccountId, externalConversationId);
+    let deletedEventCount;
+    try {
+      deletedEventCount = await this.rpaManager.clearConversationEvents(
+        platformAccountId,
+        externalConversationId,
+      );
+    } catch (error) {
+      collector.runtime.releaseConversation(platformAccountId, externalConversationId);
+      throw error;
+    }
+    return {
+      status: 'prepared',
+      account_id: account.id,
+      deleted_event_count: deletedEventCount,
+    };
+  }
+
+  async resumeConversationAfterTestReset({
+    platformAccountId,
+    externalConversationId,
+  }) {
+    this.#requireUser();
+    const account = this.registry.list(this.userId).find(
+      (candidate) => candidate.platformAccountId === platformAccountId
+        && !candidate.paused
+        && !candidate.archivedAt
+        && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
+        && this.#isAccountIdentityVerified(candidate),
+    );
+    if (!account) throw new Error('未找到会话对应的可用拼多多店铺');
+    const collector = this.#createCollector(account.id);
+    collector.runtime.releaseConversation(platformAccountId, externalConversationId);
+    return {
+      status: 'resumed',
+      account_id: account.id,
+    };
+  }
+
   #isAccountIdentityVerified(account) {
     if (!account.externalAccountId) return Boolean(account.platformAccountId);
     return this.verifiedAccountIdentities.has(account.id);

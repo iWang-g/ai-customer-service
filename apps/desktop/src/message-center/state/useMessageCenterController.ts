@@ -15,6 +15,7 @@ import {
   login,
   logout,
   recordSentMessage,
+  resetConversationTestData,
   register,
   sendMessage,
   storeSession,
@@ -361,7 +362,11 @@ export function useMessageCenterController() {
           );
           return;
         }
-        if (event.type.startsWith('rpa.') || event.type === 'conversation.updated') void loadConversationData();
+        if (
+          event.type.startsWith('rpa.')
+          || event.type === 'conversation.updated'
+          || event.type === 'conversation.reset'
+        ) void loadConversationData();
         if (
           event.type.startsWith('rpa.')
           || event.type === 'conversation.updated'
@@ -499,6 +504,38 @@ export function useMessageCenterController() {
     )));
   };
 
+  const handleResetConversationTestData = async (conversationId: string) => {
+    const conversation = conversations.find((item) => item.id === conversationId);
+    if (!conversation) throw new Error('会话不存在或已经刷新');
+    if (conversation.platform !== 'pinduoduo') {
+      throw new Error('当前仅支持重置拼多多测试会话');
+    }
+    if (!conversation.externalConversationId) {
+      throw new Error('会话缺少平台会话标识，无法安全重置');
+    }
+    if (!window.desktopBridge) throw new Error('当前运行环境不支持拼多多会话重置');
+
+    const resetTarget = {
+      platformAccountId: conversation.shopId,
+      externalConversationId: conversation.externalConversationId,
+    };
+    await window.desktopBridge.preparePddConversationTestReset(resetTarget);
+    let response: Awaited<ReturnType<typeof resetConversationTestData>>;
+    try {
+      response = await resetConversationTestData(conversationId);
+    } catch (error) {
+      await window.desktopBridge
+        .resumePddConversationAfterTestReset(resetTarget)
+        .catch(() => undefined);
+      throw error;
+    }
+    setConversations((current) => current.map((item) => (
+      item.id === conversationId ? mapConversation(response.conversation, []) : item
+    )));
+    await window.desktopBridge.resumePddConversationAfterTestReset(resetTarget);
+    await loadConversationData();
+  };
+
   const handleRefreshCustomerOrders = useCallback(async () => {
     const conversation = conversations.find((item) => item.id === selectedIdRef.current);
     if (!conversation) return;
@@ -580,6 +617,7 @@ export function useMessageCenterController() {
     handleLogout,
     handleSendMessage,
     handleClearHumanRequired,
+    handleResetConversationTestData,
     handleImportCandidate,
     loadImportCandidates,
     openImportModal,

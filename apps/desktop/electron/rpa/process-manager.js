@@ -21,6 +21,7 @@ export class RpaProcessManager extends EventEmitter {
     this.accessToken = null;
     this.accounts = [];
     this.pendingEvents = new Map();
+    this.pendingConversationClears = new Map();
     this.buffer = '';
     this.stopping = false;
     this.restartTimer = null;
@@ -98,6 +99,11 @@ export class RpaProcessManager extends EventEmitter {
     this.userId = null;
     this.accessToken = null;
     this.pendingEvents.clear();
+    for (const pending of this.pendingConversationClears.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('RPA process stopped before conversation events were cleared'));
+    }
+    this.pendingConversationClears.clear();
     this.#setState({ status: 'stopped', nodeId: null, detail: null, lastHeartbeatAt: null });
   }
 
@@ -190,6 +196,14 @@ export class RpaProcessManager extends EventEmitter {
     }
     if (message.type === 'event_queued') {
       this.pendingEvents.delete(message.event_id);
+      return;
+    }
+    if (message.type === 'conversation_events_cleared') {
+      const pending = this.pendingConversationClears.get(message.request_id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pendingConversationClears.delete(message.request_id);
+      pending.resolve(Number(message.deleted_count) || 0);
     }
   }
 
@@ -200,6 +214,37 @@ export class RpaProcessManager extends EventEmitter {
       status,
       result_json: resultJson,
       error_message: errorMessage,
+    });
+  }
+
+  clearConversationEvents(platformAccountId, conversationExternalId) {
+    for (const [eventId, event] of this.pendingEvents) {
+      if (
+        event.platform_account_id === platformAccountId
+        && event.conversation_external_id === conversationExternalId
+      ) this.pendingEvents.delete(eventId);
+    }
+    if (!this.process || this.process.killed || !this.secret) {
+      return Promise.reject(new Error('RPA process is not available'));
+    }
+    const requestId = randomBytes(16).toString('hex');
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingConversationClears.delete(requestId);
+        reject(new Error('Timed out clearing local RPA conversation events'));
+      }, 15000);
+      this.pendingConversationClears.set(requestId, { resolve, reject, timer });
+      const sent = this.#send({
+        type: 'clear_conversation_events',
+        request_id: requestId,
+        platform_account_id: platformAccountId,
+        conversation_external_id: conversationExternalId,
+      });
+      if (!sent) {
+        clearTimeout(timer);
+        this.pendingConversationClears.delete(requestId);
+        reject(new Error('Failed to request local RPA conversation event cleanup'));
+      }
     });
   }
 

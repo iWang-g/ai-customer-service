@@ -46,10 +46,17 @@ class EventQueue:
     def enqueue(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         with self.lock, self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 "INSERT OR IGNORE INTO event_queue (event_id, payload_json, created_at) VALUES (?, ?, ?)",
                 (payload["event_id"], encoded, time.time()),
             )
+            if cursor.rowcount == 0:
+                existing = self.connection.execute(
+                    "SELECT payload_json FROM event_queue WHERE event_id = ?",
+                    (payload["event_id"],),
+                ).fetchone()
+                if not existing or existing[0] != encoded:
+                    raise ValueError("event_id was reused with a different payload")
 
     def pending(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.lock:
@@ -86,6 +93,35 @@ class EventQueue:
             ).fetchone()[0]
         return pending, synced
 
+    def delete_conversation_events(
+        self,
+        platform_account_id: str,
+        conversation_external_id: str,
+    ) -> int:
+        deleted = 0
+        with self.lock, self.connection:
+            rows = self.connection.execute(
+                "SELECT event_id, payload_json FROM event_queue"
+            ).fetchall()
+            event_ids = []
+            for event_id, encoded in rows:
+                try:
+                    event = json.loads(encoded)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    event.get("platform_account_id") == platform_account_id
+                    and event.get("conversation_external_id") == conversation_external_id
+                ):
+                    event_ids.append(event_id)
+            if event_ids:
+                self.connection.executemany(
+                    "DELETE FROM event_queue WHERE event_id = ?",
+                    [(event_id,) for event_id in event_ids],
+                )
+                deleted = len(event_ids)
+        return deleted
+
 
 class RpaAgent:
     def __init__(self) -> None:
@@ -97,6 +133,7 @@ class RpaAgent:
         self.node_id: str | None = None
         self.heartbeat_interval = 30
         self.event_queue: EventQueue | None = None
+        self.event_flush_lock = threading.Lock()
         self.accounts: list[dict[str, Any]] = []
         self.accounts_version = 0
         self.synced_accounts_version = -1
@@ -232,19 +269,20 @@ class RpaAgent:
         self.emit("accounts_synced", bindings=bindings)
 
     def flush_events(self) -> None:
-        if not self.event_queue:
-            return
-        events = self.event_queue.pending()
-        if not events:
-            return
-        event_ids = [item["event_id"] for item in events]
-        try:
-            self.request("POST", "/rpa/events/batch", {"events": events}, node_auth=True)
-            self.event_queue.mark_synced(event_ids)
-            self.emit("events_synced", count=len(event_ids))
-        except ApiError as exc:
-            self.event_queue.mark_failed(event_ids, str(exc))
-            raise
+        with self.event_flush_lock:
+            if not self.event_queue:
+                return
+            events = self.event_queue.pending()
+            if not events:
+                return
+            event_ids = [item["event_id"] for item in events]
+            try:
+                self.request("POST", "/rpa/events/batch", {"events": events}, node_auth=True)
+                self.event_queue.mark_synced(event_ids)
+                self.emit("events_synced", count=len(event_ids))
+            except ApiError as exc:
+                self.event_queue.mark_failed(event_ids, str(exc))
+                raise
 
     def poll_tasks(self) -> None:
         if not self.node_token:
@@ -306,6 +344,19 @@ class RpaAgent:
                     "error_message": command.get("error_message"),
                 },
                 node_auth=True,
+            )
+        elif command_type == "clear_conversation_events":
+            if not self.event_queue:
+                raise RuntimeError("Agent is not initialized")
+            with self.event_flush_lock:
+                deleted_count = self.event_queue.delete_conversation_events(
+                    str(command["platform_account_id"]),
+                    str(command["conversation_external_id"]),
+                )
+            self.emit(
+                "conversation_events_cleared",
+                request_id=str(command["request_id"]),
+                deleted_count=deleted_count,
             )
         elif command_type == "update_access_token":
             self.access_token = str(command["access_token"])

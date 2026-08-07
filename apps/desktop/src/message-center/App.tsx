@@ -70,6 +70,7 @@ export default function App() {
       dataError={controller.dataError}
       onSendMessage={controller.handleSendMessage}
       onClearHumanRequired={controller.handleClearHumanRequired}
+      onResetConversationTestData={controller.handleResetConversationTestData}
       bot={controller.bot}
       logs={controller.logs}
       statusEvents={controller.statusEvents}

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { validateAdapterPayload } from './reader.js';
 
+const MESSAGE_SNAPSHOT_BATCH_SIZE = 50;
+
 function digest(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -13,6 +15,16 @@ function safeIsoDate(value, fallback) {
 
 function compact(value) {
   return JSON.stringify(value);
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonical(value[key] === undefined ? null : value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
 }
 
 function messageFallbackIdentity(message) {
@@ -38,6 +50,51 @@ function normalizedSnapshotMessages(messages) {
   return normalized;
 }
 
+function snapshotHashMessages(messages) {
+  return messages.map((message, index) => ({
+    dom_sequence: Number.isInteger(message.dom_sequence) ? message.dom_sequence : index,
+    sender_role: message.sender_role || '',
+    message_type: message.message_type || 'text',
+    content: message.content || '',
+    image_url: message.image_url || null,
+    image_sha256: message.image_sha256 || null,
+    media_resource_id: message.media_resource_id || null,
+    platform_message_id: message.platform_message_id || null,
+  }));
+}
+
+function snapshotPayloadHash(messages) {
+  return digest(canonical(snapshotHashMessages(messages)));
+}
+
+function sequenceEvidenceHash(messages) {
+  return digest(canonical(messages.map((message) => ({
+    sender_role: message.sender_role,
+    message_type: message.message_type,
+    content: message.content,
+    image_url: message.image_url || null,
+  }))));
+}
+
+function messageCounts(messages, key, values) {
+  return Object.fromEntries(values.map((value) => [
+    value,
+    messages.filter((message) => message[key] === value).length,
+  ]));
+}
+
+function legacyProjection(messages) {
+  const ids = messages.map((message) => message.platform_message_id).filter(Boolean);
+  return {
+    message_count: messages.length,
+    direction_counts: messageCounts(messages, 'sender_role', ['customer', 'agent']),
+    type_counts: messageCounts(messages, 'message_type', ['text', 'image', 'product', 'order']),
+    sequence_hash: sequenceEvidenceHash(messages),
+    platform_id_missing_count: messages.length - ids.length,
+    platform_id_duplicate_count: ids.length - new Set(ids).size,
+  };
+}
+
 export class PddCollectionRuntime {
   constructor({
     localAccountId,
@@ -46,6 +103,7 @@ export class PddCollectionRuntime {
     onIdentity,
     onStatus,
     onDiagnostic,
+    snapshotShadowEnabled = process.env.PDD_MESSAGE_SNAPSHOT_DUAL_TRACK_ENABLED !== 'false',
   }) {
     this.localAccountId = localAccountId;
     this.getPlatformAccountId = getPlatformAccountId;
@@ -53,8 +111,10 @@ export class PddCollectionRuntime {
     this.onIdentity = onIdentity;
     this.onStatus = onStatus;
     this.onDiagnostic = onDiagnostic;
+    this.snapshotShadowEnabled = snapshotShadowEnabled;
     this.pendingSnapshot = null;
     this.emitted = new Set();
+    this.suppressedConversations = new Set();
   }
 
   ingest(rawPayload) {
@@ -102,6 +162,30 @@ export class PddCollectionRuntime {
     this.#emitSnapshot(snapshot);
   }
 
+  clearConversationEmitted(platformAccountId, externalConversationId) {
+    const prefix = `pinduoduo:${platformAccountId}:${externalConversationId}:`;
+    let deletedCount = 0;
+    for (const key of this.emitted) {
+      if (!key.startsWith(prefix)) continue;
+      this.emitted.delete(key);
+      deletedCount += 1;
+    }
+    this.#diagnostic('runtime_conversation_dedup_cleared', {
+      conversation_external_id: externalConversationId,
+      deleted_count: deletedCount,
+    });
+    return deletedCount;
+  }
+
+  suppressConversation(platformAccountId, externalConversationId) {
+    this.suppressedConversations.add(`${platformAccountId}:${externalConversationId}`);
+    return this.clearConversationEmitted(platformAccountId, externalConversationId);
+  }
+
+  releaseConversation(platformAccountId, externalConversationId) {
+    this.suppressedConversations.delete(`${platformAccountId}:${externalConversationId}`);
+  }
+
   #emitSnapshot(snapshot) {
     const platformAccountId = this.getPlatformAccountId();
     if (!platformAccountId) {
@@ -114,6 +198,13 @@ export class PddCollectionRuntime {
     for (const conversation of snapshot.conversations) {
       const externalConversationId = conversation.external_conversation_id
         || `name:${digest(conversation.customer_name || 'unknown').slice(0, 24)}`;
+      if (this.suppressedConversations.has(`${platformAccountId}:${externalConversationId}`)) {
+        this.#diagnostic('runtime_conversation_snapshot_suppressed', {
+          conversation_external_id: externalConversationId,
+          snapshot_id: snapshot.snapshot_id || null,
+        });
+        continue;
+      }
       const conversationState = {
         customer_name: conversation.customer_name,
         title: conversation.title,
@@ -211,10 +302,76 @@ export class PddCollectionRuntime {
           },
         });
       }
+      if (this.snapshotShadowEnabled && Array.isArray(conversation.snapshot_messages)) {
+        this.#emitMessageSnapshot({
+          snapshot,
+          conversation,
+          externalConversationId,
+          platformAccountId,
+          legacyMessages: messages,
+        });
+      }
     }
     this.#diagnostic('runtime_snapshot_expansion_completed', {
       snapshot_id: snapshot.snapshot_id || null,
       event_candidate_count: emittedCandidates,
+    });
+  }
+
+  #emitMessageSnapshot({
+    snapshot,
+    conversation,
+    externalConversationId,
+    platformAccountId,
+    legacyMessages,
+  }) {
+    const messages = snapshotHashMessages(conversation.snapshot_messages);
+    const payloadHash = snapshotPayloadHash(messages);
+    const observationSeed = compact({
+      local_account_id: this.localAccountId,
+      platform_account_id: platformAccountId,
+      conversation_external_id: externalConversationId,
+      snapshot_id: snapshot.snapshot_id,
+      payload_hash: payloadHash,
+    });
+    const observationId = `pddobs_${digest(observationSeed).slice(0, 48)}`;
+    const batchCount = Math.max(1, Math.ceil(messages.length / MESSAGE_SNAPSHOT_BATCH_SIZE));
+    const projection = legacyProjection(legacyMessages);
+    for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
+      const messageOffset = batchIndex * MESSAGE_SNAPSHOT_BATCH_SIZE;
+      const batchMessages = messages.slice(messageOffset, messageOffset + MESSAGE_SNAPSHOT_BATCH_SIZE);
+      const eventKey = `pinduoduo:${platformAccountId}:${externalConversationId}:message-snapshot:${observationId}:${batchIndex}`;
+      this.#emitOnce(eventKey, {
+        event_id: `pdd_${digest(eventKey)}`,
+        dedup_key: eventKey,
+        event_type: 'message_snapshot',
+        platform_code: 'pinduoduo',
+        platform_account_id: platformAccountId,
+        conversation_external_id: externalConversationId,
+        received_at: snapshot.observed_at,
+        payload_json: {
+          observation_id: observationId,
+          collected_at: snapshot.observed_at,
+          unread: conversation.unread_count > 0,
+          payload_hash: payloadHash,
+          message_count: messages.length,
+          batch_index: batchIndex,
+          batch_count: batchCount,
+          message_offset: messageOffset,
+          messages: batchMessages,
+          source_snapshot_id: snapshot.snapshot_id,
+          legacy_projection: projection,
+        },
+      });
+    }
+    this.#diagnostic('runtime_message_snapshot_emitted', {
+      observation_id: observationId,
+      conversation_external_id: externalConversationId,
+      message_count: messages.length,
+      batch_count: batchCount,
+      legacy_message_count: legacyMessages.length,
+      platform_id_missing_count: projection.platform_id_missing_count,
+      platform_id_duplicate_count: projection.platform_id_duplicate_count,
     });
   }
 

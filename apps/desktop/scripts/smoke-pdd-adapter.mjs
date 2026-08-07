@@ -16,7 +16,7 @@ function fixture() {
       <li class="chat-item" id="conversation-a">
         <div class="chat-item-box active" data-random="8715744365612-0-all">
         <span class="chat-nickname">Buyer A</span>
-        <span class="bottom-message">hello</span>
+        <span class="bottom-message message-item">Hello again</span>
         <span data-role="unread-count">1</span>
         </div>
       </li>
@@ -28,7 +28,7 @@ function fixture() {
       <li class="chat-item" id="conversation-b">
         <div class="chat-item-box" data-random="9922334455667-0-all">
         <span class="chat-nickname">Buyer B</span>
-        <span class="bottom-message">Incoming message</span>
+        <span class="bottom-message message-item">Second reply</span>
         <span class="SessionBaseCard-unread-rot" style="display: inline-block; width: 8px; height: 8px"></span>
         </div>
       </li>
@@ -40,7 +40,7 @@ function fixture() {
       <li class="chat-item" id="conversation-c">
         <div class="chat-item-box" data-random="6677889900112-0-all">
         <span class="chat-nickname">Buyer C</span>
-        <span class="bottom-message">Another unread message</span>
+        <span class="bottom-message message-item">Another unread message</span>
         <span class="reply-status">&#x5F85;&#x56DE;&#x590D;</span>
         </div>
       </li>
@@ -162,8 +162,28 @@ app.whenReady().then(async () => {
     },
   });
   const messages = [];
+  // The production workspace manager turns preload requests into serial store-actor commands.
+  let unreadRequestSequence = 0;
+  let unreadCollectionBusy = false;
+  const requestUnreadCollection = () => {
+    if (unreadCollectionBusy) return;
+    unreadCollectionBusy = true;
+    unreadRequestSequence += 1;
+    window.webContents.send('pdd-adapter:command', {
+      type: 'collect-next-unread',
+      requestId: `adapter-smoke-unread-${unreadRequestSequence}`,
+    });
+  };
   window.webContents.on('ipc-message', (_event, channel, payload) => {
-    if (channel === 'pdd-adapter:event') messages.push(payload);
+    if (channel !== 'pdd-adapter:event') return;
+    messages.push(payload);
+    if (payload.type === 'collect_unread_request') {
+      requestUnreadCollection();
+    }
+    if (payload.type === 'unread_collection_result') {
+      unreadCollectionBusy = false;
+      if (payload.status === 'collected') setTimeout(requestUnreadCollection, 25);
+    }
   });
   await window.loadURL(`http://127.0.0.1:${address.port}/chat-merchant/index.html`);
 
@@ -242,7 +262,26 @@ app.whenReady().then(async () => {
   );
   assert.ok(initialConversation, 'initial active conversation snapshot must be collected');
   const collected = initialConversation.messages || [];
-  assert.equal(collected.length, 4, 'lead and system nodes must be filtered');
+  assert.equal(
+    collected.length,
+    4,
+    'conversation previews, lead cards, and system nodes must be filtered',
+  );
+  assert.equal(
+    collected.filter((item) => item.content === 'Hello again').length,
+    1,
+    'a preview that duplicates the newest real message must not create an early occurrence',
+  );
+  assert.equal(
+    collected.filter((item) => item.content === 'Second reply').length,
+    1,
+    'another conversation preview must not duplicate a historical agent message',
+  );
+  assert.equal(
+    collected.some((item) => item.content === 'Another unread message'),
+    false,
+    'unrelated conversation-list previews must never be read as active-chat messages',
+  );
   assert.deepEqual(
     collected.map((item) => item.platform_message_id),
     [
@@ -261,6 +300,22 @@ app.whenReady().then(async () => {
   assert.notEqual(collected[2].platform_sent_at, collected[3].platform_sent_at);
   assert.deepEqual(collected.map((item) => item.time_group_index), [0, 0, 0, 1]);
   assert.deepEqual(collected.map((item) => item.has_explicit_time), [false, true, false, true]);
+  assert.deepEqual(
+    initialConversation.snapshot_messages.map((item) => item.platform_message_id),
+    [
+      'middlePanel_List_message-a',
+      'middlePanel_List_message-b',
+      'middlePanel_List_message-c',
+      'middlePanel_List_message-d',
+    ],
+  );
+  assert.deepEqual(
+    initialConversation.snapshot_messages.map((item) => item.dom_sequence),
+    [0, 1, 2, 3],
+    'shadow snapshot sequence must remain continuous after system-node filtering',
+  );
+  assert.equal(initialConversation.snapshot_messages[0].platform_sent_at, undefined);
+  assert.equal(initialConversation.snapshot_messages[0].time_label, undefined);
   assert.ok(snapshot.snapshot_id);
   const buyerB = unreadSnapshot?.conversations?.find(
     (conversation) => conversation.external_conversation_id === '9922334455667',
@@ -388,7 +443,14 @@ app.whenReady().then(async () => {
   });
   const failedEvents = [];
   failedWindow.webContents.on('ipc-message', (_event, channel, payload) => {
-    if (channel === 'pdd-adapter:event') failedEvents.push(payload);
+    if (channel !== 'pdd-adapter:event') return;
+    failedEvents.push(payload);
+    if (payload.type === 'collect_unread_request') {
+      failedWindow.webContents.send('pdd-adapter:command', {
+        type: 'collect-next-unread',
+        requestId: 'adapter-smoke-failed-unread',
+      });
+    }
   });
   await failedWindow.loadURL(`http://127.0.0.1:${address.port}/chat-merchant/failed-switch`);
   await new Promise((resolve) => setTimeout(resolve, 4500));

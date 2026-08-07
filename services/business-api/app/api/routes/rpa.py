@@ -5,8 +5,9 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_rpa_node, get_current_user, get_db_session, get_settings_dep
 from app.core.config import Settings
-from app.models import Message, RpaNode, RpaTask, User
+from app.models import Message, MessageObservation, RpaNode, RpaTask, User
 from app.schemas.rpa import (
+    MessageObservationRead,
     NodeHeartbeatRequest,
     NodeRegisterRequest,
     NodeRegisterResponse,
@@ -155,6 +156,34 @@ async def ingest_batch(
         {"type": "rpa.events.batch", "events": [item.model_dump(mode="json") for item in events]},
     )
     return events
+
+
+@router.get("/message-observations", response_model=list[MessageObservationRead])
+def list_message_observations(
+    platform_account_id: str | None = Query(default=None),
+    conversation_external_id: str | None = Query(default=None),
+    alignment_status: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> list[MessageObservationRead]:
+    from sqlalchemy import desc, select
+
+    statement = select(MessageObservation).where(MessageObservation.user_id == user.id)
+    if platform_account_id:
+        statement = statement.where(
+            MessageObservation.platform_account_id == platform_account_id
+        )
+    if conversation_external_id:
+        statement = statement.where(
+            MessageObservation.conversation_external_id == conversation_external_id
+        )
+    if alignment_status:
+        statement = statement.where(MessageObservation.alignment_status == alignment_status)
+    observations = db.scalars(
+        statement.order_by(desc(MessageObservation.collected_at)).limit(limit)
+    ).all()
+    return [MessageObservationRead.model_validate(item) for item in observations]
 
 
 @router.get("/tasks/pending", response_model=list[RpaTaskRead])

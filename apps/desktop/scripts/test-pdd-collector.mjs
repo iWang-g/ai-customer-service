@@ -39,12 +39,13 @@ const snapshot = {
   ],
 };
 
-function createRuntime(localAccountId, binding) {
+function createRuntime(localAccountId, binding, options = {}) {
   const events = [];
   const runtime = new PddCollectionRuntime({
     localAccountId,
     getPlatformAccountId: () => binding.value,
     enqueueEvent: (event) => events.push(event),
+    ...options,
   });
   return { runtime, events };
 }
@@ -65,6 +66,84 @@ assert.equal(accountA.events[1].payload_json.platform_sent_at, '2026-07-28T07:59
 assert.equal(accountA.events[1].payload_json.snapshot_id, 'snapshot-100');
 assert.equal(accountA.events[1].payload_json.snapshot_sequence, 3);
 assert.match(accountA.events[1].dedup_key, /:message:v3:/);
+
+const dualTrackSnapshot = structuredClone(snapshot);
+dualTrackSnapshot.snapshot_id = 'snapshot-dual-track';
+dualTrackSnapshot.conversations[0].snapshot_messages = [
+  {
+    dom_sequence: 0,
+    platform_message_id: null,
+    sender_role: 'customer',
+    content: 'same customer message',
+    message_type: 'text',
+    image_url: null,
+  },
+  {
+    dom_sequence: 1,
+    platform_message_id: null,
+    sender_role: 'customer',
+    content: 'same customer message',
+    message_type: 'text',
+    image_url: null,
+  },
+  {
+    dom_sequence: 2,
+    platform_message_id: 'image-1',
+    sender_role: 'agent',
+    content: '[image]',
+    message_type: 'image',
+    image_url: 'https://img.example.com/image.png?token=temporary',
+  },
+];
+const dualTrackAccount = createRuntime('local-dual-track', { value: 'platform-dual-track' });
+dualTrackAccount.runtime.ingest(dualTrackSnapshot);
+const messageSnapshot = dualTrackAccount.events.find((event) => event.event_type === 'message_snapshot');
+assert.ok(messageSnapshot, 'dual-track snapshot event must be emitted');
+assert.equal(messageSnapshot.payload_json.messages.length, 3);
+assert.deepEqual(messageSnapshot.payload_json.messages.map((message) => message.dom_sequence), [0, 1, 2]);
+assert.deepEqual(
+  messageSnapshot.payload_json.messages.slice(0, 2).map((message) => message.content),
+  ['same customer message', 'same customer message'],
+  'identical occurrences must remain in the ordered snapshot',
+);
+assert.equal(messageSnapshot.payload_json.messages[0].platform_sent_at, undefined);
+assert.equal(messageSnapshot.payload_json.messages[0].time_label, undefined);
+assert.equal(messageSnapshot.payload_json.legacy_projection.message_count, 1);
+const firstObservationId = messageSnapshot.payload_json.observation_id;
+dualTrackAccount.runtime.ingest(dualTrackSnapshot);
+assert.equal(
+  dualTrackAccount.events.filter((event) => event.event_type === 'message_snapshot').length,
+  1,
+  'retrying the same adapter snapshot must preserve event idempotency',
+);
+assert.equal(messageSnapshot.payload_json.observation_id, firstObservationId);
+
+const splitSnapshot = structuredClone(dualTrackSnapshot);
+splitSnapshot.snapshot_id = 'snapshot-split';
+splitSnapshot.conversations[0].snapshot_messages = Array.from({ length: 101 }, (_, index) => ({
+  dom_sequence: index,
+  platform_message_id: null,
+  sender_role: index % 2 ? 'agent' : 'customer',
+  content: `message ${index}`,
+  message_type: 'text',
+  image_url: null,
+}));
+const splitAccount = createRuntime('local-split', { value: 'platform-split' });
+splitAccount.runtime.ingest(splitSnapshot);
+const splitEvents = splitAccount.events.filter((event) => event.event_type === 'message_snapshot');
+assert.equal(splitEvents.length, 3);
+assert.deepEqual(splitEvents.map((event) => event.payload_json.message_offset), [0, 50, 100]);
+assert.deepEqual(splitEvents.map((event) => event.payload_json.messages.length), [50, 50, 1]);
+assert.equal(new Set(splitEvents.map((event) => event.payload_json.observation_id)).size, 1);
+assert.equal(new Set(splitEvents.map((event) => event.payload_json.payload_hash)).size, 1);
+
+const disabledAccount = createRuntime(
+  'local-disabled',
+  { value: 'platform-disabled' },
+  { snapshotShadowEnabled: false },
+);
+disabledAccount.runtime.ingest(dualTrackSnapshot);
+assert.equal(disabledAccount.events.some((event) => event.event_type === 'message_snapshot'), false);
 
 const imageSnapshot = structuredClone(snapshot);
 imageSnapshot.snapshot_id = 'snapshot-image';
@@ -87,6 +166,15 @@ assert.equal(imageAccount.events[1].payload_json.image_url, 'https://img.example
 
 accountA.runtime.ingest(snapshot);
 assert.equal(accountA.events.length, 2, '重复 DOM 快照必须在本机去重');
+
+accountA.runtime.suppressConversation('platform-a', 'buyer-100');
+const suppressedSnapshot = structuredClone(snapshot);
+suppressedSnapshot.snapshot_id = 'snapshot-suppressed';
+accountA.runtime.ingest(suppressedSnapshot);
+assert.equal(accountA.events.length, 2, 'reset preparation must suppress target conversation events');
+accountA.runtime.releaseConversation('platform-a', 'buyer-100');
+accountA.runtime.ingest(suppressedSnapshot);
+assert.equal(accountA.events.length, 4, 'released conversation must emit a fresh baseline');
 
 const bindingB = { value: 'platform-b' };
 const accountB = createRuntime('local-b', bindingB);

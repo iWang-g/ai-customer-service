@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any
+import unicodedata
 
 from fastapi import HTTPException, status
 from sqlalchemy import and_, desc, or_, select
@@ -25,6 +27,17 @@ from app.services.message_observation_service import (
     SnapshotProtocolError,
     process_message_snapshot_shadow,
 )
+
+
+_OUTBOUND_MESSAGE_SOURCES = frozenset({
+    "desktop",
+    "ai",
+    "automation_timeout",
+    "customer_outreach",
+})
+_OUTBOUND_ECHO_CANDIDATE_LIMIT = 200
+_INVISIBLE_CONTENT_RE = re.compile(r"[\u200b-\u200d\ufeff]")
+_CONTENT_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _node_token(settings: Settings, user: User, node: RpaNode) -> str:
@@ -337,6 +350,145 @@ def _apply_collection_metadata(
         message.sent_at = message.observed_at or observed_at
 
 
+def _normalized_message_content(value: Any) -> str:
+    content = unicodedata.normalize("NFKC", str(value or ""))
+    content = _INVISIBLE_CONTENT_RE.sub("", content)
+    return _CONTENT_WHITESPACE_RE.sub(" ", content).strip()
+
+
+def _message_type(payload: dict[str, Any]) -> str:
+    message_type = str(payload.get("message_type") or payload.get("media_type") or "").strip()
+    if message_type == "image" or payload.get("image_url"):
+        return "image"
+    return message_type or "text"
+
+
+def _matches_outbound_echo(candidate: Message, payload: dict[str, Any], content: str) -> bool:
+    incoming_type = _message_type(payload)
+    candidate_payload = candidate.raw_payload if isinstance(candidate.raw_payload, dict) else {}
+    candidate_type = _message_type(candidate_payload)
+    if incoming_type != candidate_type:
+        return False
+    if incoming_type == "image":
+        # Platform image URLs are rewritten after upload, so occurrence order is
+        # stronger evidence than URL equality for an unbound local image send.
+        return True
+    return _normalized_message_content(candidate.content) == _normalized_message_content(content)
+
+
+def _same_message_evidence(left: Message, right: Message) -> bool:
+    if left.sender_role != right.sender_role:
+        return False
+    left_payload = left.raw_payload if isinstance(left.raw_payload, dict) else {}
+    right_payload = right.raw_payload if isinstance(right.raw_payload, dict) else {}
+    if _message_type(left_payload) != _message_type(right_payload):
+        return False
+    if _message_type(left_payload) == "image":
+        return True
+    return _normalized_message_content(left.content) == _normalized_message_content(right.content)
+
+
+def _has_compatible_outbound_context(
+    db: Session,
+    conversation: Conversation,
+    candidate: Message,
+    payload: dict[str, Any],
+) -> bool:
+    snapshot_id = payload.get("snapshot_id")
+    snapshot_sequence = _payload_non_negative_int(payload, "snapshot_sequence")
+    if not snapshot_id or snapshot_sequence is None or candidate.conversation_sequence is None:
+        return True
+    dom_predecessor = db.scalar(
+        select(Message)
+        .where(
+            and_(
+                Message.conversation_id == conversation.id,
+                Message.snapshot_id == snapshot_id,
+                Message.snapshot_sequence < snapshot_sequence,
+            )
+        )
+        .order_by(desc(Message.snapshot_sequence))
+        .limit(1)
+    )
+    queue_predecessor = db.scalar(
+        select(Message)
+        .where(
+            and_(
+                Message.conversation_id == conversation.id,
+                Message.conversation_sequence < candidate.conversation_sequence,
+                Message.message_status != "failed",
+            )
+        )
+        .order_by(desc(Message.conversation_sequence))
+        .limit(1)
+    )
+    if dom_predecessor is None or queue_predecessor is None:
+        return True
+    return dom_predecessor.id == queue_predecessor.id or _same_message_evidence(
+        dom_predecessor,
+        queue_predecessor,
+    )
+
+
+def _find_outbound_echo_candidate(
+    db: Session,
+    conversation: Conversation,
+    payload: dict[str, Any],
+    content: str,
+) -> Message | None:
+    newest_candidates = list(db.scalars(
+        select(Message)
+        .where(
+            and_(
+                Message.conversation_id == conversation.id,
+                Message.sender_role == "agent",
+                Message.source.in_(_OUTBOUND_MESSAGE_SOURCES),
+                Message.platform_message_id.is_(None),
+            )
+        )
+        .order_by(desc(Message.conversation_sequence), desc(Message.created_at))
+        .limit(_OUTBOUND_ECHO_CANDIDATE_LIMIT)
+    ).all())
+    for candidate in reversed(newest_candidates):
+        candidate_payload = candidate.raw_payload if isinstance(candidate.raw_payload, dict) else {}
+        if candidate_payload.get("platform_echo"):
+            continue
+        if (
+            _matches_outbound_echo(candidate, payload, content)
+            and _has_compatible_outbound_context(db, conversation, candidate, payload)
+        ):
+            return candidate
+    return None
+
+
+def _attach_outbound_echo(
+    db: Session,
+    message: Message,
+    payload: dict[str, Any],
+    request: RpaEventCreate,
+) -> Message:
+    previous_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    observed_at = _payload_datetime(payload, "observed_at") or request.received_at or utcnow()
+    message.platform_message_id = request.platform_message_id or message.platform_message_id
+    message.sender_name = payload.get("sender_name") or message.sender_name
+    message.message_status = "sent"
+    message.raw_payload = {
+        **previous_payload,
+        **payload,
+        "platform_echo": {
+            "event_id": request.event_id,
+            "platform_message_id": request.platform_message_id,
+            "observed_at": observed_at.isoformat(),
+            "snapshot_id": payload.get("snapshot_id"),
+            "snapshot_sequence": _payload_non_negative_int(payload, "snapshot_sequence"),
+        },
+    }
+    _apply_collection_metadata(message, payload, request, preserve_existing=True)
+    db.add(message)
+    db.flush()
+    return message
+
+
 def _upsert_message_from_event(
     db: Session,
     user_id: str,
@@ -436,6 +588,7 @@ def _upsert_message_from_event(
                 and_(
                     Message.conversation_id == conversation.id,
                     Message.platform_message_id.is_(None),
+                    Message.source == "rpa",
                     Message.sender_role == sender_role,
                     Message.content == content,
                     Message.platform_sent_at == platform_sent_at,
@@ -462,6 +615,7 @@ def _upsert_message_from_event(
                 and_(
                     Message.conversation_id == conversation.id,
                     Message.platform_message_id.is_(None),
+                    Message.source == "rpa",
                     Message.sender_role == sender_role,
                     Message.content == content,
                     Message.platform_sent_at == platform_sent_at,
@@ -478,31 +632,14 @@ def _upsert_message_from_event(
             db.flush()
             return fallback_match, False
     if request.event_type in {"agent_message", "message_sent"} and content:
-        # A desktop send is recorded immediately after the platform confirms it;
-        # attach the later RPA snapshot to that row instead of duplicating it.
-        recent_desktop = db.scalar(
-            select(Message)
-            .where(
-                and_(
-                    Message.conversation_id == conversation.id,
-                    Message.sender_role == "agent",
-                    Message.source == "desktop",
-                    Message.platform_message_id.is_(None),
-                    Message.content == content,
-                    Message.sent_at >= utcnow() - timedelta(seconds=60),
-                )
-            )
-            .order_by(Message.sent_at.desc())
-            .limit(1)
-        )
-        if recent_desktop:
-            recent_desktop.platform_message_id = request.platform_message_id
-            recent_desktop.source = "rpa"
-            recent_desktop.raw_payload = {**recent_desktop.raw_payload, **payload}
-            _apply_collection_metadata(recent_desktop, payload, request, preserve_existing=True)
-            db.add(recent_desktop)
-            db.flush()
-            return recent_desktop, False
+        outbound_echo = _find_outbound_echo_candidate(db, conversation, payload, content)
+        if outbound_echo:
+            return _attach_outbound_echo(
+                db,
+                outbound_echo,
+                payload,
+                request,
+            ), False
     message = Message(
         conversation_id=conversation.id,
         user_id=user_id,

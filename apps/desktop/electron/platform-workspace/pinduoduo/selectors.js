@@ -43,6 +43,15 @@ export const PDD_SELECTORS = Object.freeze({
     '[class*="msg-item"]',
     '[class*="chat-message"]',
   ],
+  messageContainers: [
+    '#message-panel',
+    '.msg-list',
+    '[data-role="message-list"]',
+    '[class*="MessageList"]',
+    '[class*="message-list"]',
+    '[class*="messageList"]',
+    '[class*="msg-list"]',
+  ],
   messageContent: [
     '.kwaishop-cs-BizTextCard',
     '[class*="BizTextCard"]',

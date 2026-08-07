@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
+from collections import Counter
 from typing import Any
 
 from pydantic import ValidationError
@@ -59,6 +62,42 @@ def _serialized_batch(payload: MessageSnapshotPayload) -> dict[str, Any]:
         "batch_index": payload.batch_index,
         "message_offset": payload.message_offset,
         "messages": [message.model_dump(mode="json") for message in payload.messages],
+    }
+
+
+def _sequence_evidence_hash(messages: list[dict[str, Any]]) -> str:
+    evidence = [
+        {
+            "sender_role": message.get("sender_role"),
+            "message_type": message.get("message_type"),
+            "content": message.get("content"),
+            "image_url": message.get("image_url"),
+        }
+        for message in messages
+    ]
+    encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _snapshot_metrics(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    direction_counts = Counter(str(message.get("sender_role") or "") for message in messages)
+    type_counts = Counter(str(message.get("message_type") or "") for message in messages)
+    platform_ids = [
+        str(message.get("platform_message_id"))
+        for message in messages
+        if message.get("platform_message_id")
+    ]
+    return {
+        "message_count": len(messages),
+        "direction_counts": {
+            key: direction_counts[key] for key in ("customer", "agent")
+        },
+        "type_counts": {
+            key: type_counts[key] for key in ("text", "image", "product", "order")
+        },
+        "sequence_hash": _sequence_evidence_hash(messages),
+        "platform_id_missing_count": len(messages) - len(platform_ids),
+        "platform_id_duplicate_count": len(platform_ids) - len(set(platform_ids)),
     }
 
 
@@ -145,7 +184,15 @@ def process_message_snapshot_shadow(
         message_count=message_count,
         batch_count=payload.batch_count,
         received_batch_count=0,
-        raw_payload={"batches": {}},
+        raw_payload={
+            "batches": {},
+            "source_snapshot_id": payload.source_snapshot_id,
+            "legacy_projection": (
+                payload.legacy_projection.model_dump(mode="json")
+                if payload.legacy_projection
+                else None
+            ),
+        },
     )
     if existing and (
         existing.batch_count != payload.batch_count
@@ -159,6 +206,20 @@ def process_message_snapshot_shadow(
         return observation
 
     raw_payload = dict(observation.raw_payload or {})
+    incoming_projection = (
+        payload.legacy_projection.model_dump(mode="json")
+        if payload.legacy_projection
+        else None
+    )
+    if (
+        raw_payload.get("source_snapshot_id") != payload.source_snapshot_id
+        or raw_payload.get("legacy_projection") != incoming_projection
+    ):
+        observation.alignment_status = "failed"
+        observation.error_message = "snapshot diagnostic metadata changed between batches"
+        observation.processed_at = utcnow()
+        db.add(observation)
+        return observation
     batches = dict(raw_payload.get("batches") or {})
     batch_key = str(payload.batch_index)
     serialized_batch = _serialized_batch(payload)
@@ -183,6 +244,8 @@ def process_message_snapshot_shadow(
         if actual_hash != observation.payload_hash:
             raise SnapshotProtocolError("assembled snapshot payload_hash does not match")
         result = align_message_sequences(_history_tail(db, conversation.id), messages)
+        snapshot_metrics = _snapshot_metrics(messages)
+        legacy_projection = raw_payload.get("legacy_projection")
         observation.alignment_status = result.status
         observation.alignment_method = result.method
         observation.overlap_size = result.overlap_size
@@ -192,6 +255,30 @@ def process_message_snapshot_shadow(
             **result.diagnostics,
             "append_from": result.append_from,
             "shadow_only": True,
+            "snapshot_metrics": snapshot_metrics,
+            "legacy_projection": legacy_projection,
+            "legacy_snapshot_comparison": (
+                {
+                    "message_count_matches": (
+                        legacy_projection.get("message_count")
+                        == snapshot_metrics["message_count"]
+                    ),
+                    "direction_counts_match": (
+                        legacy_projection.get("direction_counts")
+                        == snapshot_metrics["direction_counts"]
+                    ),
+                    "type_counts_match": (
+                        legacy_projection.get("type_counts")
+                        == snapshot_metrics["type_counts"]
+                    ),
+                    "page_sequence_matches": (
+                        legacy_projection.get("sequence_hash")
+                        == snapshot_metrics["sequence_hash"]
+                    ),
+                }
+                if isinstance(legacy_projection, dict)
+                else None
+            ),
         }
         observation.processed_at = utcnow()
         observation.error_message = None

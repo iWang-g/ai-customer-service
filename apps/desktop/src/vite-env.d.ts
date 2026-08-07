@@ -69,6 +69,21 @@ interface Window {
       conversation_key: string;
       customer_name: string | null;
     }>;
+    preparePddConversationTestReset(payload: {
+      platformAccountId: string;
+      externalConversationId: string;
+    }): Promise<{
+      status: 'prepared';
+      account_id: string;
+      deleted_event_count: number;
+    }>;
+    resumePddConversationAfterTestReset(payload: {
+      platformAccountId: string;
+      externalConversationId: string;
+    }): Promise<{
+      status: 'resumed';
+      account_id: string;
+    }>;
     sendPddMessage(payload: {
       platformAccountId: string;
       externalConversationId: string | null;

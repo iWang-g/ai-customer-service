@@ -4,12 +4,24 @@ from datetime import timedelta
 import re
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import and_, delete, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.security import utcnow
-from app.models import Conversation, Message, RpaTask, User
+from app.models import (
+    AiModelCall,
+    AutomationReplyRun,
+    Conversation,
+    ConversationWorkflow,
+    CustomerOutreachRun,
+    EmailSendTask,
+    Message,
+    MessageObservation,
+    RpaEvent,
+    RpaTask,
+    User,
+)
 from app.schemas.common import PageMeta
 from app.schemas.conversation import ConversationListResponse, ConversationRead
 from app.schemas.message import (
@@ -131,6 +143,80 @@ def clear_human_required(db: Session, user: User, conversation_id: str) -> Conve
     return _conversation_read(conversation)
 
 
+def reset_pinduoduo_conversation_test_data(
+    db: Session,
+    user: User,
+    conversation_id: str,
+) -> tuple[ConversationRead, dict[str, int]]:
+    conversation = db.get(Conversation, conversation_id)
+    if not conversation or conversation.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if conversation.platform_code != "pinduoduo":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only Pinduoduo conversations support test reset",
+        )
+    if not conversation.platform_account_id or not conversation.external_conversation_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Conversation must have a bound shop and external conversation ID before reset",
+        )
+    active_task_count = db.scalar(
+        select(func.count())
+        .select_from(RpaTask)
+        .where(
+            RpaTask.conversation_id == conversation.id,
+            RpaTask.status.in_(["queued", "dispatched", "acknowledged"]),
+        )
+    ) or 0
+    if active_task_count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Conversation has active RPA tasks; wait for them to finish before resetting",
+        )
+
+    deleted_counts: dict[str, int] = {}
+
+    def delete_conversation_rows(model: type, key: str) -> None:
+        result = db.execute(delete(model).where(model.conversation_id == conversation.id))
+        deleted_counts[key] = max(0, int(result.rowcount or 0))
+
+    # Delete dependants before messages because SQLite foreign-key enforcement
+    # differs between existing deployments and in-memory tests.
+    delete_conversation_rows(AiModelCall, "ai_model_calls")
+    delete_conversation_rows(AutomationReplyRun, "automation_reply_runs")
+    delete_conversation_rows(EmailSendTask, "email_send_tasks")
+    delete_conversation_rows(ConversationWorkflow, "conversation_workflows")
+    delete_conversation_rows(CustomerOutreachRun, "customer_outreach_runs")
+    delete_conversation_rows(RpaTask, "rpa_tasks")
+    delete_conversation_rows(MessageObservation, "message_observations")
+    delete_conversation_rows(Message, "messages")
+
+    event_conditions = [
+        RpaEvent.user_id == user.id,
+        RpaEvent.platform_account_id == conversation.platform_account_id,
+        RpaEvent.platform_code == conversation.platform_code,
+        RpaEvent.conversation_external_id == conversation.external_conversation_id,
+    ]
+    event_result = db.execute(delete(RpaEvent).where(and_(*event_conditions)))
+    deleted_counts["rpa_events"] = max(0, int(event_result.rowcount or 0))
+
+    conversation.latest_message_text = None
+    conversation.latest_message_at = None
+    conversation.unread_count = 0
+    conversation.last_message_sequence = 0
+    conversation.awaiting_reply = False
+    conversation.human_required = False
+    conversation.human_required_reason = None
+    conversation.human_required_word = None
+    conversation.human_required_at = None
+    conversation.status = "active"
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return _conversation_read(conversation), deleted_counts
+
+
 def list_messages(
     db: Session,
     user: User,
@@ -142,16 +228,23 @@ def list_messages(
     conversation = db.get(Conversation, conversation_id)
     if not conversation or conversation.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    visible_conditions = [
+        Message.conversation_id == conversation_id,
+        Message.user_id == user.id,
+    ]
+    if conversation.platform_code == "pinduoduo":
+        visible_conditions.append(Message.message_status != "failed")
+    visible_messages = and_(*visible_conditions)
     count_stmt = (
         select(func.count())
         .select_from(Message)
-        .where(and_(Message.conversation_id == conversation_id, Message.user_id == user.id))
+        .where(visible_messages)
     )
     total = db.scalar(count_stmt) or 0
     # Page backwards from the permanent queue tail, then restore chat order.
     stmt = (
         select(Message)
-        .where(and_(Message.conversation_id == conversation_id, Message.user_id == user.id))
+        .where(visible_messages)
         .order_by(desc(Message.conversation_sequence))
         .offset(offset)
         .limit(limit)

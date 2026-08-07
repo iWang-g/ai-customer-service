@@ -13,6 +13,14 @@ contextBridge.exposeInMainWorld('desktopBridge', {
     'pdd-workspace:refresh-customer-orders',
     payload,
   ),
+  preparePddConversationTestReset: (payload) => ipcRenderer.invoke(
+    'pdd-workspace:prepare-conversation-test-reset',
+    payload,
+  ),
+  resumePddConversationAfterTestReset: (payload) => ipcRenderer.invoke(
+    'pdd-workspace:resume-conversation-after-test-reset',
+    payload,
+  ),
   sendPddMessage: (payload) => ipcRenderer.invoke('pdd-workspace:send-message', payload),
   sendPddImage: (payload) => ipcRenderer.invoke('pdd-workspace:send-image', payload),
 });

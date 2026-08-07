@@ -3,10 +3,20 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
 from app.models import User
-from app.schemas.conversation import ConversationDetailResponse, ConversationListResponse
+from app.schemas.conversation import (
+    ConversationDetailResponse,
+    ConversationListResponse,
+    ConversationTestResetResponse,
+)
 from app.schemas.message import MessageListResponse
 from app.schemas.order import CustomerOrdersResponse
-from app.services.message_service import clear_human_required, get_conversation, list_conversations, list_messages
+from app.services.message_service import (
+    clear_human_required,
+    get_conversation,
+    list_conversations,
+    list_messages,
+    reset_pinduoduo_conversation_test_data,
+)
 from app.services.order_service import customer_orders_response
 from app.services.realtime import realtime_manager
 
@@ -46,6 +56,27 @@ async def clear_conversation_human_required(
         {"type": "conversation.updated", "conversation": conversation.model_dump(mode="json")},
     )
     return ConversationDetailResponse(conversation=conversation)
+
+
+@router.post("/{conversation_id}/reset-test-data", response_model=ConversationTestResetResponse)
+async def reset_conversation_test_data(
+    conversation_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> ConversationTestResetResponse:
+    conversation, deleted_counts = reset_pinduoduo_conversation_test_data(
+        db,
+        user,
+        conversation_id,
+    )
+    await realtime_manager.broadcast(
+        user.id,
+        {"type": "conversation.reset", "conversation": conversation.model_dump(mode="json")},
+    )
+    return ConversationTestResetResponse(
+        conversation=conversation,
+        deleted_counts=deleted_counts,
+    )
 
 
 @router.get("/{conversation_id}/messages", response_model=MessageListResponse)

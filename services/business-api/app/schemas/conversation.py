@@ -39,3 +39,8 @@ class ConversationListResponse(BaseModel):
 
 class ConversationDetailResponse(BaseModel):
     conversation: ConversationRead
+
+
+class ConversationTestResetResponse(BaseModel):
+    conversation: ConversationRead
+    deleted_counts: dict[str, int] = Field(default_factory=dict)

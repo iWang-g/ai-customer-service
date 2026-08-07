@@ -822,6 +822,16 @@ export function clearConversationHumanRequired(conversationId: string): Promise<
   );
 }
 
+export function resetConversationTestData(conversationId: string): Promise<{
+  conversation: ApiConversation;
+  deleted_counts: Record<string, number>;
+}> {
+  return apiRequest(
+    `/conversations/${encodeURIComponent(conversationId)}/reset-test-data`,
+    { method: 'POST' },
+  );
+}
+
 export function listMessages(conversationId: string): Promise<PageResponse<ApiMessage>> {
   return apiRequest<PageResponse<ApiMessage>>(
     `/conversations/${encodeURIComponent(conversationId)}/messages?limit=200`,

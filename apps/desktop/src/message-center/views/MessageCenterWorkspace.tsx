@@ -31,6 +31,7 @@ interface MessageCenterWorkspaceProps {
   dataError: string;
   onSendMessage: (content: string) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | null }>;
   onClearHumanRequired: (conversationId: string) => Promise<void>;
+  onResetConversationTestData: (conversationId: string) => Promise<void>;
   bot: BotStatus;
   logs: LogEntry[];
   statusEvents: StatusEvent[];
@@ -76,6 +77,7 @@ export default function MessageCenterWorkspace({
   dataError,
   onSendMessage,
   onClearHumanRequired,
+  onResetConversationTestData,
   bot,
   logs,
   statusEvents,
@@ -125,6 +127,7 @@ export default function MessageCenterWorkspace({
           onSearchTermChange={onConversationSearchChange}
           onOpenImportModal={onOpenImportModal}
           onClearHumanRequired={onClearHumanRequired}
+          onResetConversationTestData={onResetConversationTestData}
           lang={lang}
         />
       </div>

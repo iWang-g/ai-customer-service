@@ -10,9 +10,11 @@ import {
   Plus,
   ChevronDown,
   X,
+  Trash2,
 } from 'lucide-react';
 import type { Conversation, Shop } from '../types';
 import CustomerAvatar from './CustomerAvatar';
+import ConversationResetModal from './ConversationResetModal';
 
 interface SidebarProps {
   conversations: Conversation[];
@@ -29,6 +31,7 @@ interface SidebarProps {
   onSearchTermChange: (value: string) => void;
   onOpenImportModal: () => void;
   onClearHumanRequired: (conversationId: string) => Promise<void>;
+  onResetConversationTestData: (conversationId: string) => Promise<void>;
   lang: 'zh' | 'en';
 }
 
@@ -47,11 +50,13 @@ export default function Sidebar({
   onSearchTermChange,
   onOpenImportModal,
   onClearHumanRequired,
+  onResetConversationTestData,
   lang
 }: SidebarProps) {
   const [isShopDropdownOpen, setIsShopDropdownOpen] = useState(false);
   const [shopFilterText, setShopFilterText] = useState('');
   const [contextMenu, setContextMenu] = useState<{ conversationId: string; x: number; y: number } | null>(null);
+  const [resetConversation, setResetConversation] = useState<Conversation | null>(null);
 
   const filteredShops = shops.filter(s =>
     s.name.toLowerCase().includes(shopFilterText.toLowerCase())
@@ -210,7 +215,7 @@ export default function Sidebar({
             key={conv.id}
             onClick={() => onSelect(conv.id)}
             onContextMenu={(event) => {
-              if (!conv.humanRequired) return;
+              if (!conv.humanRequired && conv.platform !== 'pinduoduo') return;
               event.preventDefault();
               setContextMenu({ conversationId: conv.id, x: event.clientX, y: event.clientY });
             }}
@@ -284,20 +289,43 @@ export default function Sidebar({
             className="fixed z-50 min-w-44 rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl"
             style={{ left: contextMenu.x, top: contextMenu.y }}
           >
-            <button
-              type="button"
-              onClick={() => {
-                const conversationId = contextMenu.conversationId;
-                setContextMenu(null);
-                void onClearHumanRequired(conversationId);
-              }}
-              className="w-full rounded-lg px-3 py-2 text-left text-xs font-bold text-slate-700 hover:bg-slate-50"
-            >
-              清除“待人工处理”标记
-            </button>
+            {conversations.find((item) => item.id === contextMenu.conversationId)?.humanRequired && (
+              <button
+                type="button"
+                onClick={() => {
+                  const conversationId = contextMenu.conversationId;
+                  setContextMenu(null);
+                  void onClearHumanRequired(conversationId);
+                }}
+                className="w-full rounded-lg px-3 py-2 text-left text-xs font-bold text-slate-700 hover:bg-slate-50"
+              >
+                清除“待人工处理”标记
+              </button>
+            )}
+            {conversations.find((item) => item.id === contextMenu.conversationId)?.platform === 'pinduoduo' && (
+              <button
+                type="button"
+                onClick={() => {
+                  const conversation = conversations.find(
+                    (item) => item.id === contextMenu.conversationId,
+                  ) || null;
+                  setContextMenu(null);
+                  setResetConversation(conversation);
+                }}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-bold text-rose-600 hover:bg-rose-50"
+              >
+                <Trash2 size={14} />
+                清空聊天记录…
+              </button>
+            )}
           </div>
         </>
       )}
+      <ConversationResetModal
+        conversation={resetConversation}
+        onClose={() => setResetConversation(null)}
+        onConfirm={onResetConversationTestData}
+      />
     </div>
   );
 }
