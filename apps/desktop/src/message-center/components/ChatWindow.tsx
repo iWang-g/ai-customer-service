@@ -187,7 +187,7 @@ export default function ChatWindow({ conversation, isLoading, error, onSendMessa
                       </button>
                     )
                   ) : (
-                    <div className={`w-fit max-w-full px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm break-words ${
+                    <div className={`w-fit max-w-full px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm break-words whitespace-pre-wrap ${
                       isCustomer 
                         ? 'bg-white text-slate-700 rounded-tl-md border border-slate-100' 
                         : 'bg-sky-500 text-white rounded-tr-md'

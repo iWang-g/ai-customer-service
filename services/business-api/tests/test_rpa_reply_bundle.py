@@ -126,6 +126,42 @@ class RpaReplyBundleTests(unittest.TestCase):
         self.db.refresh(self.conversation)
         self.assertFalse(self.conversation.awaiting_reply)
 
+    def test_pending_image_confirmation_creates_visible_image_without_retry(self) -> None:
+        complete_task(
+            self.db,
+            self.task,
+            TaskCompleteRequest(
+                status="confirmation_pending",
+                result_json={
+                    "text_sent": True,
+                    "image_sent": False,
+                    "image_confirmation_pending": True,
+                },
+                error_message="image_confirmation_pending",
+            ),
+        )
+
+        self.db.refresh(self.message)
+        self.assertEqual(self.task.status, "confirmation_pending")
+        self.assertEqual(self.message.message_status, "sent")
+        image_messages = list(self.db.scalars(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.raw_payload["media_type"].as_string() == "image",
+            )
+        ).all())
+        self.assertEqual(len(image_messages), 1)
+        self.assertEqual(image_messages[0].message_status, "confirmation_pending")
+        self.assertTrue(image_messages[0].raw_payload["platform_confirmation_pending"])
+        self.assertEqual(
+            self.db.scalar(
+                select(func.count()).select_from(RpaTask).where(RpaTask.task_type == "send_image")
+            ),
+            0,
+        )
+        self.db.refresh(self.conversation)
+        self.assertFalse(self.conversation.awaiting_reply)
+
     def test_failed_reply_keeps_conversation_awaiting_reply(self) -> None:
         complete_task(
             self.db,

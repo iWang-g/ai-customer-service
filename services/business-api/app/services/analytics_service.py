@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from app.models import AutomationReplyRun, Conversation, Message, RpaTask, User
@@ -44,7 +44,19 @@ def _date_bounds(start_date: date, end_date: date, timezone_name: str) -> tuple[
 
 
 def _message_time():
-    return func.coalesce(Message.platform_sent_at, Message.observed_at, Message.sent_at)
+    return case(
+        (
+            Message.platform_code == "pinduoduo",
+            func.coalesce(Message.observed_at, Message.sent_at),
+        ),
+        else_=func.coalesce(Message.platform_sent_at, Message.observed_at, Message.sent_at),
+    )
+
+
+def _message_timestamp(message: Message) -> datetime:
+    if message.platform_code == "pinduoduo":
+        return message.observed_at or message.sent_at
+    return message.platform_sent_at or message.observed_at or message.sent_at
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -59,7 +71,7 @@ def _traffic_points(
     single_day = start_date == end_date
     if single_day:
         counts = Counter(
-            _as_utc(message.platform_sent_at or message.observed_at or message.sent_at)
+            _as_utc(_message_timestamp(message))
             .astimezone(zone)
             .hour
             for message in messages
@@ -67,7 +79,7 @@ def _traffic_points(
         return [TrafficPoint(label=f"{hour:02d}:00", count=counts[hour]) for hour in range(24)]
 
     counts = Counter(
-        _as_utc(message.platform_sent_at or message.observed_at or message.sent_at)
+        _as_utc(_message_timestamp(message))
         .astimezone(zone)
         .date()
         for message in messages

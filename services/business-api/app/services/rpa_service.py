@@ -11,7 +11,16 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.security import create_token, utcnow
-from app.models import Conversation, Message, PlatformAccount, RpaEvent, RpaNode, RpaTask, User
+from app.models import (
+    AutomationReplyRun,
+    Conversation,
+    Message,
+    PlatformAccount,
+    RpaEvent,
+    RpaNode,
+    RpaTask,
+    User,
+)
 from app.schemas.rpa import (
     NodeHeartbeatRequest,
     NodeRegisterRequest,
@@ -25,8 +34,9 @@ from app.services.order_service import apply_orders_snapshot
 from app.services.message_queue_service import append_message
 from app.services.message_observation_service import (
     SnapshotProtocolError,
-    process_message_snapshot_shadow,
+    process_message_snapshot,
 )
+from app.services.pdd_message_mode import pdd_message_write_mode
 
 
 _OUTBOUND_MESSAGE_SOURCES = frozenset({
@@ -113,6 +123,7 @@ def disconnect_node(db: Session, node: RpaNode) -> RpaNode:
 
 
 def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate) -> tuple[RpaEvent, list[Message], list[Conversation]]:
+    settings = get_settings()
     duplicate_conditions = [RpaEvent.event_id == request.event_id]
     if request.dedup_key:
         duplicate_conditions.append(RpaEvent.dedup_key == request.dedup_key)
@@ -148,17 +159,47 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
     db.add(event)
     messages: list[Message] = []
     conversations: list[Conversation] = []
+    pdd_write_mode = (
+        pdd_message_write_mode(settings)
+        if request.platform_code == "pinduoduo"
+        else "legacy"
+    )
 
     if request.event_type == "message_snapshot":
-        if get_settings().pdd_message_snapshot_shadow_enabled:
+        if pdd_write_mode == "snapshot":
             try:
-                observation = process_message_snapshot_shadow(db, user, node, request)
+                result = process_message_snapshot(
+                    db,
+                    user,
+                    node,
+                    request,
+                    write_messages=pdd_write_mode == "snapshot",
+                )
+                observation = result.observation
+                messages.extend(result.appended_messages)
+                if result.appended_messages:
+                    conversations.append(result.conversation)
                 if observation.alignment_status == "failed":
                     event.status = "failed"
                     event.error_message = observation.error_message
             except SnapshotProtocolError as exc:
                 event.status = "failed"
                 event.error_message = str(exc)
+        db.commit()
+        db.refresh(event)
+        return event, messages, conversations
+
+    if (
+        request.platform_code == "pinduoduo"
+        and request.event_type in {
+            "customer_message", "message_received", "agent_message", "message_sent"
+        }
+    ):
+        event.payload_json = {
+            **event.payload_json,
+            "message_write_mode": pdd_write_mode,
+            "legacy_write_suppressed": True,
+        }
         db.commit()
         db.refresh(event)
         return event, messages, conversations
@@ -190,9 +231,50 @@ def create_events_batch(
     for request in events:
         event, messages, _ = create_event(db, user, node, request)
         created.append(RpaEventRead.model_validate(event))
-        if messages:
-            reply_sources.append((request, messages[0], event.id))
+        source_message = select_inbound_reply_source(db, request, messages)
+        if source_message is not None:
+            reply_sources.append((request, source_message, event.id))
     return created, reply_sources
+
+
+def select_inbound_reply_source(
+    db: Session,
+    request: RpaEventCreate,
+    messages: list[Message],
+) -> Message | None:
+    """Choose at most one automation trigger from an ingested event.
+
+    Snapshot appends are already in permanent DOM order, so the batch tail is
+    the only valid trigger. Earlier customer rows remain available as context.
+    """
+    if not messages:
+        return None
+    if request.event_type in {"customer_message", "message_received"}:
+        return messages[0]
+    if request.event_type != "message_snapshot":
+        return None
+
+    tail = messages[-1]
+    if tail.sender_role != "customer":
+        return None
+    if tail.collection_kind == "incremental":
+        return tail if tail.automation_eligible else None
+    if tail.collection_kind == "bootstrap" and request.payload_json.get("unread") is True:
+        has_active_reply = db.scalar(
+            select(AutomationReplyRun.id).where(
+                AutomationReplyRun.conversation_id == tail.conversation_id,
+                AutomationReplyRun.status.in_(["pending", "running"]),
+            ).limit(1)
+        )
+        has_active_task = db.scalar(
+            select(RpaTask.id).where(
+                RpaTask.conversation_id == tail.conversation_id,
+                RpaTask.task_type == "send_message",
+                RpaTask.status.in_(["queued", "dispatched", "acknowledged"]),
+            ).limit(1)
+        )
+        return tail if not has_active_reply and not has_active_task else None
+    return None
 
 
 def _upsert_conversation_from_event(
@@ -750,11 +832,18 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
                 conversation = db.get(Conversation, task.conversation_id)
                 if conversation:
                     _refresh_awaiting_reply(db, conversation)
-    if (
+    image_confirmed = (
         request.status == "completed"
+        and request.result_json.get("image_sent") is True
+    )
+    image_confirmation_pending = (
+        request.status == "confirmation_pending"
+        and request.result_json.get("image_confirmation_pending") is True
+    )
+    if (
+        (image_confirmed or image_confirmation_pending)
         and not was_completed
         and task.task_type == "send_message"
-        and request.result_json.get("image_sent") is True
     ):
         payload = task.payload_json if isinstance(task.payload_json, dict) else {}
         follow_up = payload.get("follow_up")
@@ -776,13 +865,14 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
                     sender_role="agent",
                     sender_name=payload.get("sender_name"),
                     content="[图片]",
-                    message_status="sent",
+                    message_status="sent" if image_confirmed else "confirmation_pending",
                     source="ai",
                     raw_payload={
                         "media_type": "image",
                         "image_url": str(follow_up["url"]),
                         "parent_task_id": task.id,
                         "idempotency_key": media_key,
+                        "platform_confirmation_pending": image_confirmation_pending,
                     },
                     observed_at=now,
                     sent_at=now,

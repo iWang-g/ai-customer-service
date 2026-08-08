@@ -268,6 +268,15 @@ def _queue_reply_task(
         ),
         idempotency_key=f"auto-reply:{robot.id}:{source_message.id}:text",
     )
+    task = db.get(RpaTask, response.task_id)
+    if task is not None:
+        task.payload_json = {
+            **(task.payload_json or {}),
+            "automation_source_message_id": source_message.id,
+            "automation_trigger_sequence": source_message.conversation_sequence,
+        }
+        db.add(task)
+        db.commit()
     return response.task_id
 
 
@@ -349,6 +358,24 @@ def _message_history(rows: list[Message]) -> list[dict[str, str]]:
         for item in reversed(rows)
         if item.content.strip()
     ]
+
+
+def _snapshot_customer_batch_size(db: Session, source_message: Message) -> int:
+    if source_message.collection_kind != "incremental" or not source_message.first_observation_id:
+        return 1
+    batch_tail = db.scalars(
+        select(Message).where(
+            Message.conversation_id == source_message.conversation_id,
+            Message.first_observation_id == source_message.first_observation_id,
+            Message.conversation_sequence <= source_message.conversation_sequence,
+        ).order_by(desc(Message.conversation_sequence))
+    ).all()
+    count = 0
+    for item in batch_tail:
+        if item.sender_role != "customer":
+            break
+        count += 1
+    return max(1, count)
 
 
 def _history_with_latest(
@@ -478,7 +505,10 @@ async def _execute_bound_reply(
         result["task_ids"] = [task_id] if task_id else []
         return result
 
-    context_length = _context_length(robot)
+    context_length = max(
+        _context_length(robot),
+        _snapshot_customer_batch_size(db, source_message) - 1,
+    )
     history_rows = list(
         db.scalars(
             select(Message)
@@ -700,6 +730,7 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
         conversation_id=conversation.id,
         source_message_id=source_message.id,
         source_event_id=request.source_event_id,
+        trigger_sequence=source_message.conversation_sequence,
         robot_id=robot.id,
         status="running",
     )
@@ -746,6 +777,7 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
         )
         retrieval = result.get("retrieval") if isinstance(result.get("retrieval"), list) else []
         persisted_run.status = "succeeded"
+        persisted_run.trigger_sequence = source_message.conversation_sequence
         persisted_run.decision = str(result.get("decision") or "") or None
         persisted_run.intent = str(intent.get("intent") or "") or None
         persisted_run.qa_entry_id = str(qa_entry.get("id") or "") or None

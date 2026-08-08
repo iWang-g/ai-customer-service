@@ -85,6 +85,34 @@ class MessageQueueServiceTests(unittest.TestCase):
 
 
 class MessageQueueMigrationTests(unittest.TestCase):
+    def test_automation_trigger_sequence_column_is_added_idempotently(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.execute(text(
+                "ALTER TABLE automation_reply_runs DROP COLUMN trigger_sequence"
+            ))
+
+        apply_compatibility_migrations(engine)
+        apply_compatibility_migrations(engine)
+
+        with engine.connect() as connection:
+            columns = {
+                row.name
+                for row in connection.execute(text(
+                    "PRAGMA table_info(automation_reply_runs)"
+                )).all()
+            }
+            indexes = {
+                row.name
+                for row in connection.execute(text(
+                    "PRAGMA index_list(automation_reply_runs)"
+                )).all()
+            }
+        self.assertIn("trigger_sequence", columns)
+        self.assertIn("ix_automation_reply_runs_trigger_sequence", indexes)
+        engine.dispose()
+
     def test_backfill_is_ordered_and_idempotent(self) -> None:
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(engine)

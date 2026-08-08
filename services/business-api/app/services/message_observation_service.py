@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from collections import Counter
+from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from pydantic import ValidationError
@@ -14,13 +16,31 @@ from app.core.security import utcnow
 from app.models import Conversation, Message, MessageObservation, RpaNode, User
 from app.schemas.rpa import MessageSnapshotPayload, RpaEventCreate
 from app.services.message_sequence_service import (
+    AlignmentResult,
     align_message_sequences,
     snapshot_payload_hash,
 )
+from app.services.message_queue_service import append_messages
 
 
 class SnapshotProtocolError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class SnapshotProcessResult:
+    observation: MessageObservation
+    appended_messages: list[Message]
+    conversation: Conversation
+
+
+_conversation_locks_guard = Lock()
+_conversation_locks: dict[str, Lock] = {}
+
+
+def _conversation_lock(conversation_id: str) -> Lock:
+    with _conversation_locks_guard:
+        return _conversation_locks.setdefault(conversation_id, Lock())
 
 
 def _snapshot_payload(request: RpaEventCreate) -> MessageSnapshotPayload:
@@ -140,15 +160,174 @@ def _history_tail(db: Session, conversation_id: str, limit: int = 200) -> list[M
     return list(reversed(newest))
 
 
-def process_message_snapshot_shadow(
+def _snapshot_message(
+    user: User,
+    conversation: Conversation,
+    observation: MessageObservation,
+    item: dict[str, Any],
+    *,
+    collection_kind: str,
+) -> Message:
+    sender_role = str(item.get("sender_role") or "").strip()
+    content = str(item.get("content") or "")
+    return Message(
+        conversation_id=conversation.id,
+        user_id=user.id,
+        platform_code=conversation.platform_code,
+        platform_message_id=item.get("platform_message_id") or None,
+        sender_role=sender_role,
+        content=content,
+        message_status="sent",
+        source="rpa",
+        raw_payload={
+            **item,
+            "observation_id": observation.observation_id,
+            "source_snapshot_id": (observation.raw_payload or {}).get("source_snapshot_id"),
+        },
+        sent_at=observation.collected_at,
+        observed_at=observation.collected_at,
+        snapshot_id=(observation.raw_payload or {}).get("source_snapshot_id"),
+        collected_at=observation.collected_at,
+        first_observation_id=observation.observation_id,
+        first_dom_sequence=item.get("dom_sequence"),
+        collection_kind=collection_kind,
+        automation_eligible=collection_kind == "incremental" and sender_role == "customer",
+    )
+
+
+def _overlap_pairs(
+    history: list[Message],
+    messages: list[dict[str, Any]],
+    *,
+    method: str,
+    overlap_size: int,
+    append_from: int | None,
+    diagnostics: dict[str, Any],
+) -> list[tuple[Message, dict[str, Any]]]:
+    if method == "content_overlap" and overlap_size:
+        start = len(history) - overlap_size
+        return list(zip(history[start:], messages[:overlap_size], strict=True))
+    if method == "platform_id_anchor" and append_from is not None:
+        history_index = diagnostics.get("anchor_history_index")
+        current_index = diagnostics.get("anchor_current_index")
+        if isinstance(history_index, int) and isinstance(current_index, int):
+            size = append_from - current_index
+            return list(zip(
+                history[history_index:history_index + size],
+                messages[current_index:append_from],
+                strict=True,
+            ))
+    return []
+
+
+def _attach_snapshot_echo_evidence(
+    db: Session,
+    observation: MessageObservation,
+    pairs: list[tuple[Message, dict[str, Any]]],
+) -> None:
+    for existing, item in pairs:
+        platform_message_id = item.get("platform_message_id")
+        if existing.sender_role != "agent" or existing.platform_message_id or not platform_message_id:
+            continue
+        previous_payload = existing.raw_payload if isinstance(existing.raw_payload, dict) else {}
+        existing.platform_message_id = platform_message_id
+        existing.message_status = "sent"
+        existing.raw_payload = {
+            **previous_payload,
+            "platform_echo": {
+                "observation_id": observation.observation_id,
+                "platform_message_id": platform_message_id,
+                "observed_at": observation.collected_at.isoformat(),
+                "snapshot_sequence": item.get("dom_sequence"),
+            },
+        }
+        db.add(existing)
+
+
+def _apply_formal_snapshot(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    observation: MessageObservation,
+    messages: list[dict[str, Any]],
+    history: list[Message],
+    result: AlignmentResult,
+) -> list[Message]:
+    pairs = _overlap_pairs(
+        history,
+        messages,
+        method=result.method,
+        overlap_size=result.overlap_size,
+        append_from=result.append_from,
+        diagnostics=result.diagnostics,
+    )
+    _attach_snapshot_echo_evidence(db, observation, pairs)
+    if result.status not in {"bootstrap", "aligned"} or result.append_from is None:
+        return []
+
+    collection_kind = "bootstrap" if result.status == "bootstrap" else "incremental"
+    new_messages = [
+        _snapshot_message(
+            user,
+            conversation,
+            observation,
+            item,
+            collection_kind=collection_kind,
+        )
+        for item in messages[result.append_from:]
+    ]
+    append_messages(
+        db,
+        new_messages,
+        collected_at=observation.collected_at,
+        collection_kind=collection_kind,
+    )
+    if new_messages:
+        tail = new_messages[-1]
+        conversation.latest_message_text = tail.content
+        conversation.latest_message_at = observation.collected_at
+        conversation.unread_count = 1 if observation.unread else 0
+        conversation.awaiting_reply = tail.sender_role == "customer"
+        conversation.status = "active"
+        db.add(conversation)
+    return new_messages
+
+
+def process_message_snapshot(
     db: Session,
     user: User,
     node: RpaNode,
     request: RpaEventCreate,
-) -> MessageObservation:
-    """Store and align a snapshot without mutating the formal message queue."""
+    *,
+    write_messages: bool,
+) -> SnapshotProcessResult:
+    """Store, align and optionally append one complete ordered snapshot."""
     payload = _snapshot_payload(request)
     conversation = _conversation_for_snapshot(db, user, request)
+    with _conversation_lock(conversation.id):
+        return _process_message_snapshot_locked(
+            db,
+            user,
+            node,
+            request,
+            payload,
+            conversation,
+            write_messages=write_messages,
+        )
+
+
+def _process_message_snapshot_locked(
+    db: Session,
+    user: User,
+    node: RpaNode,
+    request: RpaEventCreate,
+    payload: MessageSnapshotPayload,
+    conversation: Conversation,
+    *,
+    write_messages: bool,
+) -> SnapshotProcessResult:
+    if write_messages:
+        db.refresh(conversation, with_for_update=True)
     existing = db.scalar(
         select(MessageObservation).where(
             MessageObservation.observation_id == payload.observation_id
@@ -165,7 +344,7 @@ def process_message_snapshot_shadow(
             "observation_id was reused with a different payload_hash"
         )
     if existing and existing.alignment_status != "pending":
-        return existing
+        return SnapshotProcessResult(existing, [], conversation)
 
     message_count = payload.message_count
     if message_count is None:
@@ -187,11 +366,6 @@ def process_message_snapshot_shadow(
         raw_payload={
             "batches": {},
             "source_snapshot_id": payload.source_snapshot_id,
-            "legacy_projection": (
-                payload.legacy_projection.model_dump(mode="json")
-                if payload.legacy_projection
-                else None
-            ),
         },
     )
     if existing and (
@@ -203,23 +377,15 @@ def process_message_snapshot_shadow(
         observation.error_message = "snapshot metadata changed between batches"
         observation.processed_at = utcnow()
         db.add(observation)
-        return observation
+        return SnapshotProcessResult(observation, [], conversation)
 
     raw_payload = dict(observation.raw_payload or {})
-    incoming_projection = (
-        payload.legacy_projection.model_dump(mode="json")
-        if payload.legacy_projection
-        else None
-    )
-    if (
-        raw_payload.get("source_snapshot_id") != payload.source_snapshot_id
-        or raw_payload.get("legacy_projection") != incoming_projection
-    ):
+    if raw_payload.get("source_snapshot_id") != payload.source_snapshot_id:
         observation.alignment_status = "failed"
         observation.error_message = "snapshot diagnostic metadata changed between batches"
         observation.processed_at = utcnow()
         db.add(observation)
-        return observation
+        return SnapshotProcessResult(observation, [], conversation)
     batches = dict(raw_payload.get("batches") or {})
     batch_key = str(payload.batch_index)
     serialized_batch = _serialized_batch(payload)
@@ -228,7 +394,7 @@ def process_message_snapshot_shadow(
         observation.error_message = "batch_index was reused with different content"
         observation.processed_at = utcnow()
         db.add(observation)
-        return observation
+        return SnapshotProcessResult(observation, [], conversation)
     batches[batch_key] = serialized_batch
     raw_payload["batches"] = batches
     observation.raw_payload = raw_payload
@@ -239,52 +405,55 @@ def process_message_snapshot_shadow(
     try:
         messages = _assemble_batches(observation)
         if messages is None:
-            return observation
+            return SnapshotProcessResult(observation, [], conversation)
         actual_hash = snapshot_payload_hash(messages)
         if actual_hash != observation.payload_hash:
             raise SnapshotProtocolError("assembled snapshot payload_hash does not match")
-        result = align_message_sequences(_history_tail(db, conversation.id), messages)
+        history = _history_tail(db, conversation.id)
+        result = align_message_sequences(history, messages)
         snapshot_metrics = _snapshot_metrics(messages)
-        legacy_projection = raw_payload.get("legacy_projection")
         observation.alignment_status = result.status
         observation.alignment_method = result.method
         observation.overlap_size = result.overlap_size
         observation.projected_append_count = result.projected_append_count
-        observation.appended_count = 0
+        appended_messages = (
+            _apply_formal_snapshot(
+                db,
+                user,
+                conversation,
+                observation,
+                messages,
+                history,
+                result,
+            )
+            if write_messages
+            else []
+        )
+        if write_messages and result.status in {"bootstrap", "aligned", "duplicate"}:
+            conversation.metadata_json = {
+                **(conversation.metadata_json or {}),
+                "pdd_message_write_mode": "snapshot",
+                "pdd_message_snapshot_activated_at": utcnow().isoformat(),
+            }
+            db.add(conversation)
+        observation.appended_count = len(appended_messages)
         observation.diagnostics_json = {
             **result.diagnostics,
             "append_from": result.append_from,
-            "shadow_only": True,
-            "snapshot_metrics": snapshot_metrics,
-            "legacy_projection": legacy_projection,
-            "legacy_snapshot_comparison": (
-                {
-                    "message_count_matches": (
-                        legacy_projection.get("message_count")
-                        == snapshot_metrics["message_count"]
-                    ),
-                    "direction_counts_match": (
-                        legacy_projection.get("direction_counts")
-                        == snapshot_metrics["direction_counts"]
-                    ),
-                    "type_counts_match": (
-                        legacy_projection.get("type_counts")
-                        == snapshot_metrics["type_counts"]
-                    ),
-                    "page_sequence_matches": (
-                        legacy_projection.get("sequence_hash")
-                        == snapshot_metrics["sequence_hash"]
-                    ),
-                }
-                if isinstance(legacy_projection, dict)
-                else None
+            "first_new_dom_sequence": (
+                appended_messages[0].first_dom_sequence if appended_messages else None
             ),
+            "last_assigned_conversation_sequence": (
+                appended_messages[-1].conversation_sequence if appended_messages else None
+            ),
+            "snapshot_metrics": snapshot_metrics,
         }
         observation.processed_at = utcnow()
         observation.error_message = None
     except SnapshotProtocolError as exc:
+        appended_messages = []
         observation.alignment_status = "failed"
         observation.processed_at = utcnow()
         observation.error_message = str(exc)
     db.add(observation)
-    return observation
+    return SnapshotProcessResult(observation, appended_messages, conversation)

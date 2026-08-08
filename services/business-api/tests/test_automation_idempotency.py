@@ -19,7 +19,11 @@ from app.models import (
 )
 from app.schemas.automation import ReplyRunRequest
 from app.schemas.message import SendMessageRequest
-from app.services.automation_service import run_reply
+from app.services.automation_service import (
+    _queue_reply_task,
+    _snapshot_customer_batch_size,
+    run_reply,
+)
 from app.services.message_service import create_send_task
 
 
@@ -39,6 +43,7 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             user_id=self.user.id,
             platform_code="pinduoduo",
             external_conversation_id="customer-1",
+            last_message_sequence=1,
         )
         self.robot = Robot(
             user_id=self.user.id,
@@ -62,6 +67,7 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             platform_code="pinduoduo",
             sender_role="customer",
             content="Is this available?",
+            conversation_sequence=1,
         )
         self.db.add(self.source_message)
         self.db.commit()
@@ -106,6 +112,7 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply_run.intent, "qa_match")
         self.assertEqual(reply_run.qa_category_name, "物流问题")
         self.assertEqual(reply_run.qa_match_type, "exact")
+        self.assertEqual(reply_run.trigger_sequence, 1)
         self.assertFalse(reply_run.document_retrieval_used)
 
     def test_auto_send_idempotency_key_reuses_message_and_task(self) -> None:
@@ -129,6 +136,59 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task_count, 1)
         self.assertEqual(agent_message_count, 1)
 
+    def test_auto_send_task_records_snapshot_trigger_sequence(self) -> None:
+        task_id = _queue_reply_task(
+            self.db,
+            self.user,
+            self.conversation,
+            self.robot,
+            self.source_message,
+            {
+                "decision": "auto_send",
+                "text": "Yes, it is available.",
+                "media": [],
+            },
+            auto_send_allowed=True,
+        )
+
+        self.assertIsNotNone(task_id)
+        task = self.db.get(RpaTask, task_id)
+        self.assertEqual(task.payload_json["automation_source_message_id"], self.source_message.id)
+        self.assertEqual(task.payload_json["automation_trigger_sequence"], 1)
+
+    def test_snapshot_batch_context_counts_only_contiguous_customer_tail(self) -> None:
+        self.source_message.conversation_sequence = 4
+        self.source_message.collection_kind = "incremental"
+        self.source_message.first_observation_id = "snapshot-context"
+        self.source_message.first_dom_sequence = 4
+        self.conversation.last_message_sequence = 4
+        self.db.add_all([
+            Message(
+                conversation_id=self.conversation.id,
+                user_id=self.user.id,
+                platform_code="pinduoduo",
+                sender_role="agent",
+                content="agent boundary",
+                conversation_sequence=2,
+                collection_kind="incremental",
+                first_observation_id="snapshot-context",
+                first_dom_sequence=2,
+            ),
+            Message(
+                conversation_id=self.conversation.id,
+                user_id=self.user.id,
+                platform_code="pinduoduo",
+                sender_role="customer",
+                content="first customer in tail",
+                conversation_sequence=3,
+                collection_kind="incremental",
+                first_observation_id="snapshot-context",
+                first_dom_sequence=3,
+            ),
+        ])
+        self.db.commit()
+
+        self.assertEqual(_snapshot_customer_batch_size(self.db, self.source_message), 2)
 
 if __name__ == "__main__":
     unittest.main()

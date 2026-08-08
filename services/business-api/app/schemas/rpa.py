@@ -85,17 +85,6 @@ class SnapshotMessage(BaseModel):
     platform_message_id: str | None = Field(default=None, max_length=128)
 
 
-class SnapshotLegacyProjection(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    message_count: int = Field(ge=0, le=200)
-    direction_counts: dict[str, int] = Field(default_factory=dict)
-    type_counts: dict[str, int] = Field(default_factory=dict)
-    sequence_hash: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
-    platform_id_missing_count: int = Field(ge=0, le=200)
-    platform_id_duplicate_count: int = Field(ge=0, le=200)
-
-
 class MessageSnapshotPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -109,8 +98,6 @@ class MessageSnapshotPayload(BaseModel):
     message_offset: int = Field(default=0, ge=0, le=200)
     messages: list[SnapshotMessage] = Field(default_factory=list, max_length=200)
     source_snapshot_id: str | None = Field(default=None, max_length=128)
-    legacy_projection: SnapshotLegacyProjection | None = None
-
     @model_validator(mode="after")
     def validate_batch_metadata(self) -> "MessageSnapshotPayload":
         if self.batch_index >= self.batch_count:
@@ -197,6 +184,6 @@ class TaskAckResponse(BaseModel):
 
 
 class TaskCompleteRequest(BaseModel):
-    status: Literal["completed", "failed"] = "completed"
+    status: Literal["completed", "failed", "confirmation_pending"] = "completed"
     result_json: dict[str, Any] = Field(default_factory=dict)
     error_message: str | None = None

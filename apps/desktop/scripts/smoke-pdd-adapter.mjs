@@ -46,7 +46,7 @@ function fixture() {
       </li>
       <main id="message-panel">
         <li id="middlePanel_List_message-a" class="clearfix onemsg">
-          <div class="cs-item"><span class="msg-content">First reply</span></div>
+          <div class="cs-item"><span class="msg-content">First line<br>Second line</span></div>
         </li>
         <li id="middlePanel_List_message-b" class="clearfix onemsg">
           <span class="message-time">2026&#x5E74;07&#x6708;23&#x65E5; 16:17:38</span>
@@ -72,7 +72,7 @@ function fixture() {
       <script>
         setTimeout(() => {
           document.title = 'Test store';
-        }, 300);
+        }, 5500);
         function recordSwitch(id) {
           document.body.dataset.switchCount = String(Number(document.body.dataset.switchCount || '0') + 1);
           document.body.dataset.switchLog = [document.body.dataset.switchLog, id].filter(Boolean).join(',');
@@ -192,7 +192,7 @@ app.whenReady().then(async () => {
     && item.conversations?.some((conversation) => (
       conversation.external_conversation_id === '9922334455667'
       && conversation.active
-      && conversation.messages?.some((message) => message.platform_message_id === 'middlePanel_List_b-message')
+      && conversation.snapshot_messages?.some((message) => message.platform_message_id === 'middlePanel_List_b-message')
     ))
   ));
   const buyerCSnapshot = () => messages.find((item) => (
@@ -200,7 +200,7 @@ app.whenReady().then(async () => {
     && item.conversations?.some((conversation) => (
       conversation.external_conversation_id === '6677889900112'
       && conversation.active
-      && conversation.messages?.some((message) => message.platform_message_id === 'middlePanel_List_c-message')
+      && conversation.snapshot_messages?.some((message) => message.platform_message_id === 'middlePanel_List_c-message')
     ))
   ));
   const buyerBFollowUpSnapshot = () => messages.find((item) => (
@@ -208,7 +208,7 @@ app.whenReady().then(async () => {
     && item.conversations?.some((conversation) => (
       conversation.external_conversation_id === '9922334455667'
       && conversation.active
-      && conversation.messages?.some((message) => message.platform_message_id === 'middlePanel_List_b-follow-up')
+      && conversation.snapshot_messages?.some((message) => message.platform_message_id === 'middlePanel_List_b-follow-up')
     ))
   ));
   const storeIdentity = () => messages.find((item) => (
@@ -224,7 +224,7 @@ app.whenReady().then(async () => {
     item.type === 'snapshot'
     && item.conversations?.some((conversation) => (
       conversation.external_conversation_id === '8715744365612'
-      && conversation.messages?.length === 4
+      && conversation.snapshot_messages?.length === 4
     ))
   ));
   const unreadSnapshot = buyerBSnapshot();
@@ -261,7 +261,7 @@ app.whenReady().then(async () => {
     (conversation) => conversation.external_conversation_id === '8715744365612',
   );
   assert.ok(initialConversation, 'initial active conversation snapshot must be collected');
-  const collected = initialConversation.messages || [];
+  const collected = initialConversation.snapshot_messages || [];
   assert.equal(
     collected.length,
     4,
@@ -291,15 +291,11 @@ app.whenReady().then(async () => {
       'middlePanel_List_message-d',
     ],
   );
-  assert.deepEqual(collected.map((item) => item.snapshot_sequence), [0, 1, 4, 5]);
+  assert.deepEqual(collected.map((item) => item.dom_sequence), [0, 1, 2, 3]);
   assert.equal(collected[0].sender_role, 'agent');
+  assert.equal(collected[0].content, 'First line\nSecond line', 'message line breaks must survive DOM collection');
   assert.equal(collected[1].sender_role, 'customer');
   assert.equal(collected[1].message_type, 'text', 'avatar must not turn text into an image message');
-  assert.equal(collected[0].platform_sent_at, collected[1].platform_sent_at, 'leading message inherits first time anchor');
-  assert.equal(collected[1].platform_sent_at, collected[2].platform_sent_at, 'messages inherit the active time group');
-  assert.notEqual(collected[2].platform_sent_at, collected[3].platform_sent_at);
-  assert.deepEqual(collected.map((item) => item.time_group_index), [0, 0, 0, 1]);
-  assert.deepEqual(collected.map((item) => item.has_explicit_time), [false, true, false, true]);
   assert.deepEqual(
     initialConversation.snapshot_messages.map((item) => item.platform_message_id),
     [
@@ -322,12 +318,12 @@ app.whenReady().then(async () => {
   );
   assert.ok(buyerB?.active, 'unread conversation must be verified as active before collection');
   assert.deepEqual(
-    buyerB.messages.map((message) => message.platform_message_id),
+    buyerB.snapshot_messages.map((message) => message.platform_message_id),
     ['middlePanel_List_b-message'],
   );
-  assert.equal(buyerB.messages[0].content, 'Message from Buyer B');
+  assert.equal(buyerB.snapshot_messages[0].content, 'Message from Buyer B');
   assert.ok(
-    !buyerB.messages.some((message) => collected.some((initial) => initial.platform_message_id === message.platform_message_id)),
+    !buyerB.snapshot_messages.some((message) => collected.some((initial) => initial.platform_message_id === message.platform_message_id)),
     'messages from the previous conversation must never be attached to the unread target',
   );
   const buyerC = secondUnreadSnapshot?.conversations?.find(
@@ -335,10 +331,10 @@ app.whenReady().then(async () => {
   );
   assert.ok(buyerC?.active, 'the next unread conversation must be processed serially');
   assert.deepEqual(
-    buyerC.messages.map((message) => message.platform_message_id),
+    buyerC.snapshot_messages.map((message) => message.platform_message_id),
     ['middlePanel_List_c-message'],
   );
-  assert.equal(buyerC.messages[0].content, 'Message from Buyer C');
+  assert.equal(buyerC.snapshot_messages[0].content, 'Message from Buyer C');
   await new Promise((resolve) => setTimeout(resolve, 1800));
   const initialSwitchCount = await window.webContents.executeJavaScript('document.body.dataset.switchCount');
   const initialSwitchLog = await window.webContents.executeJavaScript('document.body.dataset.switchLog');
@@ -431,6 +427,49 @@ app.whenReady().then(async () => {
   assert.equal(enterResult?.status, 'sent', 'Enter fallback must send when button does not clear input');
   assert.equal(enterResult?.method, 'enter');
 
+  const imageRequestId = 'adapter-smoke-image-dom-confirmation';
+  await window.webContents.executeJavaScript(`
+    (() => {
+      const dialog = document.createElement('div');
+      dialog.id = 'slow-image-confirmation';
+      dialog.setAttribute('role', 'dialog');
+      dialog.textContent = '\u662f\u5426\u53d1\u9001\u56fe\u7247 \u53d1\u9001\u4e2d';
+      Object.assign(dialog.style, { display: 'block', width: '200px', height: '100px' });
+      document.body.appendChild(dialog);
+      document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' || document.querySelector('#middlePanel_List_slow-image')) return;
+        setTimeout(() => {
+          document.querySelector('#message-panel').insertAdjacentHTML(
+            'beforeend',
+            '<li id="middlePanel_List_slow-image" class="clearfix onemsg">'
+              + '<div class="cs-item"><span class="msg-content">'
+              + '<img src="https://img.example.com/slow-image.png">'
+              + '</span></div></li>',
+          );
+        }, 300);
+      });
+    })();
+  `);
+  window.webContents.send('pdd-adapter:command', {
+    type: 'send-image-enter',
+    requestId: imageRequestId,
+    expectedConversationKey: '9922334455667',
+    customerName: 'Buyer B',
+  });
+  const imageDeadline = Date.now() + 10000;
+  while (
+    !messages.some((item) => item.type === 'image_send_result' && item.request_id === imageRequestId)
+    && Date.now() < imageDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const imageResult = messages.find((item) => (
+    item.type === 'image_send_result' && item.request_id === imageRequestId
+  ));
+  assert.equal(imageResult?.status, 'sent', 'DOM image echo must confirm a send while the modal remains visible');
+  assert.equal(imageResult?.confirmation, 'dom_echo');
+  await window.webContents.executeJavaScript("document.querySelector('#slow-image-confirmation')?.remove()");
+
   const failedWindow = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -458,7 +497,7 @@ app.whenReady().then(async () => {
     item.type === 'snapshot'
     && item.conversations?.some((conversation) => (
       conversation.customer_name === 'Failure Buyer B'
-      && conversation.messages?.some((message) => message.platform_message_id === 'middlePanel_List_failure-a-message')
+      && conversation.snapshot_messages?.some((message) => message.platform_message_id === 'middlePanel_List_failure-a-message')
     ))
   ));
   assert.equal(incorrectlyBound, false, 'an unverified switch must never emit messages for the target');
@@ -466,7 +505,7 @@ app.whenReady().then(async () => {
     item.type === 'snapshot'
     && item.conversations?.some((conversation) => (
       conversation.customer_name === 'Failure Buyer A'
-      && conversation.messages?.some((message) => (
+      && conversation.snapshot_messages?.some((message) => (
         message.platform_message_id === 'middlePanel_List_failure-a-message'
       ))
     ))

@@ -9,6 +9,7 @@ const MUTATION_DEBOUNCE_MS = 250;
 const FAILED_SWITCH_COOLDOWN_MS = 1500;
 const SWITCH_TIMEOUT_MS = 4000;
 const SWITCH_POLL_MS = 100;
+const IMAGE_CONFIRMATION_HARD_TIMEOUT_MS = 60000;
 const MANUAL_ACTIVITY_PAUSE_MS = 5000;
 const IDENTITY_STABLE_MS = 1000;
 const HANDLED_UNREAD_RETRY_MS = 30000;
@@ -127,6 +128,11 @@ function diagnostic(stage, details = {}, level = 'info') {
 
 function text(value, limit = MAX_TEXT) {
   const cleaned = String(value || '').replace(/\s+/g, ' ').trim();
+  return cleaned ? cleaned.slice(0, limit) : null;
+}
+
+function messageText(value, limit = MAX_TEXT) {
+  const cleaned = String(value || '').replace(/\r\n?/g, '\n').trim();
   return cleaned ? cleaned.slice(0, limit) : null;
 }
 
@@ -335,7 +341,6 @@ function readConversation(element) {
     unread_count: unreadCount(element),
     avatar_url: avatarUrl(element),
     active: isActive(element),
-    messages: [],
   };
 }
 
@@ -441,75 +446,10 @@ function messageType(element, contentElement) {
   return 'text';
 }
 
-function dateFromParts(year, month, day, hour, minute, second = 0) {
-  const value = new Date(year, month - 1, day, hour, minute, second);
-  if (
-    value.getFullYear() !== year
-    || value.getMonth() !== month - 1
-    || value.getDate() !== day
-    || value.getHours() !== hour
-    || value.getMinutes() !== minute
-  ) return null;
-  return value;
-}
-
-function parseTimeLabel(value, observedAt) {
-  if (!value) return null;
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  if (/^\d{10,13}$/.test(normalized)) {
-    const numeric = Number(normalized);
-    const date = new Date(numeric < 100000000000 ? numeric * 1000 : numeric);
-    return Number.isNaN(date.getTime()) ? null : date.toISOString();
-  }
-  const direct = new Date(normalized);
-  if (!Number.isNaN(direct.getTime()) && /[TzZ]|[+-]\d{2}:?\d{2}$/.test(normalized)) {
-    return direct.toISOString();
-  }
-  const full = normalized.match(/(\d{4})\s*(?:[-/.]|\u5e74)\s*(\d{1,2})\s*(?:[-/.]|\u6708)\s*(\d{1,2})\s*(?:\u65e5)?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-  if (full) {
-    return dateFromParts(...full.slice(1).map((part) => Number(part || 0)))?.toISOString() || null;
-  }
-  const observed = new Date(observedAt);
-  if (Number.isNaN(observed.getTime())) return null;
-  const monthDay = normalized.match(/(\d{1,2})\s*(?:[-/.]|\u6708)\s*(\d{1,2})\s*(?:\u65e5)?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-  if (monthDay) {
-    return dateFromParts(
-      observed.getFullYear(),
-      ...monthDay.slice(1).map((part) => Number(part || 0)),
-    )?.toISOString() || null;
-  }
-  const relative = normalized.match(/^(\u4eca\u5929|\u6628\u5929|\u524d\u5929)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (relative) {
-    const dayOffset = relative[1] === '\u4eca\u5929' ? 0 : relative[1] === '\u6628\u5929' ? -1 : -2;
-    const base = new Date(observed.getFullYear(), observed.getMonth(), observed.getDate() + dayOffset);
-    return dateFromParts(
-      base.getFullYear(),
-      base.getMonth() + 1,
-      base.getDate(),
-      ...relative.slice(2).map((part) => Number(part || 0)),
-    )?.toISOString() || null;
-  }
-  const clock = normalized.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (clock) {
-    return dateFromParts(
-      observed.getFullYear(),
-      observed.getMonth() + 1,
-      observed.getDate(),
-      ...clock.slice(1).map((part) => Number(part || 0)),
-    )?.toISOString() || null;
-  }
-  return null;
-}
-
-function parseMessageTime(element, observedAt) {
+function messageTimeLabel(element) {
   const timeElement = queryFirst(element, selectors.messageTime);
-  const raw = attribute(timeElement || element, ['datetime', 'data-time', 'data-timestamp'])
+  return attribute(timeElement || element, ['datetime', 'data-time', 'data-timestamp'])
     || text(timeElement?.textContent, 64);
-  return {
-    platform_sent_at: parseTimeLabel(raw, observedAt),
-    time_label: raw,
-    has_explicit_time: Boolean(raw),
-  };
 }
 
 function isIgnoredMessage(element, type, content) {
@@ -523,10 +463,10 @@ function isIgnoredMessage(element, type, content) {
 
 function stripLeadingTimeLabel(content, timeLabel) {
   if (!timeLabel || !content.startsWith(timeLabel)) return content;
-  return text(content.slice(timeLabel.length)) || '';
+  return messageText(content.slice(timeLabel.length)) || '';
 }
 
-function readMessage(element, sequence, timeInfo) {
+function readMessage(element) {
   const contentElement = queryFirst(element, selectors.messageContent) || element;
   const type = messageType(element, contentElement);
   const image = type === 'image' ? contentImage(element, contentElement) : null;
@@ -542,8 +482,8 @@ function readMessage(element, sequence, timeInfo) {
       imageUrl = null;
     }
   }
-  let content = text(contentElement.textContent);
-  content = stripLeadingTimeLabel(content || '', timeInfo.time_label);
+  let content = messageText(contentElement.innerText || contentElement.textContent);
+  content = stripLeadingTimeLabel(content || '', messageTimeLabel(element));
   if (!content && type === 'image') content = '[image]';
   if (!content && type === 'product') content = '[product]';
   if (!content && type === 'order') content = '[order]';
@@ -557,49 +497,13 @@ function readMessage(element, sequence, timeInfo) {
     content,
     message_type: type,
     image_url: imageUrl,
-    snapshot_sequence: sequence,
-    ...timeInfo,
   };
-}
-
-function readMessages(elements, observedAt) {
-  const entries = elements.map((element, sequence) => ({
-    element,
-    sequence,
-    time: parseMessageTime(element, observedAt),
-  }));
-  let anchor = null;
-  let groupIndex = -1;
-  for (const entry of entries) {
-    if (entry.time.has_explicit_time) {
-      groupIndex += 1;
-      anchor = entry.time.platform_sent_at;
-    }
-    entry.time.platform_sent_at = entry.time.platform_sent_at || anchor;
-    entry.time.time_group_index = groupIndex >= 0 ? groupIndex : null;
-  }
-  const firstAnchored = entries.find((entry) => entry.time.platform_sent_at);
-  if (firstAnchored) {
-    for (const entry of entries) {
-      if (entry.time.platform_sent_at) break;
-      entry.time.platform_sent_at = firstAnchored.time.platform_sent_at;
-      entry.time.time_group_index = firstAnchored.time.time_group_index;
-    }
-  }
-  return entries.map(({ element, sequence, time }) => readMessage(element, sequence, time)).filter(Boolean);
 }
 
 function readSnapshotMessages(elements) {
   const messages = [];
   for (const element of elements) {
-    const timeElement = queryFirst(element, selectors.messageTime);
-    const timeLabel = attribute(timeElement || element, ['datetime', 'data-time', 'data-timestamp'])
-      || text(timeElement?.textContent, 64);
-    const message = readMessage(element, messages.length, {
-      platform_sent_at: null,
-      time_label: timeLabel,
-      has_explicit_time: Boolean(timeLabel),
-    });
+    const message = readMessage(element);
     if (!message) continue;
     if (!['text', 'image'].includes(message.message_type)) continue;
     messages.push({
@@ -695,7 +599,6 @@ function readSnapshot(observedAt, entries = collectConversationEntries(), verifi
   const conversations = entries.map((entry) => ({
     ...entry.conversation,
     active: verifiedActiveKey ? entry.key === verifiedActiveKey : entry.conversation.active,
-    messages: [],
   }));
   let active = verifiedActiveKey
     ? conversations.find((conversation) => conversationKey(conversation) === verifiedActiveKey)
@@ -703,8 +606,6 @@ function readSnapshot(observedAt, entries = collectConversationEntries(), verifi
   if (!active && conversations.length === 1) active = conversations[0];
   if (active) {
     const { elements } = inspectMessageCandidates();
-    const messages = readMessages(elements, observedAt);
-    if (messages.length) active.messages = messages.slice(-200);
     const snapshotMessages = readSnapshotMessages(elements).slice(-200);
     active.snapshot_messages = snapshotMessages.map((message, domSequence) => ({
       ...message,
@@ -1147,7 +1048,7 @@ function emitSnapshot(entries, verifiedActiveKey = null, force = false) {
     force,
     conversation_count: conversations.length,
     active_conversation_key: active ? conversationKey(active) : null,
-    active_message_count: active?.messages?.length || 0,
+    active_message_count: active?.snapshot_messages?.length || 0,
     verified_active_key: verifiedActiveKey,
     message_candidates: messageCandidates,
   });
@@ -1411,7 +1312,7 @@ async function processConversationEntry(entry, entries, { markUnread = false, em
     conversation_key: entry.key,
     customer_name: entry.conversation.customer_name,
     unread_count: entry.conversation.unread_count,
-    message_count: readMessages(inspectMessageCandidates().elements, new Date().toISOString()).length,
+    message_count: readSnapshotMessages(inspectMessageCandidates().elements).length,
     order_collection_status: orderSnapshot.collection_status,
     order_count: orderSnapshot.orders.length,
   });
@@ -1569,6 +1470,41 @@ async function waitForDialogClosed(dialog, timeout = 5000) {
     await sleep(100);
   }
   return !dialog.isConnected || !isVisible(dialog);
+}
+
+function agentImageEvidence() {
+  const messages = readSnapshotMessages(inspectMessageCandidates().elements)
+    .filter((message) => message.sender_role === 'agent' && message.message_type === 'image');
+  return {
+    count: messages.length,
+    identities: new Set(messages.map((message) => (
+      message.platform_message_id || message.image_url || ''
+    )).filter(Boolean)),
+  };
+}
+
+function hasNewAgentImageEvidence(before) {
+  const current = agentImageEvidence();
+  return current.count > before.count
+    || [...current.identities].some((identity) => !before.identities.has(identity));
+}
+
+function imageConfirmationFailed(dialog) {
+  const content = text(dialog?.textContent, 4000) || '';
+  return /\u4e0a\u4f20\u5931\u8d25|\u53d1\u9001\u5931\u8d25|\u7f51\u7edc\u5f02\u5e38|\u91cd\u8bd5\u4e0a\u4f20/.test(content);
+}
+
+async function waitForImageConfirmation(dialog, before, timeout = IMAGE_CONFIRMATION_HARD_TIMEOUT_MS) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!dialog.isConnected || !isVisible(dialog)) return 'dialog_closed';
+    if (hasNewAgentImageEvidence(before)) return 'dom_echo';
+    if (imageConfirmationFailed(dialog)) return 'failed';
+    await sleep(200);
+  }
+  if (!dialog.isConnected || !isVisible(dialog)) return 'dialog_closed';
+  if (hasNewAgentImageEvidence(before)) return 'dom_echo';
+  return imageConfirmationFailed(dialog) ? 'failed' : 'pending';
 }
 
 async function waitForReplyInputEmpty(input, timeout = 1800) {
@@ -1858,6 +1794,7 @@ async function sendImageEnter(requestId, targetKey = '', customerName = '') {
     if (!input || !isVisible(input)) throw new Error('reply_input_missing');
     const dialog = await waitForImageConfirmationDialog();
     if (!dialog) throw new Error('image_confirmation_modal_not_found');
+    const imageEvidenceBeforeSend = agentImageEvidence();
     diagnostic('image_confirmation_modal_detected', {
       request_id: requestId.slice(0, 128),
       conversation_key: targetKey || null,
@@ -1878,18 +1815,35 @@ async function sendImageEnter(requestId, targetKey = '', customerName = '') {
         conversation_key: targetKey || null,
       }, 'warn');
     }
-    if (!await waitForDialogClosed(dialog)) {
-      throw new Error('image_confirmation_modal_not_closed');
+    const confirmation = await waitForImageConfirmation(dialog, imageEvidenceBeforeSend);
+    if (confirmation === 'failed') {
+      throw new Error('image_confirmation_reported_failure');
+    }
+    if (confirmation === 'pending') {
+      diagnostic('image_confirmation_pending', {
+        request_id: requestId.slice(0, 128),
+        conversation_key: targetKey || null,
+        method,
+      }, 'warn');
+      emit('image_send_result', {
+        request_id: requestId.slice(0, 128),
+        status: 'pending',
+        method,
+        confirmation: 'pending',
+      });
+      return;
     }
     diagnostic('image_confirmation_completed', {
       request_id: requestId.slice(0, 128),
       conversation_key: targetKey || null,
       method,
+      confirmation,
     });
     emit('image_send_result', {
       request_id: requestId.slice(0, 128),
       status: 'sent',
       method,
+      confirmation,
     });
   } catch (error) {
     diagnostic('image_confirmation_failed', {

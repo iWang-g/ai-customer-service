@@ -5,10 +5,26 @@ import path from 'node:path';
 import { classifyPddPage } from '../electron/platform-workspace/pinduoduo/detector.js';
 import { PddDiagnosticLogger } from '../electron/platform-workspace/pinduoduo/diagnostic-logger.js';
 import { PddCollectionRuntime } from '../electron/platform-workspace/pinduoduo/runtime.js';
+import { validateAdapterPayload } from '../electron/platform-workspace/pinduoduo/reader.js';
 
 assert.equal(classifyPddPage('https://mms.pinduoduo.com/login/'), 'login_required');
 assert.equal(classifyPddPage('https://mms.pinduoduo.com/chat-windows/index.html'), 'online');
 assert.equal(classifyPddPage('https://example.com/chat-windows/index.html'), 'unsupported');
+
+const multilinePayload = validateAdapterPayload({
+  version: 1,
+  type: 'snapshot',
+  snapshot_id: 'multiline',
+  observed_at: '2026-08-07T00:00:00.000Z',
+  conversations: [{
+    external_conversation_id: 'multiline-conversation',
+    customer_name: 'Multiline buyer',
+    unread_count: 1,
+    active: true,
+    snapshot_messages: [{ sender_role: 'agent', message_type: 'text', content: 'line 1\nline 2' }],
+  }],
+});
+assert.equal(multilinePayload.conversations[0].snapshot_messages[0].content, 'line 1\nline 2');
 
 const snapshot = {
   version: 1,
@@ -22,17 +38,13 @@ const snapshot = {
       latest_message_text: '请问有货吗',
       unread_count: 2,
       active: true,
-      messages: [
+      snapshot_messages: [
         {
+          dom_sequence: 0,
           platform_message_id: 'message-100',
           sender_role: 'customer',
           content: '请问有货吗',
           message_type: 'text',
-          platform_sent_at: '2026-07-28T07:59:00.000Z',
-          snapshot_sequence: 3,
-          time_group_index: 1,
-          time_label: '2026-07-28 15:59:00',
-          has_explicit_time: true,
         },
       ],
     },
@@ -59,13 +71,11 @@ bindingA.value = 'platform-a';
 accountA.runtime.accountBindingChanged();
 assert.equal(accountA.events.length, 2);
 assert.equal(accountA.events[0].event_type, 'conversation_snapshot');
-assert.equal(accountA.events[1].event_type, 'message_received');
+assert.equal(accountA.events[1].event_type, 'message_snapshot');
 assert.equal(accountA.events[1].platform_account_id, 'platform-a');
 assert.equal(accountA.events[1].received_at, snapshot.observed_at);
-assert.equal(accountA.events[1].payload_json.platform_sent_at, '2026-07-28T07:59:00.000Z');
-assert.equal(accountA.events[1].payload_json.snapshot_id, 'snapshot-100');
-assert.equal(accountA.events[1].payload_json.snapshot_sequence, 3);
-assert.match(accountA.events[1].dedup_key, /:message:v3:/);
+assert.equal(accountA.events[1].payload_json.source_snapshot_id, 'snapshot-100');
+assert.equal(accountA.events[1].payload_json.messages[0].dom_sequence, 0);
 
 const dualTrackSnapshot = structuredClone(snapshot);
 dualTrackSnapshot.snapshot_id = 'snapshot-dual-track';
@@ -108,7 +118,6 @@ assert.deepEqual(
 );
 assert.equal(messageSnapshot.payload_json.messages[0].platform_sent_at, undefined);
 assert.equal(messageSnapshot.payload_json.messages[0].time_label, undefined);
-assert.equal(messageSnapshot.payload_json.legacy_projection.message_count, 1);
 const firstObservationId = messageSnapshot.payload_json.observation_id;
 dualTrackAccount.runtime.ingest(dualTrackSnapshot);
 assert.equal(
@@ -137,32 +146,23 @@ assert.deepEqual(splitEvents.map((event) => event.payload_json.messages.length),
 assert.equal(new Set(splitEvents.map((event) => event.payload_json.observation_id)).size, 1);
 assert.equal(new Set(splitEvents.map((event) => event.payload_json.payload_hash)).size, 1);
 
-const disabledAccount = createRuntime(
-  'local-disabled',
-  { value: 'platform-disabled' },
-  { snapshotShadowEnabled: false },
-);
-disabledAccount.runtime.ingest(dualTrackSnapshot);
-assert.equal(disabledAccount.events.some((event) => event.event_type === 'message_snapshot'), false);
-
 const imageSnapshot = structuredClone(snapshot);
 imageSnapshot.snapshot_id = 'snapshot-image';
-imageSnapshot.conversations[0].messages = [{
+imageSnapshot.conversations[0].snapshot_messages = [{
+  dom_sequence: 0,
   platform_message_id: 'image-message-100',
   sender_role: 'customer',
   content: '[image]',
   message_type: 'image',
   image_url: 'https://img.example.com/customer-image.png',
-  platform_sent_at: null,
-  snapshot_sequence: 4,
-  time_group_index: 1,
-  time_label: null,
-  has_explicit_time: false,
 }];
 const imageAccount = createRuntime('local-image', { value: 'platform-image' });
 imageAccount.runtime.ingest(imageSnapshot);
-assert.equal(imageAccount.events[1].payload_json.media_type, 'image');
-assert.equal(imageAccount.events[1].payload_json.image_url, 'https://img.example.com/customer-image.png');
+assert.equal(imageAccount.events[1].payload_json.messages[0].message_type, 'image');
+assert.equal(
+  imageAccount.events[1].payload_json.messages[0].image_url,
+  'https://img.example.com/customer-image.png',
+);
 
 accountA.runtime.ingest(snapshot);
 assert.equal(accountA.events.length, 2, '重复 DOM 快照必须在本机去重');
@@ -188,48 +188,36 @@ assert.notEqual(
 
 const duplicateDomSnapshot = structuredClone(snapshot);
 duplicateDomSnapshot.snapshot_id = 'snapshot-duplicate-dom';
-duplicateDomSnapshot.conversations[0].messages = [
+duplicateDomSnapshot.conversations[0].snapshot_messages = [
   {
+    dom_sequence: 0,
     platform_message_id: null,
     sender_role: 'customer',
     content: 'same customer message',
     message_type: 'text',
-    platform_sent_at: '2026-07-27T10:00:34.000Z',
-    snapshot_sequence: 0,
-    time_group_index: 0,
-    time_label: null,
-    has_explicit_time: false,
   },
   {
+    dom_sequence: 1,
     platform_message_id: null,
     sender_role: 'customer',
     content: 'same customer message',
     message_type: 'text',
-    platform_sent_at: '2026-07-27T10:00:34.000Z',
-    snapshot_sequence: 1,
-    time_group_index: 0,
-    time_label: null,
-    has_explicit_time: false,
   },
   {
+    dom_sequence: 2,
     platform_message_id: 'middlePanel_list_100',
     sender_role: 'customer',
     content: 'same customer message',
     message_type: 'text',
-    platform_sent_at: '2026-07-28T08:00:00.000Z',
-    snapshot_sequence: 14,
-    time_group_index: 2,
-    time_label: '2026-07-28 16:00:00',
-    has_explicit_time: true,
   },
 ];
 const duplicateDomAccount = createRuntime('local-duplicate', { value: 'platform-duplicate' });
 duplicateDomAccount.runtime.ingest(duplicateDomSnapshot);
-const duplicateDomMessages = duplicateDomAccount.events.filter(
-  (event) => event.event_type === 'message_received',
-);
-assert.equal(duplicateDomMessages.length, 2, 'identical fallback candidates must emit once');
-assert.equal(duplicateDomMessages[1].platform_message_id, 'middlePanel_list_100');
+const duplicateDomMessages = duplicateDomAccount.events.find(
+  (event) => event.event_type === 'message_snapshot',
+).payload_json.messages;
+assert.equal(duplicateDomMessages.length, 3, 'ordered snapshots must preserve identical occurrences');
+assert.deepEqual(duplicateDomMessages.map((message) => message.dom_sequence), [0, 1, 2]);
 
 const diagnosticDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pdd-diagnostic-logger-'));
 try {

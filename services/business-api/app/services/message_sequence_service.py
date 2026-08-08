@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
@@ -20,6 +21,14 @@ _TEMPORARY_IMAGE_QUERY_KEYS = {
     "x-amz-signature",
     "x-amz-expires",
 }
+_LOCAL_OUTBOUND_SOURCES = frozenset({
+    "desktop",
+    "ai",
+    "automation_timeout",
+    "customer_outreach",
+})
+_INVISIBLE_TEXT_RE = re.compile(r"[\u200b-\u200d\ufeff]")
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
 
 
 def _value(item: object, key: str, default: Any = None) -> Any:
@@ -30,6 +39,24 @@ def _value(item: object, key: str, default: Any = None) -> Any:
 
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def normalize_outbound_echo_text(value: Any) -> str:
+    """Normalize whitespace that a platform DOM may discard around CJK text."""
+    content = unicodedata.normalize("NFKC", str(value or ""))
+    content = _INVISIBLE_TEXT_RE.sub("", content).strip()
+
+    def replace_whitespace(match: re.Match[str]) -> str:
+        left = content[match.start() - 1] if match.start() else ""
+        right = content[match.end()] if match.end() < len(content) else ""
+        left_category = unicodedata.category(left) if left else ""
+        right_category = unicodedata.category(right) if right else ""
+        touches_cjk = any("\u3400" <= char <= "\u9fff" for char in (left, right))
+        touches_punctuation = left_category.startswith("P") or right_category.startswith("P")
+        is_dom_collapsible_break = "\n" in match.group() or "\r" in match.group()
+        return "" if is_dom_collapsible_break and (touches_cjk or touches_punctuation) else " "
+
+    return _WHITESPACE_RUN_RE.sub(replace_whitespace, content)
 
 
 def normalize_image_url(value: Any) -> str:
@@ -159,13 +186,17 @@ def _platform_anchor(
             same_fingerprint = (
                 current_fingerprints[candidate_index] == history_fingerprints[historical_index]
             )
+            outbound_echo_match = _compatible_outbound_echo_pair(
+                history[historical_index],
+                current[candidate_index],
+            )
             same_unique_id = bool(
                 current_ids[candidate_index]
                 and current_ids[candidate_index] == history_ids[historical_index]
                 and history_counts[current_ids[candidate_index]] == 1
                 and current_counts[current_ids[candidate_index]] == 1
             )
-            if same_fingerprint:
+            if same_fingerprint or outbound_echo_match:
                 matching_context += 1
             elif not same_unique_id:
                 contradictory_context += 1
@@ -184,6 +215,28 @@ def _platform_anchor(
         return None
     overlap, append_from, _current_index, diagnostics = max(candidates)
     return overlap, append_from, diagnostics
+
+
+def _compatible_outbound_echo_pair(history_item: object, current_item: object) -> bool:
+    if str(_value(history_item, "sender_role") or "").strip().lower() != "agent":
+        return False
+    if str(_value(current_item, "sender_role") or "").strip().lower() != "agent":
+        return False
+    if str(_value(history_item, "source") or "").strip() not in _LOCAL_OUTBOUND_SOURCES:
+        return False
+    history_type = message_type(history_item)
+    if history_type != message_type(current_item):
+        return False
+    if history_type == "image":
+        # Pinduoduo uploads local reply images to its CDN, so the DOM URL cannot
+        # identify the original local asset. The anchored position supplies the
+        # identity; this exception remains limited to unbound local outbound images.
+        return not _platform_id(history_item)
+    if history_type != "text":
+        return False
+    return normalize_outbound_echo_text(
+        _value(history_item, "content")
+    ) == normalize_outbound_echo_text(_value(current_item, "content"))
 
 
 def align_message_sequences(

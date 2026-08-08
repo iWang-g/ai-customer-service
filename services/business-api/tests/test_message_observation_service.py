@@ -1,7 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from pydantic import ValidationError
 from sqlalchemy import create_engine, func, select
@@ -15,12 +16,29 @@ from app.models import (
     MessageObservation,
     PlatformAccount,
     RpaNode,
+    RpaTask,
     User,
 )
+from app.core.config import Settings
 from app.schemas.rpa import MessageSnapshotPayload, RpaEventCreate
-from app.services.message_observation_service import process_message_snapshot_shadow
+from app.services.message_observation_service import process_message_snapshot
 from app.services.message_sequence_service import snapshot_payload_hash
-from app.services.rpa_service import create_event
+from app.services.rpa_service import create_event, select_inbound_reply_source
+
+
+def observe_message_snapshot(
+    db: Session,
+    user: User,
+    node: RpaNode,
+    request: RpaEventCreate,
+) -> MessageObservation:
+    return process_message_snapshot(
+        db,
+        user,
+        node,
+        request,
+        write_messages=False,
+    ).observation
 
 
 class MessageObservationServiceTests(unittest.TestCase):
@@ -114,7 +132,6 @@ class MessageObservationServiceTests(unittest.TestCase):
         message_count: int | None = None,
         payload_hash: str | None = None,
         account_id: str | None = None,
-        legacy_projection: dict[str, object] | None = None,
     ) -> RpaEventCreate:
         batch_messages = self.messages() if messages is None else messages
         full_messages = self.messages()
@@ -134,18 +151,14 @@ class MessageObservationServiceTests(unittest.TestCase):
                 "batch_count": batch_count,
                 "message_offset": message_offset,
                 "messages": batch_messages,
-                **(
-                    {"source_snapshot_id": "desktop-snapshot-1", "legacy_projection": legacy_projection}
-                    if legacy_projection is not None
-                    else {}
-                ),
+                "source_snapshot_id": "desktop-snapshot-1",
             },
         )
 
     def test_complete_snapshot_saves_shadow_alignment_without_formal_mutation(self) -> None:
         message_count_before = self.db.scalar(select(func.count()).select_from(Message))
         tail_before = self.conversation.last_message_sequence
-        observation = process_message_snapshot_shadow(
+        observation = observe_message_snapshot(
             self.db, self.user, self.node, self.request("aligned")
         )
         self.db.commit()
@@ -161,36 +174,536 @@ class MessageObservationServiceTests(unittest.TestCase):
         self.assertTrue(self.conversation.awaiting_reply)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(AutomationReplyRun)), 0)
 
-    def test_shadow_diagnostics_compare_legacy_and_ordered_snapshot(self) -> None:
-        messages = self.messages()
+    def test_formal_snapshot_appends_increment_with_contiguous_sequences(self) -> None:
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request("formal-aligned"),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "aligned")
+        self.assertEqual(result.observation.appended_count, 1)
+        self.assertEqual(len(result.appended_messages), 1)
+        appended = result.appended_messages[0]
+        self.assertEqual(appended.content, "有货吗")
+        self.assertEqual(appended.conversation_sequence, 3)
+        self.assertEqual(appended.first_observation_id, "formal-aligned")
+        self.assertEqual(appended.first_dom_sequence, 2)
+        self.assertEqual(appended.collection_kind, "incremental")
+        self.assertTrue(appended.automation_eligible)
+        self.db.refresh(self.conversation)
+        self.assertEqual(self.conversation.last_message_sequence, 3)
+        self.assertEqual(self.conversation.latest_message_text, "有货吗")
+        self.assertTrue(self.conversation.awaiting_reply)
+        self.assertNotIn("shadow_only", result.observation.diagnostics_json)
+
+    def test_formal_bootstrap_appends_batch_without_automation_eligibility(self) -> None:
+        self.db.query(Message).delete()
+        self.conversation.last_message_sequence = 0
+        self.db.commit()
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request("formal-bootstrap"),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "bootstrap")
+        self.assertEqual(result.observation.appended_count, 3)
+        self.assertEqual(
+            [item.conversation_sequence for item in result.appended_messages],
+            [1, 2, 3],
+        )
+        self.assertTrue(all(item.collection_kind == "bootstrap" for item in result.appended_messages))
+        self.assertTrue(all(not item.automation_eligible for item in result.appended_messages))
+
+    def test_unread_bootstrap_selects_only_customer_tail_as_reply_source(self) -> None:
+        self.db.query(Message).delete()
+        self.conversation.last_message_sequence = 0
+        self.db.commit()
+
+        request = self.request("unread-bootstrap-trigger")
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            request,
+            write_messages=True,
+        )
+        self.db.commit()
+
+        source = select_inbound_reply_source(self.db, request, result.appended_messages)
+        self.assertIsNotNone(source)
+        self.assertEqual(source.content, "有货吗")
+        self.assertEqual(source.collection_kind, "bootstrap")
+        self.assertFalse(source.automation_eligible)
+
+    def test_read_bootstrap_never_selects_reply_source(self) -> None:
+        self.db.query(Message).delete()
+        self.conversation.last_message_sequence = 0
+        self.db.commit()
+        request = self.request("read-bootstrap")
+        request.payload_json["unread"] = False
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            request,
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertIsNone(
+            select_inbound_reply_source(self.db, request, result.appended_messages)
+        )
+
+    def test_unread_bootstrap_with_active_send_task_does_not_select_reply_source(self) -> None:
+        self.db.query(Message).delete()
+        self.conversation.last_message_sequence = 0
+        self.db.add(RpaTask(
+            user_id=self.user.id,
+            platform_account_id=self.account.id,
+            conversation_id=self.conversation.id,
+            task_type="send_message",
+            platform_code="pinduoduo",
+            status="queued",
+        ))
+        self.db.commit()
+        request = self.request("unread-bootstrap-active-task")
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            request,
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertIsNone(
+            select_inbound_reply_source(self.db, request, result.appended_messages)
+        )
+
+    def test_incremental_batch_selects_only_last_customer_message(self) -> None:
+        messages = [
+            *self.messages()[:2],
+            {
+                "dom_sequence": 2,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "第一条新消息",
+                "platform_message_id": "new-customer-1",
+            },
+            {
+                "dom_sequence": 3,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "第二条新消息",
+                "platform_message_id": "new-customer-2",
+            },
+        ]
         request = self.request(
-            "diagnostics",
-            legacy_projection={
-                "message_count": 2,
-                "direction_counts": {"customer": 1, "agent": 1},
-                "type_counts": {"text": 2, "image": 0, "product": 0, "order": 0},
-                "sequence_hash": "0" * 64,
-                "platform_id_missing_count": 0,
-                "platform_id_duplicate_count": 0,
+            "incremental-customer-tail",
+            messages=messages,
+            message_count=len(messages),
+            payload_hash=snapshot_payload_hash(messages),
+        )
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            request,
+            write_messages=True,
+        )
+        self.db.commit()
+
+        source = select_inbound_reply_source(self.db, request, result.appended_messages)
+        self.assertEqual([item.content for item in result.appended_messages], [
+            "第一条新消息",
+            "第二条新消息",
+        ])
+        self.assertIsNotNone(source)
+        self.assertEqual(source.content, "第二条新消息")
+        self.assertEqual(source.conversation_sequence, 4)
+
+    def test_incremental_agent_tail_does_not_select_reply_source(self) -> None:
+        messages = [
+            *self.messages()[:2],
+            {
+                "dom_sequence": 2,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "客户追问",
+                "platform_message_id": "new-customer",
+            },
+            {
+                "dom_sequence": 3,
+                "sender_role": "agent",
+                "message_type": "text",
+                "content": "平台人工已回复",
+                "platform_message_id": "new-agent",
+            },
+        ]
+        request = self.request(
+            "incremental-agent-tail",
+            messages=messages,
+            message_count=len(messages),
+            payload_hash=snapshot_payload_hash(messages),
+        )
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            request,
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertIsNone(
+            select_inbound_reply_source(self.db, request, result.appended_messages)
+        )
+
+    def test_duplicate_snapshot_and_retry_do_not_select_reply_source(self) -> None:
+        request = self.request("single-trigger")
+        first = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            request,
+            write_messages=True,
+        )
+        self.db.commit()
+        retry = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            request,
+            write_messages=True,
+        )
+        duplicate_request = self.request("duplicate-trigger")
+        duplicate = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            duplicate_request,
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertIsNotNone(
+            select_inbound_reply_source(self.db, request, first.appended_messages)
+        )
+        self.assertIsNone(
+            select_inbound_reply_source(self.db, request, retry.appended_messages)
+        )
+        self.assertEqual(duplicate.observation.alignment_status, "duplicate")
+        self.assertIsNone(
+            select_inbound_reply_source(self.db, duplicate_request, duplicate.appended_messages)
+        )
+
+    def test_formal_snapshot_retry_does_not_append_twice(self) -> None:
+        request = self.request("formal-retry")
+        first = process_message_snapshot(
+            self.db, self.user, self.node, request, write_messages=True
+        )
+        self.db.commit()
+        count_after_first = self.db.scalar(select(func.count()).select_from(Message))
+        second = process_message_snapshot(
+            self.db, self.user, self.node, request, write_messages=True
+        )
+        self.db.commit()
+
+        self.assertEqual(first.observation.id, second.observation.id)
+        self.assertEqual(second.appended_messages, [])
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(Message)),
+            count_after_first,
+        )
+
+    def test_formal_snapshot_preserves_repeated_occurrences(self) -> None:
+        repeated = [
+            *self.messages()[:2],
+            {
+                "dom_sequence": 2,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "哈喽",
+                "platform_message_id": "repeat-1",
+            },
+            {
+                "dom_sequence": 3,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "哈喽",
+                "platform_message_id": "repeat-2",
+            },
+        ]
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "formal-repeated",
+                messages=repeated,
+                message_count=len(repeated),
+                payload_hash=snapshot_payload_hash(repeated),
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "aligned")
+        self.assertEqual([item.content for item in result.appended_messages], ["哈喽", "哈喽"])
+        self.assertEqual(
+            [item.conversation_sequence for item in result.appended_messages],
+            [3, 4],
+        )
+
+    def test_formal_unaligned_snapshot_never_mutates_queue(self) -> None:
+        messages = [{
+            "dom_sequence": 0,
+            "sender_role": "customer",
+            "message_type": "text",
+            "content": "完全无关",
+            "platform_message_id": None,
+        }]
+        before_count = self.db.scalar(select(func.count()).select_from(Message))
+        before_tail = self.conversation.last_message_sequence
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "formal-unaligned",
+                messages=messages,
+                message_count=1,
+                payload_hash=snapshot_payload_hash(messages),
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "unaligned")
+        self.assertEqual(result.observation.appended_count, 0)
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), before_count)
+        self.db.refresh(self.conversation)
+        self.assertEqual(self.conversation.last_message_sequence, before_tail)
+
+    def test_formal_snapshot_attaches_platform_echo_to_local_outbound(self) -> None:
+        outbound = self.db.scalar(
+            select(Message).where(Message.conversation_id == self.conversation.id).order_by(
+                Message.conversation_sequence.desc()
+            )
+        )
+        self.assertIsNotNone(outbound)
+        outbound.platform_message_id = None
+        outbound.source = "desktop"
+        self.db.commit()
+        echoed = self.messages()[:2]
+        echoed[1]["platform_message_id"] = "echo-agent"
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "formal-echo",
+                messages=echoed,
+                message_count=2,
+                payload_hash=snapshot_payload_hash(echoed),
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "duplicate")
+        self.assertEqual(result.observation.appended_count, 0)
+        self.db.refresh(outbound)
+        self.assertEqual(outbound.platform_message_id, "echo-agent")
+        self.assertEqual(outbound.raw_payload["platform_echo"]["observation_id"], "formal-echo")
+
+    def test_formal_snapshot_aligns_dom_collapsed_outbound_then_appends_customer(self) -> None:
+        customer = self.db.scalar(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.sender_role == "customer",
+            ).order_by(Message.conversation_sequence)
+        )
+        outbound = self.db.scalar(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.sender_role == "agent",
+            ).order_by(Message.conversation_sequence.desc())
+        )
+        self.assertIsNotNone(customer)
+        self.assertIsNotNone(outbound)
+        outbound.content = "您好\n\n请问需要什么帮助"
+        outbound.platform_message_id = None
+        outbound.source = "desktop"
+        self.db.commit()
+        messages = [
+            {
+                "dom_sequence": 0,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": customer.content,
+                "platform_message_id": customer.platform_message_id,
+            },
+            {
+                "dom_sequence": 1,
+                "sender_role": "agent",
+                "message_type": "text",
+                "content": "您好请问需要什么帮助",
+                "platform_message_id": "collapsed-agent-echo",
+            },
+            {
+                "dom_sequence": 2,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "怎么看键盘是否适配",
+                "platform_message_id": "new-customer-question",
+            },
+        ]
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "collapsed-outbound-echo",
+                messages=messages,
+                message_count=len(messages),
+                payload_hash=snapshot_payload_hash(messages),
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "aligned")
+        self.assertEqual(result.observation.alignment_method, "platform_id_anchor")
+        self.assertEqual(result.observation.appended_count, 1)
+        self.assertEqual(result.appended_messages[0].content, "怎么看键盘是否适配")
+        self.db.refresh(outbound)
+        self.assertEqual(outbound.platform_message_id, "collapsed-agent-echo")
+        self.assertEqual(
+            outbound.raw_payload["platform_echo"]["observation_id"],
+            "collapsed-outbound-echo",
+        )
+
+    def test_formal_snapshot_aligns_qa_text_and_uploaded_image_then_appends_customer(self) -> None:
+        customer = self.db.scalar(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.sender_role == "customer",
+            ).order_by(Message.conversation_sequence)
+        )
+        outbound_text = self.db.scalar(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.sender_role == "agent",
+            ).order_by(Message.conversation_sequence.desc())
+        )
+        self.assertIsNotNone(customer)
+        self.assertIsNotNone(outbound_text)
+        outbound_text.content = "第一行\n第二行"
+        outbound_text.platform_message_id = None
+        outbound_text.source = "desktop"
+        outbound_image = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="[图片]",
+            source="ai",
+            message_status="confirmation_pending",
+            conversation_sequence=3,
+            raw_payload={
+                "media_type": "image",
+                "image_url": "http://127.0.0.1:8010/api/v1/qa-assets/answer.png",
             },
         )
-        observation = process_message_snapshot_shadow(self.db, self.user, self.node, request)
+        self.conversation.last_message_sequence = 3
+        self.db.add(outbound_image)
+        self.db.commit()
+        messages = [
+            {
+                "dom_sequence": 0,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": customer.content,
+                "platform_message_id": customer.platform_message_id,
+            },
+            {
+                "dom_sequence": 1,
+                "sender_role": "agent",
+                "message_type": "text",
+                "content": "第一行第二行",
+                "platform_message_id": "qa-text-echo",
+            },
+            {
+                "dom_sequence": 2,
+                "sender_role": "agent",
+                "message_type": "image",
+                "content": "[图片]",
+                "image_url": "https://chat-img.pddugc.com/uploaded-answer.png?token=temp",
+                "platform_message_id": "qa-image-echo",
+            },
+            {
+                "dom_sequence": 3,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "蓝牙怎么连接",
+                "platform_message_id": "new-customer-question",
+            },
+        ]
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "qa-text-image-echo",
+                messages=messages,
+                message_count=len(messages),
+                payload_hash=snapshot_payload_hash(messages),
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "aligned")
+        self.assertEqual(result.observation.alignment_method, "platform_id_anchor")
+        self.assertEqual([item.content for item in result.appended_messages], ["蓝牙怎么连接"])
+        self.db.refresh(outbound_text)
+        self.db.refresh(outbound_image)
+        self.assertEqual(outbound_text.platform_message_id, "qa-text-echo")
+        self.assertEqual(outbound_image.platform_message_id, "qa-image-echo")
+        self.assertEqual(outbound_image.message_status, "sent")
+
+    def test_snapshot_diagnostics_describe_ordered_snapshot(self) -> None:
+        messages = self.messages()
+        request = self.request("diagnostics")
+        observation = observe_message_snapshot(self.db, self.user, self.node, request)
         self.db.commit()
 
         metrics = observation.diagnostics_json["snapshot_metrics"]
-        comparison = observation.diagnostics_json["legacy_snapshot_comparison"]
         self.assertEqual(metrics["message_count"], len(messages))
         self.assertEqual(metrics["direction_counts"], {"customer": 2, "agent": 1})
         self.assertEqual(metrics["platform_id_missing_count"], 1)
-        self.assertFalse(comparison["message_count_matches"])
-        self.assertFalse(comparison["direction_counts_match"])
-        self.assertFalse(comparison["page_sequence_matches"])
+        self.assertNotIn("legacy_snapshot_comparison", observation.diagnostics_json)
 
     def test_empty_formal_queue_is_classified_as_bootstrap_without_appending(self) -> None:
         self.db.query(Message).delete()
         self.conversation.last_message_sequence = 0
         self.db.commit()
-        observation = process_message_snapshot_shadow(
+        observation = observe_message_snapshot(
             self.db, self.user, self.node, self.request("bootstrap")
         )
         self.db.commit()
@@ -207,13 +720,13 @@ class MessageObservationServiceTests(unittest.TestCase):
             message_count=2,
             payload_hash=snapshot_payload_hash(duplicate_messages),
         )
-        observation = process_message_snapshot_shadow(self.db, self.user, self.node, request)
+        observation = observe_message_snapshot(self.db, self.user, self.node, request)
         self.db.commit()
         self.assertEqual(observation.alignment_status, "duplicate")
         self.assertEqual(observation.overlap_size, 2)
         self.assertEqual(observation.projected_append_count, 0)
 
-    def test_rpa_event_entrypoint_returns_no_reply_source_or_formal_conversation_update(self) -> None:
+    def test_disabled_rpa_event_entrypoint_does_not_process_snapshot(self) -> None:
         request = self.request("rpa-entrypoint")
         message_count_before = self.db.scalar(select(func.count()).select_from(Message))
         event, reply_sources, changed_conversations = create_event(
@@ -229,26 +742,124 @@ class MessageObservationServiceTests(unittest.TestCase):
                 MessageObservation.observation_id == "rpa-entrypoint"
             )
         )
-        self.assertIsNotNone(observation)
-        self.assertEqual(observation.alignment_status, "aligned")
+        self.assertIsNone(observation)
+
+    def test_snapshot_shop_mode_writes_snapshot_and_suppresses_legacy_events(self) -> None:
+        self.account.metadata_json = {"pdd_message_snapshot_write_enabled": True}
+        self.db.commit()
+        settings = Settings(
+            _env_file=None,
+            PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED=True,
+        )
+        with patch("app.services.rpa_service.get_settings", return_value=settings):
+            snapshot_event, appended, changed = create_event(
+                self.db,
+                self.user,
+                self.node,
+                self.request("formal-rpa-entrypoint"),
+            )
+            legacy_request = RpaEventCreate(
+                event_id="legacy-suppressed",
+                event_type="message_received",
+                platform_code="pinduoduo",
+                platform_account_id=self.account.id,
+                platform_message_id="legacy-new",
+                conversation_external_id="same-external-id",
+                payload_json={
+                    "customer_name": "Customer",
+                    "sender_role": "customer",
+                    "content": "旧事件不能再写入",
+                },
+            )
+            legacy_event, legacy_messages, legacy_conversations = create_event(
+                self.db,
+                self.user,
+                self.node,
+                legacy_request,
+            )
+
+        self.assertEqual(snapshot_event.status, "processed")
+        self.assertEqual([item.content for item in appended], ["有货吗"])
+        self.assertEqual([item.id for item in changed], [self.conversation.id])
+        self.assertEqual(legacy_messages, [])
+        self.assertEqual(legacy_conversations, [])
+        self.assertTrue(legacy_event.payload_json["legacy_write_suppressed"])
+        self.assertEqual(legacy_event.payload_json["message_write_mode"], "snapshot")
+        self.assertIsNone(
+            self.db.scalar(
+                select(Message).where(Message.platform_message_id == "legacy-new")
+            )
+        )
+
+    def test_unaligned_first_snapshot_does_not_suppress_legacy_fallback(self) -> None:
+        self.account.metadata_json = {"pdd_message_snapshot_write_enabled": True}
+        self.db.commit()
+        settings = Settings(
+            _env_file=None,
+            PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED=True,
+        )
+        unrelated = [{
+            "dom_sequence": 0,
+            "sender_role": "customer",
+            "message_type": "text",
+            "content": "无法对齐",
+            "platform_message_id": "unaligned-new",
+        }]
+        with patch("app.services.rpa_service.get_settings", return_value=settings):
+            snapshot_event, appended, _ = create_event(
+                self.db,
+                self.user,
+                self.node,
+                self.request(
+                    "unaligned-first-switch",
+                    messages=unrelated,
+                    message_count=1,
+                    payload_hash=snapshot_payload_hash(unrelated),
+                ),
+            )
+            legacy_request = RpaEventCreate(
+                event_id="legacy-fallback",
+                event_type="message_received",
+                platform_code="pinduoduo",
+                platform_account_id=self.account.id,
+                platform_message_id="legacy-fallback-id",
+                conversation_external_id="same-external-id",
+                payload_json={
+                    "sender_role": "customer",
+                    "content": "旧链路继续兜底",
+                },
+            )
+            legacy_event, legacy_messages, _ = create_event(
+                self.db,
+                self.user,
+                self.node,
+                legacy_request,
+            )
+
+        self.assertEqual(snapshot_event.status, "processed")
+        self.assertEqual(appended, [])
+        self.assertEqual(legacy_messages, [])
+        self.assertTrue(legacy_event.payload_json["legacy_write_suppressed"])
 
     def test_same_observation_retry_returns_existing_result(self) -> None:
-        first = process_message_snapshot_shadow(self.db, self.user, self.node, self.request("retry"))
+        first = observe_message_snapshot(self.db, self.user, self.node, self.request("retry"))
         self.db.commit()
-        second = process_message_snapshot_shadow(self.db, self.user, self.node, self.request("retry"))
+        second = observe_message_snapshot(self.db, self.user, self.node, self.request("retry"))
         self.db.commit()
         self.assertEqual(second.id, first.id)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(MessageObservation)), 1)
 
     def test_same_observation_with_different_hash_preserves_previous_result(self) -> None:
-        first = process_message_snapshot_shadow(self.db, self.user, self.node, self.request("conflict"))
+        first = observe_message_snapshot(self.db, self.user, self.node, self.request("conflict"))
         self.db.commit()
-        event, reply_sources, changed_conversations = create_event(
-            self.db,
-            self.user,
-            self.node,
-            self.request("conflict", payload_hash="f" * 64),
-        )
+        settings = Settings(_env_file=None, PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED=True)
+        with patch("app.services.rpa_service.get_settings", return_value=settings):
+            event, reply_sources, changed_conversations = create_event(
+                self.db,
+                self.user,
+                self.node,
+                self.request("conflict", payload_hash="f" * 64),
+            )
         self.assertEqual(event.status, "failed")
         self.assertIn("different payload_hash", event.error_message or "")
         self.assertEqual(reply_sources, [])
@@ -258,7 +869,7 @@ class MessageObservationServiceTests(unittest.TestCase):
 
     def test_initial_snapshot_with_wrong_hash_is_failed_without_formal_mutation(self) -> None:
         message_count_before = self.db.scalar(select(func.count()).select_from(Message))
-        observation = process_message_snapshot_shadow(
+        observation = observe_message_snapshot(
             self.db,
             self.user,
             self.node,
@@ -286,7 +897,7 @@ class MessageObservationServiceTests(unittest.TestCase):
             message_offset=2,
             payload_hash=payload_hash,
         )
-        observation = process_message_snapshot_shadow(self.db, self.user, self.node, second_batch)
+        observation = observe_message_snapshot(self.db, self.user, self.node, second_batch)
         self.db.commit()
         self.assertEqual(observation.alignment_status, "pending")
         self.assertEqual(observation.received_batch_count, 1)
@@ -299,7 +910,7 @@ class MessageObservationServiceTests(unittest.TestCase):
             message_offset=0,
             payload_hash=payload_hash,
         )
-        observation = process_message_snapshot_shadow(self.db, self.user, self.node, first_batch)
+        observation = observe_message_snapshot(self.db, self.user, self.node, first_batch)
         self.db.commit()
         self.assertEqual(observation.alignment_status, "aligned")
         self.assertEqual(observation.received_batch_count, 2)
@@ -315,9 +926,9 @@ class MessageObservationServiceTests(unittest.TestCase):
             message_count=3,
             payload_hash=payload_hash,
         )
-        observation = process_message_snapshot_shadow(self.db, self.user, self.node, first_batch)
+        observation = observe_message_snapshot(self.db, self.user, self.node, first_batch)
         self.db.commit()
-        observation = process_message_snapshot_shadow(self.db, self.user, self.node, first_batch)
+        observation = observe_message_snapshot(self.db, self.user, self.node, first_batch)
         self.db.commit()
         self.assertEqual(observation.received_batch_count, 1)
         self.assertEqual(observation.alignment_status, "pending")
@@ -329,7 +940,7 @@ class MessageObservationServiceTests(unittest.TestCase):
             message_count=3,
             payload_hash=payload_hash,
         )
-        observation = process_message_snapshot_shadow(self.db, self.user, self.node, changed)
+        observation = observe_message_snapshot(self.db, self.user, self.node, changed)
         self.db.commit()
         self.assertEqual(observation.alignment_status, "failed")
 
@@ -360,7 +971,7 @@ class MessageObservationServiceTests(unittest.TestCase):
         ))
         self.db.commit()
 
-        observation = process_message_snapshot_shadow(
+        observation = observe_message_snapshot(
             self.db,
             self.user,
             self.node,

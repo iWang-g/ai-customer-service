@@ -7,12 +7,6 @@ function digest(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function safeIsoDate(value, fallback) {
-  if (!value) return fallback;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? fallback : date.toISOString();
-}
-
 function compact(value) {
   return JSON.stringify(value);
 }
@@ -25,29 +19,6 @@ function canonical(value) {
     )).join(',')}}`;
   }
   return JSON.stringify(value === undefined ? null : value);
-}
-
-function messageFallbackIdentity(message) {
-  return digest(compact({
-    sender_role: message.sender_role,
-    content: message.content,
-    message_type: message.message_type,
-    platform_sent_at: message.platform_sent_at,
-    time_group_index: message.time_group_index,
-    time_label: message.time_label,
-  })).slice(0, 40);
-}
-
-function normalizedSnapshotMessages(messages) {
-  const seen = new Set();
-  const normalized = [];
-  for (const message of messages) {
-    const identity = message.platform_message_id || messageFallbackIdentity(message);
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    normalized.push(message);
-  }
-  return normalized;
 }
 
 function snapshotHashMessages(messages) {
@@ -67,34 +38,6 @@ function snapshotPayloadHash(messages) {
   return digest(canonical(snapshotHashMessages(messages)));
 }
 
-function sequenceEvidenceHash(messages) {
-  return digest(canonical(messages.map((message) => ({
-    sender_role: message.sender_role,
-    message_type: message.message_type,
-    content: message.content,
-    image_url: message.image_url || null,
-  }))));
-}
-
-function messageCounts(messages, key, values) {
-  return Object.fromEntries(values.map((value) => [
-    value,
-    messages.filter((message) => message[key] === value).length,
-  ]));
-}
-
-function legacyProjection(messages) {
-  const ids = messages.map((message) => message.platform_message_id).filter(Boolean);
-  return {
-    message_count: messages.length,
-    direction_counts: messageCounts(messages, 'sender_role', ['customer', 'agent']),
-    type_counts: messageCounts(messages, 'message_type', ['text', 'image', 'product', 'order']),
-    sequence_hash: sequenceEvidenceHash(messages),
-    platform_id_missing_count: messages.length - ids.length,
-    platform_id_duplicate_count: ids.length - new Set(ids).size,
-  };
-}
-
 export class PddCollectionRuntime {
   constructor({
     localAccountId,
@@ -103,7 +46,6 @@ export class PddCollectionRuntime {
     onIdentity,
     onStatus,
     onDiagnostic,
-    snapshotShadowEnabled = process.env.PDD_MESSAGE_SNAPSHOT_DUAL_TRACK_ENABLED !== 'false',
   }) {
     this.localAccountId = localAccountId;
     this.getPlatformAccountId = getPlatformAccountId;
@@ -111,7 +53,6 @@ export class PddCollectionRuntime {
     this.onIdentity = onIdentity;
     this.onStatus = onStatus;
     this.onDiagnostic = onDiagnostic;
-    this.snapshotShadowEnabled = snapshotShadowEnabled;
     this.pendingSnapshot = null;
     this.emitted = new Set();
     this.suppressedConversations = new Set();
@@ -145,7 +86,7 @@ export class PddCollectionRuntime {
       snapshot_id: payload.snapshot_id || null,
       conversation_count: payload.conversations?.length || 0,
       total_message_count: (payload.conversations || [])
-        .reduce((total, conversation) => total + (conversation.messages?.length || 0), 0),
+        .reduce((total, conversation) => total + (conversation.snapshot_messages?.length || 0), 0),
     });
     this.#emitSnapshot(payload);
     return true;
@@ -254,61 +195,20 @@ export class PddCollectionRuntime {
         });
       }
 
-      const messages = normalizedSnapshotMessages(conversation.messages);
       this.#diagnostic('runtime_conversation_snapshot_expanded', {
         snapshot_id: snapshot.snapshot_id || null,
         conversation_external_id: externalConversationId,
         customer_name: conversation.customer_name || null,
         latest_message_text: conversation.latest_message_text || '',
         unread_count: conversation.unread_count,
-        raw_message_count: conversation.messages?.length || 0,
-        normalized_message_count: messages.length,
+        ordered_message_count: conversation.snapshot_messages?.length || 0,
       });
-      for (const message of messages) {
-        const stableMessagePart = message.platform_message_id || messageFallbackIdentity(message);
-        const messageDedup = `pinduoduo:${platformAccountId}:${externalConversationId}:message:v3:${stableMessagePart}`;
-        emittedCandidates += 1;
-        this.#emitOnce(messageDedup, {
-          event_id: `pdd_${digest(messageDedup)}`,
-          dedup_key: messageDedup,
-          event_type: message.sender_role === 'agent' ? 'agent_message' : 'message_received',
-          platform_code: 'pinduoduo',
-          platform_account_id: platformAccountId,
-          platform_message_id: message.platform_message_id,
-          conversation_external_id: externalConversationId,
-          received_at: snapshot.observed_at,
-          payload_json: {
-            customer_name: conversation.customer_name,
-            title: conversation.title,
-            content: message.content,
-            sender_name: message.sender_name,
-            sender_role: message.sender_role,
-            message_type: message.message_type,
-            ...(message.message_type === 'image' && message.image_url
-              ? { media_type: 'image', image_url: message.image_url }
-              : {}),
-            platform_sent_at: safeIsoDate(message.platform_sent_at, null),
-            observed_at: snapshot.observed_at,
-            snapshot_id: snapshot.snapshot_id,
-            snapshot_sequence: message.snapshot_sequence,
-            time_group_index: message.time_group_index,
-            time_label: message.time_label,
-            has_explicit_time: message.has_explicit_time,
-            unread_count: conversation.unread_count,
-            conversation_metadata: {
-              avatar_url: conversation.avatar_url,
-              local_account_id: this.localAccountId,
-            },
-          },
-        });
-      }
-      if (this.snapshotShadowEnabled && Array.isArray(conversation.snapshot_messages)) {
-        this.#emitMessageSnapshot({
+      if (Array.isArray(conversation.snapshot_messages)) {
+        emittedCandidates += this.#emitMessageSnapshot({
           snapshot,
           conversation,
           externalConversationId,
           platformAccountId,
-          legacyMessages: messages,
         });
       }
     }
@@ -323,7 +223,6 @@ export class PddCollectionRuntime {
     conversation,
     externalConversationId,
     platformAccountId,
-    legacyMessages,
   }) {
     const messages = snapshotHashMessages(conversation.snapshot_messages);
     const payloadHash = snapshotPayloadHash(messages);
@@ -336,7 +235,6 @@ export class PddCollectionRuntime {
     });
     const observationId = `pddobs_${digest(observationSeed).slice(0, 48)}`;
     const batchCount = Math.max(1, Math.ceil(messages.length / MESSAGE_SNAPSHOT_BATCH_SIZE));
-    const projection = legacyProjection(legacyMessages);
     for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
       const messageOffset = batchIndex * MESSAGE_SNAPSHOT_BATCH_SIZE;
       const batchMessages = messages.slice(messageOffset, messageOffset + MESSAGE_SNAPSHOT_BATCH_SIZE);
@@ -360,7 +258,6 @@ export class PddCollectionRuntime {
           message_offset: messageOffset,
           messages: batchMessages,
           source_snapshot_id: snapshot.snapshot_id,
-          legacy_projection: projection,
         },
       });
     }
@@ -369,10 +266,8 @@ export class PddCollectionRuntime {
       conversation_external_id: externalConversationId,
       message_count: messages.length,
       batch_count: batchCount,
-      legacy_message_count: legacyMessages.length,
-      platform_id_missing_count: projection.platform_id_missing_count,
-      platform_id_duplicate_count: projection.platform_id_duplicate_count,
     });
+    return batchCount;
   }
 
   #emitOnce(key, event) {

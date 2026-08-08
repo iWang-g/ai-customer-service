@@ -69,7 +69,7 @@ class AnalyticsServiceTests(unittest.TestCase):
         self.add_message("agent", 10, source="desktop")
         self.add_message("customer", 11, source="demo")
         self.add_message("agent", 12, status="failed")
-        # Platform time wins, so this history snapshot belongs to the previous day.
+        # Pinduoduo analytics follow local collection time, not the page time label.
         historical = self.add_message("customer", 13)
         historical.platform_sent_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
         self.db.commit()
@@ -78,9 +78,10 @@ class AnalyticsServiceTests(unittest.TestCase):
             self.db, self.user, date(2026, 8, 3), date(2026, 8, 3), "Asia/Shanghai"
         )
 
-        self.assertEqual(result.metrics.message_count, 2)
+        self.assertEqual(result.metrics.message_count, 3)
         self.assertEqual(result.traffic[9].count, 1)
-        self.assertEqual(sum(point.count for point in result.traffic), 1)
+        self.assertEqual(result.traffic[13].count, 1)
+        self.assertEqual(sum(point.count for point in result.traffic), 2)
         self.assertEqual(result.metrics.independent_reception_rate, 0.0)
 
     def test_robot_only_conversation_and_response_time_are_calculated(self) -> None:

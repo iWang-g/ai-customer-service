@@ -15,6 +15,7 @@ const CONVERSATION_LIST_TIMEOUT_MS = 8000;
 const CONVERSATION_COLLECTION_TIMEOUT_MS = 15000;
 const MESSAGE_PREPARATION_TIMEOUT_MS = 15000;
 const IMAGE_PREPARATION_TIMEOUT_MS = 15000;
+const IMAGE_SEND_CONFIRMATION_TIMEOUT_MS = 70000;
 const STORE_SCAN_TIMEOUT_MS = 10000;
 const UNREAD_COLLECTION_TIMEOUT_MS = 15000;
 const BACKGROUND_ACCOUNT_LOAD_TIMEOUT_MS = 30000;
@@ -624,7 +625,7 @@ export class PddWorkspaceManager {
       const timer = setTimeout(() => {
         this.pendingImagePreparations.delete(requestId);
         reject(new Error('拼多多图片发送超时'));
-      }, IMAGE_PREPARATION_TIMEOUT_MS);
+      }, IMAGE_SEND_CONFIRMATION_TIMEOUT_MS);
       this.pendingImagePreparations.set(requestId, { accountId: account.id, resolve, reject, timer });
       view.webContents.send('pdd-adapter:command', {
         type: 'send-image-enter',
@@ -696,7 +697,9 @@ export class PddWorkspaceManager {
       expectedConversationKey,
       customerName,
     );
-    if (sent?.status !== 'sent') throw new Error(sent?.error || '拼多多图片发送失败');
+    if (!['sent', 'pending'].includes(sent?.status)) {
+      throw new Error(sent?.error || '拼多多图片发送失败');
+    }
     return sent;
   }
 
@@ -739,8 +742,10 @@ export class PddWorkspaceManager {
     return {
       method: textResult.method || null,
       text_sent: true,
-      image_sent: Boolean(imageResult),
+      image_sent: imageResult?.status === 'sent',
+      image_confirmation_pending: imageResult?.status === 'pending',
       image_method: imageResult?.method || null,
+      image_confirmation: imageResult?.confirmation || null,
     };
   }
 
@@ -750,7 +755,12 @@ export class PddWorkspaceManager {
     try {
       if (task.task_type === 'send_message') {
         const result = await this.#sendReplyBundle(task, payload, account, setState, signal);
-        this.rpaManager.completeTask(task.id, 'completed', result);
+        this.rpaManager.completeTask(
+          task.id,
+          result.image_confirmation_pending ? 'confirmation_pending' : 'completed',
+          result,
+          result.image_confirmation_pending ? 'image_confirmation_pending' : null,
+        );
       } else if (task.task_type === 'send_image') {
         if (!account) throw new Error('未找到消息对应的拼多多店铺，请确认店铺已登录');
         const image = await this.#downloadImage(payload.image_url, signal);

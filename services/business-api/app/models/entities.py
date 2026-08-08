@@ -648,6 +648,7 @@ class AutomationReplyRun(Base, TimestampMixin):
     source_event_id: Mapped[str | None] = mapped_column(
         ForeignKey("rpa_events.id", ondelete="SET NULL"), index=True, nullable=True
     )
+    trigger_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
     robot_id: Mapped[str] = mapped_column(
         ForeignKey("robots.id", ondelete="CASCADE"), index=True, nullable=False
     )

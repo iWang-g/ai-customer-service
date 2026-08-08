@@ -6,6 +6,7 @@ from app.services.message_sequence_service import (
     align_message_sequences,
     longest_tail_overlap,
     message_fingerprint,
+    normalize_outbound_echo_text,
     normalize_text,
 )
 
@@ -54,6 +55,19 @@ class MessageSequenceServiceTests(unittest.TestCase):
 
     def test_longest_tail_overlap_uses_occurrence_order(self) -> None:
         self.assertEqual(longest_tail_overlap(["a", "b", "b"], ["b", "b", "c"]), 2)
+
+    def test_outbound_echo_normalization_handles_dom_discarded_line_breaks(self) -> None:
+        local = "链接电脑的模式(USB有线链接)\n\n而三模是支持三种模式"
+        dom = "链接电脑的模式(USB有线链接)而三模是支持三种模式"
+        self.assertEqual(normalize_outbound_echo_text(local), normalize_outbound_echo_text(dom))
+        self.assertNotEqual(
+            normalize_outbound_echo_text("USB Type A"),
+            normalize_outbound_echo_text("USB TypeA"),
+        )
+        self.assertNotEqual(
+            normalize_outbound_echo_text("中文 空格"),
+            normalize_outbound_echo_text("中文空格"),
+        )
 
     def test_empty_history_bootstraps_full_visible_snapshot(self) -> None:
         current = [text("customer", "你好"), text("agent", "您好")]
@@ -146,6 +160,100 @@ class MessageSequenceServiceTests(unittest.TestCase):
         result = align_message_sequences(history, current)
         self.assertEqual(result.method, "platform_id_anchor")
         self.assertEqual(result.projected_append_count, 1)
+
+    def test_platform_anchor_accepts_local_outbound_dom_whitespace_echo(self) -> None:
+        history = [
+            text("customer", "单模和三模有什么区别", "customer-id"),
+            {
+                **text(
+                    "agent",
+                    "亲~单模是有线链接\n\n而三模是有线、无线和蓝牙",
+                    None,
+                ),
+                "source": "desktop",
+            },
+        ]
+        current = [
+            text("customer", "单模和三模有什么区别", "customer-id"),
+            text(
+                "agent",
+                "亲~单模是有线链接而三模是有线、无线和蓝牙",
+                "agent-echo-id",
+            ),
+            text("customer", "怎么看键盘是否适配", "new-customer-id"),
+        ]
+
+        result = align_message_sequences(history, current)
+
+        self.assertEqual(result.status, "aligned")
+        self.assertEqual(result.method, "platform_id_anchor")
+        self.assertEqual(result.overlap_size, 2)
+        self.assertEqual(result.append_from, 2)
+        self.assertEqual(result.projected_append_count, 1)
+
+    def test_platform_anchor_accepts_local_outbound_image_cdn_echo(self) -> None:
+        history = [
+            text("customer", "怎么看键盘是否适配", "customer-id"),
+            {
+                **text("agent", "第一行\n第二行", None),
+                "source": "desktop",
+            },
+            {
+                **image(
+                    "agent",
+                    image_url="http://127.0.0.1:8010/api/v1/qa-assets/answer.png",
+                ),
+                "source": "ai",
+            },
+        ]
+        current = [
+            text("customer", "怎么看键盘是否适配", "customer-id"),
+            text("agent", "第一行第二行", "agent-text-echo"),
+            image(
+                "agent",
+                platform_message_id="agent-image-echo",
+                image_url="https://chat-img.pddugc.com/uploaded-answer.png?token=temp",
+            ),
+            text("customer", "蓝牙怎么连接", "new-customer-id"),
+        ]
+
+        result = align_message_sequences(history, current)
+
+        self.assertEqual(result.status, "aligned")
+        self.assertEqual(result.method, "platform_id_anchor")
+        self.assertEqual(result.overlap_size, 3)
+        self.assertEqual(result.append_from, 3)
+        self.assertEqual(result.projected_append_count, 1)
+
+    def test_platform_anchor_does_not_relax_platform_or_customer_image_urls(self) -> None:
+        for sender, source in (("agent", "rpa"), ("customer", "rpa")):
+            history_image = image(sender, image_url="https://old.invalid/image.png")
+            history_image["source"] = source
+            result = align_message_sequences(
+                [text("customer", "anchor", "anchor-id"), history_image],
+                [
+                    text("customer", "anchor", "anchor-id"),
+                    image(sender, image_url="https://new.invalid/image.png"),
+                    text("customer", "new", "new-id"),
+                ],
+            )
+            self.assertEqual(result.status, "unaligned")
+
+    def test_platform_anchor_does_not_relax_non_outbound_text(self) -> None:
+        current = [
+            text("customer", "稳定客户消息", "customer-id"),
+            text("agent", "客服回复下一段", "agent-id"),
+            text("customer", "真正新增", "new-id"),
+        ]
+        for source in ("rpa", None):
+            history_tail = text("agent", "客服回复\n\n下一段", None)
+            if source is not None:
+                history_tail["source"] = source
+            result = align_message_sequences(
+                [text("customer", "稳定客户消息", "customer-id"), history_tail],
+                current,
+            )
+            self.assertEqual(result.status, "unaligned")
 
     def test_repeated_or_isolated_platform_id_is_not_a_trustworthy_anchor(self) -> None:
         repeated = align_message_sequences(

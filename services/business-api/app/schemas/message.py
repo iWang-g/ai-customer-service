@@ -53,7 +53,9 @@ class SendMessageRequest(BaseModel):
 class SendMessageResponse(BaseModel):
     message: MessageRead
     task_id: str
-    task_status: Literal["queued", "dispatched", "acknowledged", "completed", "failed"]
+    task_status: Literal[
+        "queued", "dispatched", "acknowledged", "completed", "failed", "confirmation_pending"
+    ]
 
 
 class RecordSentMessageRequest(BaseModel):

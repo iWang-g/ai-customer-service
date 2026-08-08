@@ -46,6 +46,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "human_required_at": "DATETIME",
         },
         "automation_reply_runs": {
+            "trigger_sequence": "INTEGER",
             "intent": "VARCHAR(64)",
             "qa_entry_id": "VARCHAR(128)",
             "qa_category_id": "VARCHAR(128)",
@@ -351,6 +352,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                 source_message_id VARCHAR(32) NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
                 source_event_id VARCHAR(32) REFERENCES rpa_events(id) ON DELETE SET NULL,
+                trigger_sequence INTEGER,
                 robot_id VARCHAR(32) NOT NULL REFERENCES robots(id) ON DELETE CASCADE,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending',
                 decision VARCHAR(32),
@@ -500,6 +502,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             ("automation_reply_runs", "ix_automation_reply_runs_conversation_id", "conversation_id"),
             ("automation_reply_runs", "ix_automation_reply_runs_source_message_id", "source_message_id"),
             ("automation_reply_runs", "ix_automation_reply_runs_source_event_id", "source_event_id"),
+            ("automation_reply_runs", "ix_automation_reply_runs_trigger_sequence", "trigger_sequence"),
             ("automation_reply_runs", "ix_automation_reply_runs_robot_id", "robot_id"),
             ("automation_reply_runs", "ix_automation_reply_runs_status", "status"),
             ("automation_reply_runs", "ix_automation_reply_runs_trace_id", "trace_id"),

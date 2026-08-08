@@ -30,6 +30,7 @@ from app.services.rpa_service import (
     get_pending_tasks,
     heartbeat_node,
     register_node,
+    select_inbound_reply_source,
 )
 from app.services.platform_account_service import sync_platform_accounts_for_node
 from app.services.realtime import realtime_manager
@@ -46,7 +47,7 @@ def _schedule_inbound_reply(
     source_message: Message,
     source_event_id: str,
 ) -> None:
-    if request.event_type not in {"customer_message", "message_received"}:
+    if request.event_type not in {"customer_message", "message_received", "message_snapshot"}:
         return
     if not auto_reply_enabled(db, user):
         return
@@ -130,8 +131,9 @@ async def ingest_event(
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     event, messages, _ = create_event(db, user, node, request)
-    if messages:
-        _schedule_inbound_reply(db, user, request, messages[0], event.id)
+    source_message = select_inbound_reply_source(db, request, messages)
+    if source_message is not None:
+        _schedule_inbound_reply(db, user, request, source_message, event.id)
     await realtime_manager.broadcast(
         user.id,
         {"type": "rpa.event", "event": RpaEventRead.model_validate(event).model_dump(mode="json")},
