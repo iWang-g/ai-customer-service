@@ -139,6 +139,12 @@ export function useMessageCenterController() {
   const [customerOrders, setCustomerOrders] = useState<CustomerOrdersResponse | null>(null);
   const [isLoadingCustomerOrders, setIsLoadingCustomerOrders] = useState(false);
   const monitoringModelRef = useRef('deepseek-chat');
+  const currentViewRef = useRef(currentView);
+  const humanRequiredSnapshotRef = useRef(new Map<string, string>());
+
+  useEffect(() => {
+    currentViewRef.current = currentView;
+  }, [currentView]);
 
   const mapMonitoringLog = (item: MonitoringLog): LogEntry => ({
     id: item.id,
@@ -261,6 +267,15 @@ export function useMessageCenterController() {
       const targetId = response.items.some((item) => item.id === selectedIdRef.current)
         ? selectedIdRef.current
         : response.items[0]?.id || '';
+      const previousHumanRequired = humanRequiredSnapshotRef.current;
+      const nextHumanRequired = new Map<string, string>();
+      const newlyHumanRequired = response.items.filter((item) => {
+        if (!item.human_required) return false;
+        const notificationKey = `${item.id}:${item.human_required_at || 'active'}`;
+        nextHumanRequired.set(item.id, notificationKey);
+        return previousHumanRequired.get(item.id) !== notificationKey;
+      });
+      humanRequiredSnapshotRef.current = nextHumanRequired;
       setConversations((current) => {
         const mapped = response.items.map((item) => {
           const existing = current.find((conversation) => conversation.id === item.id);
@@ -268,6 +283,19 @@ export function useMessageCenterController() {
         });
         return mapped;
       });
+      if (newlyHumanRequired.length > 0) {
+        void window.desktopBridge?.notifyHumanRequired({
+          items: newlyHumanRequired.map((item) => ({
+            conversationId: item.id,
+            notificationKey: nextHumanRequired.get(item.id) || `${item.id}:active`,
+            platformName: item.platform_name || item.platform_code,
+            shopName: item.shop_name || '',
+            customerName: item.customer_name || item.title || '',
+          })),
+          messageCenterVisible: currentViewRef.current === 'messages',
+          viewingConversationId: selectedIdRef.current || null,
+        }).catch((error) => console.error('发送待人工桌面通知失败:', error));
+      }
       if (targetId) await Promise.all([
         loadMessagesForConversation(targetId),
         loadCustomerOrders(targetId),
@@ -374,8 +402,25 @@ export function useMessageCenterController() {
         ) void loadMonitoring(monitoringModelRef.current);
       },
       setConnectionStatus,
+      () => {
+        void loadConversationData();
+      },
     );
   }, [authReady, loadConversationData, loadMonitoring, session?.access_token]);
+
+  useEffect(() => window.desktopBridge?.onOpenHumanRequiredConversation((conversationId) => {
+    setCurrentView('messages');
+    setSelectedPlatform('all');
+    setSelectedCategory('all');
+    setSelectedShop('all');
+    setConversationSearch('');
+    if (conversationId) {
+      void Promise.all([
+        loadMessagesForConversation(conversationId),
+        loadCustomerOrders(conversationId),
+      ]);
+    }
+  }), [loadCustomerOrders, loadMessagesForConversation]);
 
   const handleMonitoringModelChange = useCallback((model: string) => {
     void loadMonitoring(model);
@@ -438,11 +483,13 @@ export function useMessageCenterController() {
 
   const handleLogout = () => {
     void window.desktopBridge?.closePlatformWorkspaces().catch(() => undefined);
+    void window.desktopBridge?.clearHumanRequiredNotifications().catch(() => undefined);
     void logout().catch(() => undefined);
     clearStoredSession();
     setSession(null);
     setCurrentView('messages');
     setConversations([]);
+    humanRequiredSnapshotRef.current.clear();
     selectedIdRef.current = '';
     setSelectedId('');
     setConnectionStatus('disconnected');

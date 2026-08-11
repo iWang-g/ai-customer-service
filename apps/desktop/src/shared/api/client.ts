@@ -879,6 +879,7 @@ export function connectRealtime(
   accessToken: string,
   onEvent: (event: RealtimeEvent) => void,
   onStatus: (status: 'connecting' | 'connected' | 'disconnected') => void,
+  onConnected?: () => void,
 ): () => void {
   const configured = import.meta.env.VITE_WS_URL as string | undefined;
   const wsBase = configured
@@ -886,25 +887,63 @@ export function connectRealtime(
     : import.meta.env.DEV
       ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
       : API_BASE_URL.replace(/^http/, 'ws').replace(/\/api\/v1$/, '');
-  onStatus('connecting');
-  const socket = new WebSocket(`${wsBase}/ws/events?token=${encodeURIComponent(accessToken)}`);
-  const heartbeat = window.setInterval(() => {
-    if (socket.readyState === WebSocket.OPEN) socket.send('ping');
-  }, 30_000);
+  let socket: WebSocket | null = null;
+  let heartbeat: number | null = null;
+  let reconnectTimer: number | null = null;
+  let reconnectAttempt = 0;
+  let stopped = false;
 
-  socket.addEventListener('open', () => onStatus('connected'));
-  socket.addEventListener('message', (event) => {
-    try {
-      onEvent(JSON.parse(event.data) as RealtimeEvent);
-    } catch {
-      // Ignore malformed push messages and keep the connection alive.
-    }
-  });
-  socket.addEventListener('close', () => onStatus('disconnected'));
-  socket.addEventListener('error', () => onStatus('disconnected'));
+  const clearHeartbeat = () => {
+    if (heartbeat !== null) window.clearInterval(heartbeat);
+    heartbeat = null;
+  };
+
+  const connect = () => {
+    if (stopped) return;
+    onStatus('connecting');
+    const nextSocket = new WebSocket(`${wsBase}/ws/events?token=${encodeURIComponent(accessToken)}`);
+    socket = nextSocket;
+
+    nextSocket.addEventListener('open', () => {
+      if (stopped || socket !== nextSocket) return;
+      reconnectAttempt = 0;
+      onStatus('connected');
+      onConnected?.();
+      clearHeartbeat();
+      heartbeat = window.setInterval(() => {
+        if (nextSocket.readyState === WebSocket.OPEN) nextSocket.send('ping');
+      }, 30_000);
+    });
+    nextSocket.addEventListener('message', (event) => {
+      try {
+        onEvent(JSON.parse(event.data) as RealtimeEvent);
+      } catch {
+        // Ignore malformed push messages and keep the connection alive.
+      }
+    });
+    nextSocket.addEventListener('close', () => {
+      if (socket !== nextSocket) return;
+      clearHeartbeat();
+      socket = null;
+      if (stopped) return;
+      onStatus('disconnected');
+      const delay = Math.min(30_000, 1_000 * (2 ** reconnectAttempt));
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(connect, delay);
+    });
+    nextSocket.addEventListener('error', () => {
+      if (nextSocket.readyState !== WebSocket.CLOSED) nextSocket.close();
+    });
+  };
+
+  connect();
 
   return () => {
-    window.clearInterval(heartbeat);
-    socket.close();
+    stopped = true;
+    clearHeartbeat();
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    socket?.close();
+    socket = null;
   };
 }

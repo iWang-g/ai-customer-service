@@ -70,6 +70,19 @@ interface WechatAccount {
 
 interface Window {
   desktopBridge?: {
+    notifyHumanRequired(payload: {
+      items: Array<{
+        conversationId: string;
+        notificationKey: string;
+        platformName: string;
+        shopName: string;
+        customerName: string;
+      }>;
+      messageCenterVisible: boolean;
+      viewingConversationId: string | null;
+    }): Promise<boolean>;
+    clearHumanRequiredNotifications(): Promise<boolean>;
+    onOpenHumanRequiredConversation(listener: (conversationId: string | null) => void): () => void;
     showPlatformContextMenu(payload: { platformCode: 'pinduoduo' | 'wechat'; userId: string }): Promise<boolean>;
     getWechatAccounts(): Promise<WechatAccount[]>;
     identifyWechatAccounts(payload: { localAccountId?: string; force?: boolean }): Promise<{

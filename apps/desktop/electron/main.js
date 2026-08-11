@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PddAccountRegistry } from './platform-workspace/account-registry.js';
@@ -22,6 +22,78 @@ let rpaProcessManager = null;
 let wechatProcessManager = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
+const pendingHumanRequiredNotifications = new Map();
+const shownHumanRequiredNotificationKeys = new Set();
+const activeHumanRequiredNotifications = new Set();
+let humanRequiredNotificationTimer = null;
+
+function focusMessageCenter(conversationId = null) {
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow();
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.webContents.send('desktop:open-human-required-conversation', conversationId);
+}
+
+function flushHumanRequiredNotifications() {
+  humanRequiredNotificationTimer = null;
+  const items = [...pendingHumanRequiredNotifications.values()];
+  pendingHumanRequiredNotifications.clear();
+  if (items.length === 0 || !Notification.isSupported()) return;
+
+  const singleItem = items.length === 1 ? items[0] : null;
+  const notification = new Notification({
+    title: singleItem ? '有新的会话待人工处理' : `${items.length} 个会话待人工处理`,
+    body: singleItem
+      ? [singleItem.platformName, singleItem.shopName, singleItem.customerName].filter(Boolean).join(' · ')
+      : '请打开消息中心查看并及时处理。',
+  });
+  activeHumanRequiredNotifications.add(notification);
+  notification.on('click', () => focusMessageCenter(singleItem?.conversationId || null));
+  notification.on('close', () => activeHumanRequiredNotifications.delete(notification));
+  notification.show();
+}
+
+function queueHumanRequiredNotifications(payload) {
+  if (!Array.isArray(payload?.items)) return false;
+  const suppressConversationId = (
+    mainWindow?.isFocused()
+    && payload.messageCenterVisible === true
+    && typeof payload.viewingConversationId === 'string'
+  ) ? payload.viewingConversationId : null;
+
+  for (const item of payload.items) {
+    if (
+      typeof item?.conversationId !== 'string'
+      || !item.conversationId
+      || typeof item.notificationKey !== 'string'
+      || !item.notificationKey
+      || item.conversationId === suppressConversationId
+      || shownHumanRequiredNotificationKeys.has(item.notificationKey)
+    ) continue;
+    shownHumanRequiredNotificationKeys.add(item.notificationKey);
+    pendingHumanRequiredNotifications.set(item.notificationKey, {
+      conversationId: item.conversationId,
+      platformName: typeof item.platformName === 'string' ? item.platformName.slice(0, 64) : '',
+      shopName: typeof item.shopName === 'string' ? item.shopName.slice(0, 64) : '',
+      customerName: typeof item.customerName === 'string' ? item.customerName.slice(0, 64) : '',
+    });
+  }
+  if (pendingHumanRequiredNotifications.size === 0) return true;
+  if (humanRequiredNotificationTimer) clearTimeout(humanRequiredNotificationTimer);
+  humanRequiredNotificationTimer = setTimeout(flushHumanRequiredNotifications, 2500);
+  return true;
+}
+
+function clearHumanRequiredNotifications() {
+  if (humanRequiredNotificationTimer) clearTimeout(humanRequiredNotificationTimer);
+  humanRequiredNotificationTimer = null;
+  pendingHumanRequiredNotifications.clear();
+  shownHumanRequiredNotificationKeys.clear();
+  for (const notification of activeHumanRequiredNotifications) notification.close();
+  activeHumanRequiredNotifications.clear();
+}
 
 function syncWechatRpaAccounts(accounts = wechatProcessManager?.listAccounts?.() || []) {
   rpaProcessManager?.setPlatformAccounts('wechat', accounts.map((account) => ({
@@ -49,6 +121,13 @@ function isValidAccessToken(value) {
 }
 
 function registerIpcHandlers() {
+  ipcMain.handle('desktop:notify-human-required', (_event, payload) => (
+    queueHumanRequiredNotifications(payload)
+  ));
+  ipcMain.handle('desktop:clear-human-required-notifications', () => {
+    clearHumanRequiredNotifications();
+    return true;
+  });
   ipcMain.handle('desktop:show-platform-context-menu', (event, payload) => {
     if (!['pinduoduo', 'wechat'].includes(payload?.platformCode) || !isValidUserId(payload?.userId)) {
       throw new Error('平台工作区参数无效');
@@ -344,6 +423,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (process.platform === 'win32') app.setAppUserModelId('com.omniai.customer-service');
   pddAccountRegistry = new PddAccountRegistry(app.getPath('userData'));
   wechatProcessManager = new WechatProcessManager({
     registry: new WechatAccountRegistry(app.getPath('userData')),

@@ -1,6 +1,13 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('desktopBridge', {
+  notifyHumanRequired: (payload) => ipcRenderer.invoke('desktop:notify-human-required', payload),
+  clearHumanRequiredNotifications: () => ipcRenderer.invoke('desktop:clear-human-required-notifications'),
+  onOpenHumanRequiredConversation: (listener) => {
+    const handler = (_event, conversationId) => listener(conversationId);
+    ipcRenderer.on('desktop:open-human-required-conversation', handler);
+    return () => ipcRenderer.removeListener('desktop:open-human-required-conversation', handler);
+  },
   showPlatformContextMenu: (payload) => ipcRenderer.invoke('desktop:show-platform-context-menu', payload),
   startRpa: (payload) => ipcRenderer.invoke('desktop:start-rpa', payload),
   closePlatformWorkspaces: () => ipcRenderer.invoke('desktop:close-platform-workspaces'),
