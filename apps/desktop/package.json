@@ -13,6 +13,7 @@
     "smoke:pdd-adapter": "electron scripts/smoke-pdd-adapter.mjs",
     "test:pdd-collector": "node scripts/test-pdd-collector.mjs",
     "test:store-actor": "node scripts/test-store-actor.mjs",
+    "test:wechat-process-manager": "node scripts/test-wechat-process-manager.mjs",
     "start": "electron .",
     "dist": "pnpm build && electron-builder"
   },

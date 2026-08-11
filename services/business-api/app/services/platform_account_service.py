@@ -14,6 +14,7 @@ from app.schemas.platform_account import (
     PlatformAccountRead,
     PlatformAccountUpdate,
 )
+from app.schemas.platform import platform_display_name
 from app.schemas.rpa import PlatformAccountSyncItem
 
 
@@ -62,7 +63,7 @@ def create_or_sync_platform_account(
         account = PlatformAccount(
             user_id=user.id,
             platform_code=request.platform_code,
-            platform_name="拼多多",
+            platform_name=platform_display_name(request.platform_code),
             local_account_id=request.local_account_id,
             account_name=request.account_name.strip(),
             account_alias=(request.account_alias or request.account_name).strip(),
@@ -132,13 +133,20 @@ def sync_platform_accounts_for_node(
     user: User,
     node: RpaNode,
     items: list[PlatformAccountSyncItem],
+    *,
+    platform_code: str = "pinduoduo",
 ) -> list[PlatformAccount]:
+    if any(item.platform_code != platform_code for item in items):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mixed platform account sync is not supported",
+        )
     local_ids = {item.local_account_id for item in items}
     existing = db.scalars(
         select(PlatformAccount).where(
             and_(
                 PlatformAccount.user_id == user.id,
-                PlatformAccount.platform_code == "pinduoduo",
+                PlatformAccount.platform_code == platform_code,
                 PlatformAccount.local_account_id.is_not(None),
             )
         )
@@ -156,7 +164,7 @@ def sync_platform_accounts_for_node(
             db,
             user,
             PlatformAccountCreate(
-                platform_code="pinduoduo",
+                platform_code=platform_code,
                 local_account_id=item.local_account_id,
                 account_name=item.account_name,
                 account_alias=item.account_alias,

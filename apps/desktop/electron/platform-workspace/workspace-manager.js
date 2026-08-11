@@ -1497,7 +1497,7 @@ export class PddWorkspaceManager {
 
   #syncRpaAccounts() {
     if (!this.userId || !this.rpaManager) return;
-    this.rpaManager.setAccounts([
+    this.rpaManager.setPlatformAccounts('pinduoduo', [
       ...this.registry.list(this.userId),
       ...this.registry.list(this.userId, { archived: true }),
     ]);

@@ -23,6 +23,13 @@ contextBridge.exposeInMainWorld('desktopBridge', {
   ),
   sendPddMessage: (payload) => ipcRenderer.invoke('pdd-workspace:send-message', payload),
   sendPddImage: (payload) => ipcRenderer.invoke('pdd-workspace:send-image', payload),
+  getWechatAccounts: () => ipcRenderer.invoke('wechat:get-accounts'),
+  identifyWechatAccounts: (payload) => ipcRenderer.invoke('wechat:identify-accounts', payload),
+  onShowWechatAccounts: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on('wechat:show-accounts', handler);
+    return () => ipcRenderer.removeListener('wechat:show-accounts', handler);
+  },
 });
 
 contextBridge.exposeInMainWorld('pddWorkspace', {

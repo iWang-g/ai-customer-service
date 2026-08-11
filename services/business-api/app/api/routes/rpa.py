@@ -109,7 +109,9 @@ async def sync_platform_accounts(
     user = db.get(User, node.user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    accounts = sync_platform_accounts_for_node(db, user, node, request.accounts)
+    accounts = sync_platform_accounts_for_node(
+        db, user, node, request.accounts, platform_code=request.platform_code
+    )
     response = [PlatformAccountRead.model_validate(account) for account in accounts]
     await realtime_manager.broadcast(
         user.id,

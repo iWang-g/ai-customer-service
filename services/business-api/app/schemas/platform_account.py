@@ -6,9 +6,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.common import PageMeta
+from app.schemas.platform import PlatformCode
 
 
-PlatformCode = Literal["pinduoduo"]
 LoginStatus = Literal[
     "unknown", "login_required", "online", "offline", "risk_control", "error", "paused"
 ]

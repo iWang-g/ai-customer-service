@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.schemas.platform import PlatformCode
 
 class RpaNodeRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -41,6 +42,7 @@ class NodeRegisterResponse(BaseModel):
 
 
 class PlatformAccountSyncItem(BaseModel):
+    platform_code: PlatformCode = "pinduoduo"
     local_account_id: str = Field(min_length=1, max_length=64)
     account_name: str = Field(min_length=1, max_length=128)
     account_alias: str | None = Field(default=None, max_length=128)
@@ -53,13 +55,14 @@ class PlatformAccountSyncItem(BaseModel):
 
 
 class PlatformAccountSyncRequest(BaseModel):
+    platform_code: PlatformCode = "pinduoduo"
     accounts: list[PlatformAccountSyncItem] = Field(default_factory=list, max_length=100)
 
 
 class RpaEventCreate(BaseModel):
     event_id: str = Field(min_length=1)
     event_type: str = Field(min_length=1)
-    platform_code: str = Field(min_length=1)
+    platform_code: PlatformCode
     platform_account_id: str | None = None
     platform_message_id: str | None = None
     conversation_external_id: str | None = None
@@ -77,7 +80,7 @@ class SnapshotMessage(BaseModel):
 
     dom_sequence: int = Field(ge=0, le=9999)
     sender_role: Literal["customer", "agent"]
-    message_type: str = Field(min_length=1, max_length=32)
+    message_type: Literal["text", "image", "emoji", "file", "video", "product", "order"]
     content: str = Field(default="", max_length=100_000)
     image_url: str | None = Field(default=None, max_length=8192)
     image_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")

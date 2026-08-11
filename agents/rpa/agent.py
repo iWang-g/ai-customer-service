@@ -201,7 +201,7 @@ class RpaAgent:
                 "node_key": node_key,
                 "hostname": socket.gethostname(),
                 "machine_name": platform.node() or None,
-                "supported_platforms": ["pinduoduo"],
+                "supported_platforms": ["pinduoduo", "wechat"],
                 "app_version": "0.1.0",
             },
         )
@@ -235,10 +235,12 @@ class RpaAgent:
         )
 
     def sync_accounts(self) -> None:
-        payload = []
+        payloads: dict[str, list[dict[str, Any]]] = {"pinduoduo": [], "wechat": []}
         for account in self.accounts:
-            payload.append(
+            platform_code = str(account.get("platform_code") or "pinduoduo")
+            payloads.setdefault(platform_code, []).append(
                 {
+                    "platform_code": platform_code,
                     "local_account_id": account["id"],
                     "account_name": account.get("account_name") or account["alias"],
                     "account_alias": account["alias"],
@@ -248,24 +250,27 @@ class RpaAgent:
                     "metadata_json": {
                         "workspace_partition": account.get("partition"),
                         "paused": bool(account.get("paused")),
+                        **dict(account.get("metadata_json") or {}),
                     },
                 }
             )
-        responses = self.request(
-            "POST",
-            "/rpa/platform-accounts/sync",
-            {"accounts": payload},
-            node_auth=True,
-        )
         bindings = []
-        for response in responses:
-            bindings.append(
-                {
-                    "local_account_id": response["local_account_id"],
-                    "platform_account_id": response["id"],
-                    "login_status": response["login_status"],
-                }
+        for platform_code, payload in payloads.items():
+            responses = self.request(
+                "POST",
+                "/rpa/platform-accounts/sync",
+                {"platform_code": platform_code, "accounts": payload},
+                node_auth=True,
             )
+            for response in responses:
+                bindings.append(
+                    {
+                        "platform_code": platform_code,
+                        "local_account_id": response["local_account_id"],
+                        "platform_account_id": response["id"],
+                        "login_status": response["login_status"],
+                    }
+                )
         self.emit("accounts_synced", bindings=bindings)
 
     def flush_events(self) -> None:

@@ -20,6 +20,7 @@ export class RpaProcessManager extends EventEmitter {
     this.userId = null;
     this.accessToken = null;
     this.accounts = [];
+    this.accountsByPlatform = new Map();
     this.pendingEvents = new Map();
     this.pendingConversationClears = new Map();
     this.buffer = '';
@@ -47,8 +48,13 @@ export class RpaProcessManager extends EventEmitter {
   }
 
   setAccounts(accounts) {
-    this.accounts = accounts.map((account) => ({
+    this.setPlatformAccounts('pinduoduo', accounts);
+  }
+
+  setPlatformAccounts(platformCode, accounts) {
+    const normalized = accounts.map((account) => ({
       id: account.id,
+      platform_code: platformCode,
       alias: account.alias,
       partition: account.partition,
       paused: Boolean(account.paused || account.archivedAt),
@@ -58,7 +64,16 @@ export class RpaProcessManager extends EventEmitter {
       login_status: account.paused || account.archivedAt
         ? 'paused'
         : account.loginStatus === 'account_mismatch' ? 'error' : account.loginStatus || 'unknown',
+      metadata_json: account.metadataJson || {
+        process_id: account.processId || null,
+        window_handle: account.windowHandle || null,
+        wechat_name: account.wechatName || null,
+        wechat_id: account.wechatId || null,
+        identity_source: account.identitySource || null,
+      },
     }));
+    this.accountsByPlatform.set(platformCode, normalized);
+    this.accounts = [...this.accountsByPlatform.values()].flat();
     this.#send({ type: 'sync_accounts', accounts: this.accounts });
   }
 
@@ -99,6 +114,8 @@ export class RpaProcessManager extends EventEmitter {
     this.userId = null;
     this.accessToken = null;
     this.pendingEvents.clear();
+    this.accounts = [];
+    this.accountsByPlatform.clear();
     for (const pending of this.pendingConversationClears.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('RPA process stopped before conversation events were cleared'));

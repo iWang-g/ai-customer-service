@@ -34,7 +34,7 @@ interface PddImportCandidate {
   id: string;
   accountId: string;
   platformAccountId: string | null;
-  platformCode: 'pinduoduo';
+  platformCode: 'pinduoduo' | 'wechat';
   platformName: string;
   shopName: string;
   conversationKey: string;
@@ -45,9 +45,38 @@ interface PddImportCandidate {
   active: boolean;
 }
 
+interface WechatAccount {
+  localAccountId: string;
+  externalAccountId: string | null;
+  platformAccountId: string | null;
+  wechatName: string | null;
+  wechatId: string | null;
+  alias: string;
+  processId: number | null;
+  lastKnownProcessId: number | null;
+  windowHandle: number | null;
+  executablePath: string | null;
+  loginStatus: string;
+  healthStatus: string;
+  identityStatus: string;
+  identitySource: string | null;
+  identityDetail: string | null;
+  identityLastCheckedAt: string | null;
+  identityProbeStatus: string | null;
+  createdAt: string;
+  lastSeenAt: string | null;
+  disconnectedAt: string | null;
+}
+
 interface Window {
   desktopBridge?: {
-    showPlatformContextMenu(payload: { platformCode: 'pinduoduo'; userId: string }): Promise<boolean>;
+    showPlatformContextMenu(payload: { platformCode: 'pinduoduo' | 'wechat'; userId: string }): Promise<boolean>;
+    getWechatAccounts(): Promise<WechatAccount[]>;
+    identifyWechatAccounts(payload: { localAccountId?: string; force?: boolean }): Promise<{
+      accounts: WechatAccount[];
+      results: Array<{ localAccountId: string; status: string }>;
+    }>;
+    onShowWechatAccounts(listener: () => void): () => void;
     startRpa(payload: { userId: string; accessToken: string }): Promise<{
       status: string;
       nodeId?: string | null;

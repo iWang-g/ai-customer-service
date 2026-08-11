@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from uuid import uuid4
 
-from agent import EventQueue
+from agent import EventQueue, RpaAgent
 
 
 class EventQueueTests(unittest.TestCase):
@@ -61,6 +61,55 @@ class EventQueueTests(unittest.TestCase):
         self.assertEqual(queue.pending(), [other])
         queue.connection.close()
 
+
+class AccountSyncTests(unittest.TestCase):
+    def test_accounts_are_synced_in_platform_isolated_batches(self) -> None:
+        agent = RpaAgent()
+        agent.accounts = [
+            {
+                "id": "pdd-local",
+                "platform_code": "pinduoduo",
+                "alias": "PDD Shop",
+                "external_account_id": "pdd-1",
+                "login_status": "online",
+            },
+            {
+                "id": "wechat-local",
+                "platform_code": "wechat",
+                "alias": "WeChat Name",
+                "external_account_id": "wechat:hash",
+                "login_status": "online",
+                "metadata_json": {"wechat_id": "wx-id"},
+            },
+        ]
+        requests: list[dict] = []
+        emitted: list[dict] = []
+
+        def request(_method, _path, payload, *, node_auth=False):
+            requests.append({"payload": payload, "node_auth": node_auth})
+            return [
+                {
+                    "local_account_id": item["local_account_id"],
+                    "id": f"server-{item['local_account_id']}",
+                    "login_status": item["login_status"],
+                }
+                for item in payload["accounts"]
+            ]
+
+        agent.request = request  # type: ignore[method-assign]
+        agent.emit = lambda message_type, **payload: emitted.append(  # type: ignore[method-assign]
+            {"type": message_type, **payload}
+        )
+
+        agent.sync_accounts()
+
+        self.assertEqual([item["payload"]["platform_code"] for item in requests], ["pinduoduo", "wechat"])
+        self.assertEqual(requests[1]["payload"]["accounts"][0]["metadata_json"]["wechat_id"], "wx-id")
+        self.assertTrue(all(item["node_auth"] for item in requests))
+        self.assertEqual(
+            [item["platform_code"] for item in emitted[0]["bindings"]],
+            ["pinduoduo", "wechat"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

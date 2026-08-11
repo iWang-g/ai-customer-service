@@ -32,16 +32,10 @@ from app.schemas.message import (
     SendMessageRequest,
     SendMessageResponse,
 )
+from app.schemas.platform import PLATFORM_DISPLAY_NAMES
 from app.services.message_queue_service import append_message
 
 
-PLATFORM_DISPLAY_NAMES = {
-    "pinduoduo": "拼多多",
-    "qianniu": "千牛",
-    "douyin": "抖音",
-    "kuaishou": "快手",
-    "xiaohongshu": "小红书",
-}
 PLACEHOLDER_SHOP_NAMES = {
     "待识别店铺名称",
     "拼多多",

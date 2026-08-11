@@ -55,8 +55,8 @@ def _conversation_for_snapshot(
     user: User,
     request: RpaEventCreate,
 ) -> Conversation:
-    if request.platform_code != "pinduoduo":
-        raise SnapshotProtocolError("message_snapshot currently supports pinduoduo only")
+    if request.platform_code not in {"pinduoduo", "wechat"}:
+        raise SnapshotProtocolError("unsupported platform for message_snapshot")
     if not request.platform_account_id:
         raise SnapshotProtocolError("platform_account_id is required")
     external_id = str(request.conversation_external_id or "").strip()

@@ -1,10 +1,12 @@
-import { app, BrowserWindow, ipcMain, Menu, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PddAccountRegistry } from './platform-workspace/account-registry.js';
 import { PddWorkspaceManager } from './platform-workspace/workspace-manager.js';
 import { PddDiagnosticLogger } from './platform-workspace/pinduoduo/diagnostic-logger.js';
 import { RpaProcessManager } from './rpa/process-manager.js';
+import { WechatAccountRegistry } from './wechat/account-registry.js';
+import { WechatProcessManager } from './wechat/process-manager.js';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
@@ -17,8 +19,18 @@ let mainWindow = null;
 let pddWorkspaceManager = null;
 let pddAccountRegistry = null;
 let rpaProcessManager = null;
+let wechatProcessManager = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
+
+function syncWechatRpaAccounts(accounts = wechatProcessManager?.listAccounts?.() || []) {
+  rpaProcessManager?.setPlatformAccounts('wechat', accounts.map((account) => ({
+    ...account,
+    id: account.localAccountId,
+    alias: account.wechatName || account.alias,
+    platformAccountName: account.wechatName || account.alias,
+  })));
+}
 
 function isValidUserId(value) {
   return typeof value === 'string' && value.length > 0 && value.length <= 128;
@@ -28,22 +40,83 @@ function isValidAccountId(value) {
   return typeof value === 'string' && /^[0-9a-f-]{36}$/i.test(value);
 }
 
+function isValidWechatLocalAccountId(value) {
+  return typeof value === 'string' && /^wechat-[0-9a-f-]{36}$/i.test(value);
+}
+
 function isValidAccessToken(value) {
   return typeof value === 'string' && value.length >= 32 && value.length <= 8192;
 }
 
 function registerIpcHandlers() {
   ipcMain.handle('desktop:show-platform-context-menu', (event, payload) => {
-    if (payload?.platformCode !== 'pinduoduo' || !isValidUserId(payload?.userId)) {
+    if (!['pinduoduo', 'wechat'].includes(payload?.platformCode) || !isValidUserId(payload?.userId)) {
       throw new Error('平台工作区参数无效');
     }
     const ownerWindow = BrowserWindow.fromWebContents(event.sender) || mainWindow;
-    const menu = Menu.buildFromTemplate([
-      {
-        label: '打开原平台工作区',
-        click: () => void pddWorkspaceManager.open(payload.userId),
+    const openPlatformItem = {
+      label: payload.platformCode === 'wechat' ? '打开微信登录窗口' : '打开原平台工作区',
+      click: () => {
+        if (payload.platformCode === 'wechat') {
+          void (async () => {
+            try {
+              const result = await wechatProcessManager.openLogin();
+              if (result.status === 'no_new_instance') {
+                await dialog.showMessageBox(ownerWindow || undefined, {
+                  type: 'warning',
+                  title: '未检测到新的微信窗口',
+                  message: '微信已启动，但未产生新的登录窗口。请稍后重试或检查当前微信版本的多开行为。',
+                });
+              }
+            } catch (error) {
+              if (error?.code !== 'WECHAT_EXECUTABLE_NOT_FOUND') {
+                await dialog.showMessageBox(ownerWindow || undefined, {
+                  type: 'error',
+                  title: '微信启动失败',
+                  message: error instanceof Error ? error.message : String(error),
+                });
+                return;
+              }
+              const selection = await dialog.showOpenDialog(ownerWindow || undefined, {
+                title: '选择微信程序',
+                properties: ['openFile'],
+                filters: [{ name: '微信程序', extensions: ['exe'] }],
+              });
+              if (selection.canceled || !selection.filePaths[0]) return;
+              wechatProcessManager.setExecutablePath(selection.filePaths[0]);
+              try {
+                const result = await wechatProcessManager.openLogin();
+                if (result.status === 'no_new_instance') {
+                  await dialog.showMessageBox(ownerWindow || undefined, {
+                    type: 'warning',
+                    title: '未检测到新的微信窗口',
+                    message: '微信已启动，但未产生新的登录窗口。请稍后重试或检查当前微信版本的多开行为。',
+                  });
+                }
+              } catch (retryError) {
+                await dialog.showMessageBox(ownerWindow || undefined, {
+                  type: 'error',
+                  title: '微信启动失败',
+                  message: retryError instanceof Error ? retryError.message : String(retryError),
+                });
+              }
+            }
+          })();
+          return;
+        }
+        void pddWorkspaceManager.open(payload.userId);
       },
-    ]);
+    };
+    const menu = Menu.buildFromTemplate(payload.platformCode === 'wechat'
+      ? [
+          openPlatformItem,
+          { type: 'separator' },
+          {
+            label: '查看已登录账号',
+            click: () => ownerWindow?.webContents.send('wechat:show-accounts'),
+          },
+        ]
+      : [openPlatformItem]);
     menu.popup({ window: ownerWindow || undefined });
     return true;
   });
@@ -54,15 +127,27 @@ function registerIpcHandlers() {
     }
     await pddWorkspaceManager.bindUser(payload.userId);
     await rpaProcessManager.start({ userId: payload.userId, accessToken: payload.accessToken });
-    rpaProcessManager.setAccounts([
+    rpaProcessManager.setPlatformAccounts('pinduoduo', [
       ...pddAccountRegistry.list(payload.userId),
       ...pddAccountRegistry.list(payload.userId, { archived: true }),
     ]);
+    syncWechatRpaAccounts();
     return rpaProcessManager.getState();
   });
   ipcMain.handle('desktop:close-platform-workspaces', async () => {
     await pddWorkspaceManager.closeForLogout();
     await rpaProcessManager.stop();
+  });
+  ipcMain.handle('wechat:get-accounts', () => wechatProcessManager.refreshAccounts());
+  ipcMain.handle('wechat:identify-accounts', (_event, payload) => {
+    const localAccountId = payload?.localAccountId || null;
+    if (localAccountId && !isValidWechatLocalAccountId(localAccountId)) {
+      throw new Error('微信账号参数无效');
+    }
+    return wechatProcessManager.identifyAccounts({
+      localAccountId,
+      force: Boolean(payload?.force),
+    });
   });
   ipcMain.handle('pdd-workspace:get-state', () => pddWorkspaceManager.getState());
   ipcMain.handle('pdd-workspace:add-account', () =>
@@ -260,6 +345,10 @@ function createWindow() {
 
 app.whenReady().then(() => {
   pddAccountRegistry = new PddAccountRegistry(app.getPath('userData'));
+  wechatProcessManager = new WechatProcessManager({
+    registry: new WechatAccountRegistry(app.getPath('userData')),
+    onAccountsChanged: (accounts) => syncWechatRpaAccounts(accounts),
+  });
   const pddDiagnosticLogger = new PddDiagnosticLogger(diagnosticLogDirectory);
   pddDiagnosticLogger.write('system', {
     type: 'diagnostic',
@@ -277,6 +366,16 @@ app.whenReady().then(() => {
     apiBaseUrl: process.env.BUSINESS_API_URL || 'http://127.0.0.1:8001/api/v1',
     pythonExecutable: process.env.RPA_PYTHON_PATH || 'python',
   });
+  rpaProcessManager.on('bindings', (bindings) => {
+    for (const binding of bindings) {
+      if (binding.platform_code !== 'wechat') continue;
+      wechatProcessManager.registry?.bindPlatformAccount(
+        binding.local_account_id,
+        binding.platform_account_id,
+        binding.login_status,
+      );
+    }
+  });
   pddWorkspaceManager = new PddWorkspaceManager({
     registry: pddAccountRegistry,
     devServerUrl,
@@ -288,6 +387,9 @@ app.whenReady().then(() => {
   });
   registerIpcHandlers();
   createWindow();
+  void wechatProcessManager.startMonitoring().catch((error) => {
+    console.error('微信账号恢复失败:', error);
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -303,6 +405,7 @@ app.on('before-quit', (event) => {
     pddWorkspaceManager ? pddWorkspaceManager.prepareToQuit() : Promise.resolve(),
     rpaProcessManager ? rpaProcessManager.stop() : Promise.resolve(),
   ]);
+  wechatProcessManager?.stopMonitoring();
   void shutdownPromise.finally(() => {
     shutdownComplete = true;
     app.quit();

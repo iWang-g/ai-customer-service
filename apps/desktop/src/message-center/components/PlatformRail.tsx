@@ -16,9 +16,10 @@ import {
   Settings,
   LogOut
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import customerServiceAvatar from '../../shared/assets/customer-service-avatar.svg';
 import DevelopmentNotice from './DevelopmentNotice';
+import WechatAccountsModal from './WechatAccountsModal';
 
 interface PlatformRailProps {
   selectedPlatform: string;
@@ -35,7 +36,7 @@ const platformIcons: Record<string, any> = {
   all: MessagesSquare,
   qianniu: Store,
   pinduoduo: ShoppingBag,
-  personal_wechat: MessageCircle,
+  wechat: MessageCircle,
   qq: MessagesSquare,
   douyin: Video,
   kuaishou: Play,
@@ -46,7 +47,7 @@ const platformThemes: Record<string, { bg: string, text: string, shadow: string,
   all: { bg: 'bg-indigo-600', text: 'text-white', shadow: 'shadow-indigo-500/40', glow: 'bg-indigo-500' },
   qianniu: { bg: 'bg-blue-500', text: 'text-white', shadow: 'shadow-blue-500/40', glow: 'bg-blue-400' },
   pinduoduo: { bg: 'bg-rose-600', text: 'text-white', shadow: 'shadow-rose-600/40', glow: 'bg-rose-500' },
-  personal_wechat: { bg: 'bg-emerald-500', text: 'text-white', shadow: 'shadow-emerald-500/40', glow: 'bg-emerald-400' },
+  wechat: { bg: 'bg-emerald-500', text: 'text-white', shadow: 'shadow-emerald-500/40', glow: 'bg-emerald-400' },
   qq: { bg: 'bg-sky-500', text: 'text-white', shadow: 'shadow-sky-500/40', glow: 'bg-sky-400' },
   douyin: { bg: 'bg-slate-900', text: 'text-white', shadow: 'shadow-slate-400/30', glow: 'bg-slate-400' },
   kuaishou: { bg: 'bg-orange-500', text: 'text-white', shadow: 'shadow-orange-500/40', glow: 'bg-orange-400' },
@@ -57,7 +58,7 @@ const railPlatforms = [
   { id: 'all', name: '全部' },
   { id: 'qianniu', name: '千牛' },
   { id: 'pinduoduo', name: '拼多多' },
-  { id: 'personal_wechat', name: '个人微信' },
+  { id: 'wechat', name: '个人微信' },
   { id: 'qq', name: 'QQ' },
   { id: 'douyin', name: '抖音' },
   { id: 'kuaishou', name: '快手' },
@@ -67,6 +68,9 @@ const railPlatforms = [
 export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpenAdmin, onLogout, userName, userId, userRole, lang }: PlatformRailProps) {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [developmentNoticeTrigger, setDevelopmentNoticeTrigger] = useState(0);
+  const [isWechatAccountsOpen, setIsWechatAccountsOpen] = useState(false);
+
+  useEffect(() => window.desktopBridge?.onShowWechatAccounts(() => setIsWechatAccountsOpen(true)), []);
 
   const t = {
     zh: {
@@ -97,11 +101,11 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
               key={p.id}
               onClick={() => onPlatformSelect(p.id)}
               onContextMenu={(event) => {
-                if (p.id !== 'pinduoduo') return;
+                if (p.id !== 'pinduoduo' && p.id !== 'wechat') return;
                 event.preventDefault();
                 void window.desktopBridge
-                  ?.showPlatformContextMenu({ platformCode: 'pinduoduo', userId })
-                  .catch((error) => console.error('打开拼多多工作区菜单失败:', error));
+                  ?.showPlatformContextMenu({ platformCode: p.id as 'pinduoduo' | 'wechat', userId })
+                  .catch((error) => console.error('打开平台菜单失败:', error));
               }}
               className={`group relative flex flex-col items-center gap-1.5 transition-all focus:outline-none w-full`}
               id={`rail-platform-${p.id}`}
@@ -231,6 +235,7 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
         trigger={developmentNoticeTrigger}
         message={lang === 'zh' ? '设置助手功能开发中' : 'Assistant settings are under development'}
       />
+      <WechatAccountsModal isOpen={isWechatAccountsOpen} onClose={() => setIsWechatAccountsOpen(false)} />
     </div>
   );
 }
