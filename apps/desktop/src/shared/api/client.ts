@@ -1,9 +1,12 @@
 const API_BASE_URL = (
+  window.desktopConfig?.businessApiUrl ||
   import.meta.env.VITE_API_BASE_URL ||
   (import.meta.env.DEV ? '/api/v1' : 'http://127.0.0.1:8001/api/v1')
 ).replace(/\/$/, '');
 const SESSION_STORAGE_KEY = 'ai-customer-service.auth';
+const SESSION_CHANGE_EVENT = 'ai-customer-service.session-change';
 const KNOWLEDGE_BASE_URL = (
+  window.desktopConfig?.knowledgeBaseUrl ||
   import.meta.env.VITE_KB_BASE_URL ||
   (import.meta.env.DEV ? '/kb-api/api/v1' : 'http://127.0.0.1:8010/api/v1')
 ).replace(/\/$/, '');
@@ -45,7 +48,38 @@ export interface ApiConversation {
   human_required_reason: string | null;
   human_required_word: string | null;
   human_required_at: string | null;
+  messages_cleared_sequence: number;
+  deleted_at: string | null;
   metadata_json: Record<string, unknown>;
+  message_sync_issue?: MessageSyncIssue | null;
+}
+
+export interface MessageSyncIssue {
+  observation_id: string;
+  first_detected_at: string;
+  latest_detected_at: string;
+  unread: boolean;
+  message_count: number;
+  consecutive_failure_count: number;
+  requires_attention: boolean;
+  dismissed_at: string | null;
+}
+
+export interface MessageSyncIssueSnapshotMessage {
+  dom_sequence: number;
+  sender_role: string;
+  message_type: string;
+  content: string;
+  display_mode: string;
+  automation_mode: string;
+  time_label: string | null;
+  structured_payload: Record<string, unknown> | null;
+}
+
+export interface MessageSyncIssueDetail {
+  conversation_id: string;
+  issue: MessageSyncIssue;
+  messages: MessageSyncIssueSnapshotMessage[];
 }
 
 export interface ApiMessage {
@@ -110,31 +144,15 @@ export interface CustomerOrdersResponse {
   }>;
 }
 
-export interface AiConfig {
-  provider: 'deepseek';
-  base_url: string;
-  model: 'deepseek-chat' | 'deepseek-reasoner';
-  api_key_masked: string;
-  enabled: boolean;
-  temperature: number;
-  updated_at: string | null;
-}
-
-export interface AiConfigInput {
-  provider: 'deepseek';
-  base_url: string;
-  model: 'deepseek-chat' | 'deepseek-reasoner';
-  api_key: string;
-  enabled: boolean;
-  temperature: number;
-}
-
-export interface AiConfigTestResult {
-  ok: boolean;
+export interface AiModel {
   provider: string;
-  model: string;
-  message: string;
+  model_id: string;
+  display_name: string;
+  available: boolean;
+  fetched_at: string;
 }
+
+export interface AiModelList { items: AiModel[]; }
 
 export interface EmailConfig {
   enabled: boolean;
@@ -291,6 +309,12 @@ export interface KnowledgeBaseSummary {
   kind: 'qa' | 'product' | 'tone';
   persona: string;
   enabled: boolean;
+  is_public: boolean;
+  owner_user_id: string;
+  owner_username: string;
+  owner_display_name: string;
+  is_owner: boolean;
+  read_only: boolean;
   item_count: number;
   created_at: string;
   updated_at: string;
@@ -305,6 +329,7 @@ export interface KnowledgeDocument {
   file_size: number;
   status: string;
   chunk_count: number;
+  chunk_strategy_version: string;
   error_message: string;
   created_at: string;
   updated_at: string;
@@ -313,6 +338,9 @@ export interface KnowledgeDocument {
 
 export interface KnowledgeDocumentDetail extends KnowledgeDocument {
   content: string;
+  chunk_type: string;
+  metadata: Record<string, unknown>;
+  strategy_version: string;
 }
 
 export interface KnowledgeDocumentChunk {
@@ -431,6 +459,15 @@ interface PageResponse<T> {
 export interface RealtimeEvent {
   type: string;
   message?: ApiMessage;
+  task?: {
+    id: string;
+    conversation_id: string | null;
+    message_id: string | null;
+    task_type: string;
+    status: string;
+    result_json: Record<string, unknown>;
+    error_message: string | null;
+  };
   [key: string]: unknown;
 }
 
@@ -447,12 +484,23 @@ function formatErrorDetail(detail: unknown): string {
   return '请求失败，请稍后重试';
 }
 
+export class ApiRequestError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
+
+export function isAuthenticationError(error: unknown): boolean {
+  return error instanceof ApiRequestError && (error.status === 401 || error.status === 403);
+}
+
 async function parseError(response: Response): Promise<Error> {
   try {
     const payload = (await response.json()) as { detail?: unknown };
-    return new Error(formatErrorDetail(payload.detail));
+    return new ApiRequestError(formatErrorDetail(payload.detail), response.status);
   } catch {
-    return new Error(`请求失败 (${response.status})`);
+    return new ApiRequestError(`请求失败 (${response.status})`, response.status);
   }
 }
 
@@ -468,10 +516,20 @@ export function getStoredSession(): AuthSession | null {
 
 export function storeSession(session: AuthSession): void {
   localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  window.dispatchEvent(new CustomEvent<AuthSession | null>(SESSION_CHANGE_EVENT, { detail: session }));
 }
 
 export function clearStoredSession(): void {
   localStorage.removeItem(SESSION_STORAGE_KEY);
+  window.dispatchEvent(new CustomEvent<AuthSession | null>(SESSION_CHANGE_EVENT, { detail: null }));
+}
+
+export function subscribeToSessionChanges(listener: (session: AuthSession | null) => void): () => void {
+  const handleChange = (event: Event) => {
+    listener((event as CustomEvent<AuthSession | null>).detail);
+  };
+  window.addEventListener(SESSION_CHANGE_EVENT, handleChange);
+  return () => window.removeEventListener(SESSION_CHANGE_EVENT, handleChange);
 }
 
 async function refreshSession(): Promise<AuthSession | null> {
@@ -483,10 +541,11 @@ async function refreshSession(): Promise<AuthSession | null> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: current.refresh_token }),
     });
-    if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
       clearStoredSession();
       return null;
     }
+    if (!response.ok) return null;
     const refreshed = (await response.json()) as AuthSession;
     storeSession(refreshed);
     return refreshed;
@@ -519,20 +578,32 @@ async function apiRequest<T>(
   if (response.status === 401 && requireAuth && retryAfterRefresh) {
     const refreshed = await refreshSession();
     if (refreshed) return apiRequest<T>(path, init, true, false);
+    if (getStoredSession()) throw new Error('服务暂时无法刷新登录状态，请稍后重试');
   }
   if (!response.ok) throw await parseError(response);
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 
-async function knowledgeRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function knowledgeRequest<T>(
+  path: string,
+  init: RequestInit = {},
+  retryAfterRefresh = true,
+): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
+  const session = getStoredSession();
+  if (!session) throw new Error('登录状态已失效，请重新登录');
+  headers.set('Authorization', `Bearer ${session.access_token}`);
   let response: Response;
   try {
     response = await fetch(`${KNOWLEDGE_BASE_URL}${path}`, { ...init, headers });
   } catch {
     throw new Error('无法连接知识库服务，请确认 8010 端口已启动');
+  }
+  if (response.status === 401 && retryAfterRefresh) {
+    const refreshed = await refreshSession();
+    if (refreshed) return knowledgeRequest<T>(path, init, false);
   }
   if (!response.ok) throw await parseError(response);
   return (await response.json()) as T;
@@ -546,14 +617,6 @@ export function login(username: string, password: string): Promise<AuthSession> 
   );
 }
 
-export function register(username: string, displayName: string, password: string): Promise<AuthSession> {
-  return apiRequest<AuthSession>(
-    '/auth/register',
-    { method: 'POST', body: JSON.stringify({ username, display_name: displayName, password }) },
-    false,
-  );
-}
-
 export function getCurrentUser(): Promise<ApiUser> {
   return apiRequest<ApiUser>('/auth/me');
 }
@@ -562,20 +625,12 @@ export function logout(): Promise<{ message: string }> {
   return apiRequest<{ message: string }>('/auth/logout', { method: 'POST' });
 }
 
-export function getAiConfig(): Promise<AiConfig> {
-  return apiRequest<AiConfig>('/ai-config');
+export function listAiModels(): Promise<AiModelList> {
+  return apiRequest<AiModelList>('/ai-models');
 }
 
-export function saveAiConfig(input: AiConfigInput): Promise<AiConfig> {
-  return apiRequest<AiConfig>('/ai-config', { method: 'PUT', body: JSON.stringify(input) });
-}
-
-export function testAiConfig(input: AiConfigInput): Promise<AiConfigTestResult> {
-  return apiRequest<AiConfigTestResult>('/ai-config/test', { method: 'POST', body: JSON.stringify(input) });
-}
-
-export function testSavedAiConfig(): Promise<AiConfigTestResult> {
-  return apiRequest<AiConfigTestResult>('/ai-config/test-saved', { method: 'POST' });
+export function syncAiModels(): Promise<AiModelList> {
+  return apiRequest<AiModelList>('/ai-models/sync', { method: 'POST' });
 }
 
 export function getUserSettings(): Promise<UserSettings> {
@@ -654,16 +709,17 @@ export function createKnowledgeBase(
   name: string,
   kind: 'product' | 'qa' | 'tone',
   persona = '',
+  isPublic = false,
 ): Promise<KnowledgeBaseSummary> {
   return knowledgeRequest<KnowledgeBaseSummary>('/knowledge-bases', {
     method: 'POST',
-    body: JSON.stringify({ name, kind, persona }),
+    body: JSON.stringify({ name, kind, persona, is_public: isPublic }),
   });
 }
 
 export function updateKnowledgeBase(
   id: string,
-  input: { name?: string; persona?: string; enabled?: boolean },
+  input: { name?: string; persona?: string; enabled?: boolean; is_public?: boolean },
 ): Promise<KnowledgeBaseSummary> {
   return knowledgeRequest<KnowledgeBaseSummary>(`/knowledge-bases/${encodeURIComponent(id)}`, {
     method: 'PATCH',
@@ -752,6 +808,22 @@ export function getQaImageUrl(imageUrl: string): string {
   return `${KNOWLEDGE_BASE_URL}${imageUrl.startsWith('/') ? '' : '/'}${imageUrl}`;
 }
 
+export async function loadQaImageUrl(imageUrl: string): Promise<string> {
+  const url = getQaImageUrl(imageUrl);
+  if (!url.includes('/api/v1/qa-assets/')) return url;
+  const session = getStoredSession();
+  if (!session) throw new Error('登录状态已失效，请重新登录');
+  let response = await fetch(url, { headers: { Authorization: `Bearer ${session.access_token}` } });
+  if (response.status === 401) {
+    const refreshed = await refreshSession();
+    if (refreshed) {
+      response = await fetch(url, { headers: { Authorization: `Bearer ${refreshed.access_token}` } });
+    }
+  }
+  if (!response.ok) throw await parseError(response);
+  return URL.createObjectURL(await response.blob());
+}
+
 export function listProductDocuments(baseId: string): Promise<KnowledgeDocument[]> {
   return knowledgeRequest<KnowledgeDocument[]>(`/knowledge-bases/${encodeURIComponent(baseId)}/documents`);
 }
@@ -780,6 +852,12 @@ export function importProductDocument(baseId: string, file: File): Promise<Knowl
 
 export function deleteKnowledgeDocument(documentId: string): Promise<KnowledgeDocument> {
   return knowledgeRequest<KnowledgeDocument>(`/documents/${encodeURIComponent(documentId)}`, { method: 'DELETE' });
+}
+
+export function reprocessKnowledgeDocument(documentId: string): Promise<KnowledgeDocument> {
+  return knowledgeRequest<KnowledgeDocument>(`/documents/${encodeURIComponent(documentId)}/reprocess`, {
+    method: 'POST',
+  });
 }
 
 export function listRobots(): Promise<ApiRobot[]> {
@@ -822,6 +900,46 @@ export function clearConversationHumanRequired(conversationId: string): Promise<
   );
 }
 
+export function clearConversationHistory(conversationId: string): Promise<{ conversation: ApiConversation }> {
+  return apiRequest(`/conversations/${encodeURIComponent(conversationId)}/clear-history`, {
+    method: 'POST',
+  });
+}
+
+export function deleteConversation(conversationId: string): Promise<{ conversation: ApiConversation }> {
+  return apiRequest(`/conversations/${encodeURIComponent(conversationId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function getConversationMessageSyncIssue(
+  conversationId: string,
+): Promise<MessageSyncIssueDetail> {
+  return apiRequest<MessageSyncIssueDetail>(
+    `/conversations/${encodeURIComponent(conversationId)}/message-sync-issue`,
+  );
+}
+
+export function dismissConversationMessageSyncIssue(
+  conversationId: string,
+): Promise<{ conversation: ApiConversation }> {
+  return apiRequest<{ conversation: ApiConversation }>(
+    `/conversations/${encodeURIComponent(conversationId)}/message-sync-issue/dismiss`,
+    { method: 'POST' },
+  );
+}
+
+export function rebuildConversationMessageQueue(conversationId: string): Promise<{
+  conversation: ApiConversation;
+  messages: ApiMessage[];
+  deleted_counts: Record<string, number>;
+}> {
+  return apiRequest(
+    `/conversations/${encodeURIComponent(conversationId)}/message-sync-issue/rebuild`,
+    { method: 'POST' },
+  );
+}
+
 export function resetConversationTestData(conversationId: string): Promise<{
   conversation: ApiConversation;
   deleted_counts: Record<string, number>;
@@ -849,6 +967,8 @@ export function recordSentMessage(
   conversationId: string,
   content: string,
   platformMessageId?: string | null,
+  clientMessageId?: string | null,
+  mediaType: 'text' | 'image' = 'text',
 ): Promise<{ message: ApiMessage }> {
   return apiRequest<{ message: ApiMessage }>('/messages/record-sent', {
     method: 'POST',
@@ -856,6 +976,8 @@ export function recordSentMessage(
       conversation_id: conversationId,
       content,
       platform_message_id: platformMessageId || null,
+      client_message_id: clientMessageId || null,
+      media_type: mediaType,
     }),
   });
 }
@@ -881,7 +1003,7 @@ export function connectRealtime(
   onStatus: (status: 'connecting' | 'connected' | 'disconnected') => void,
   onConnected?: () => void,
 ): () => void {
-  const configured = import.meta.env.VITE_WS_URL as string | undefined;
+  const configured = window.desktopConfig?.websocketUrl || import.meta.env.VITE_WS_URL as string | undefined;
   const wsBase = configured
     ? configured.replace(/\/$/, '')
     : import.meta.env.DEV
@@ -892,21 +1014,26 @@ export function connectRealtime(
   let reconnectTimer: number | null = null;
   let reconnectAttempt = 0;
   let stopped = false;
+  let hasConnected = false;
 
   const clearHeartbeat = () => {
     if (heartbeat !== null) window.clearInterval(heartbeat);
     heartbeat = null;
   };
 
-  const connect = () => {
+  const connect = async (refreshBeforeConnect = false) => {
     if (stopped) return;
-    onStatus('connecting');
-    const nextSocket = new WebSocket(`${wsBase}/ws/events?token=${encodeURIComponent(accessToken)}`);
+    if (!hasConnected && reconnectAttempt === 0) onStatus('connecting');
+    const refreshed = refreshBeforeConnect ? await refreshSession() : null;
+    if (stopped) return;
+    const currentAccessToken = refreshed?.access_token || getStoredSession()?.access_token || accessToken;
+    const nextSocket = new WebSocket(`${wsBase}/ws/events?token=${encodeURIComponent(currentAccessToken)}`);
     socket = nextSocket;
 
     nextSocket.addEventListener('open', () => {
       if (stopped || socket !== nextSocket) return;
       reconnectAttempt = 0;
+      hasConnected = true;
       onStatus('connected');
       onConnected?.();
       clearHeartbeat();
@@ -929,14 +1056,14 @@ export function connectRealtime(
       onStatus('disconnected');
       const delay = Math.min(30_000, 1_000 * (2 ** reconnectAttempt));
       reconnectAttempt += 1;
-      reconnectTimer = window.setTimeout(connect, delay);
+      reconnectTimer = window.setTimeout(() => void connect(true), delay);
     });
     nextSocket.addEventListener('error', () => {
       if (nextSocket.readyState !== WebSocket.CLOSED) nextSocket.close();
     });
   };
 
-  connect();
+  void connect();
 
   return () => {
     stopped = true;

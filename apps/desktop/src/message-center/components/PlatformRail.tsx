@@ -4,22 +4,9 @@
  */
 
 import { AnimatePresence, motion } from 'framer-motion';
-import { 
-  MessagesSquare, 
-  Store,
-  Video,
-  Play,
-  ShoppingBag,
-  Heart,
-  MessageCircle,
-  LayoutDashboard,
-  Settings,
-  LogOut
-} from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { LayoutDashboard, LogOut, ShoppingBag } from 'lucide-react';
+import { useState } from 'react';
 import customerServiceAvatar from '../../shared/assets/customer-service-avatar.svg';
-import DevelopmentNotice from './DevelopmentNotice';
-import WechatAccountsModal from './WechatAccountsModal';
 
 interface PlatformRailProps {
   selectedPlatform: string;
@@ -33,54 +20,27 @@ interface PlatformRailProps {
 }
 
 const platformIcons: Record<string, any> = {
-  all: MessagesSquare,
-  qianniu: Store,
   pinduoduo: ShoppingBag,
-  wechat: MessageCircle,
-  qq: MessagesSquare,
-  douyin: Video,
-  kuaishou: Play,
-  xiaohongshu: Heart,
 };
 
 const platformThemes: Record<string, { bg: string, text: string, shadow: string, glow: string }> = {
-  all: { bg: 'bg-indigo-600', text: 'text-white', shadow: 'shadow-indigo-500/40', glow: 'bg-indigo-500' },
-  qianniu: { bg: 'bg-blue-500', text: 'text-white', shadow: 'shadow-blue-500/40', glow: 'bg-blue-400' },
   pinduoduo: { bg: 'bg-rose-600', text: 'text-white', shadow: 'shadow-rose-600/40', glow: 'bg-rose-500' },
-  wechat: { bg: 'bg-emerald-500', text: 'text-white', shadow: 'shadow-emerald-500/40', glow: 'bg-emerald-400' },
-  qq: { bg: 'bg-sky-500', text: 'text-white', shadow: 'shadow-sky-500/40', glow: 'bg-sky-400' },
-  douyin: { bg: 'bg-slate-900', text: 'text-white', shadow: 'shadow-slate-400/30', glow: 'bg-slate-400' },
-  kuaishou: { bg: 'bg-orange-500', text: 'text-white', shadow: 'shadow-orange-500/40', glow: 'bg-orange-400' },
-  xiaohongshu: { bg: 'bg-red-500', text: 'text-white', shadow: 'shadow-red-500/40', glow: 'bg-red-400' },
 };
 
 const railPlatforms = [
-  { id: 'all', name: '全部' },
-  { id: 'qianniu', name: '千牛' },
   { id: 'pinduoduo', name: '拼多多' },
-  { id: 'wechat', name: '个人微信' },
-  { id: 'qq', name: 'QQ' },
-  { id: 'douyin', name: '抖音' },
-  { id: 'kuaishou', name: '快手' },
-  { id: 'xiaohongshu', name: '小红书' },
 ];
 
 export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpenAdmin, onLogout, userName, userId, userRole, lang }: PlatformRailProps) {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
-  const [developmentNoticeTrigger, setDevelopmentNoticeTrigger] = useState(0);
-  const [isWechatAccountsOpen, setIsWechatAccountsOpen] = useState(false);
-
-  useEffect(() => window.desktopBridge?.onShowWechatAccounts(() => setIsWechatAccountsOpen(true)), []);
 
   const t = {
     zh: {
-      settings: '设置助手',
       admin: '管理后台',
       profile: '管理员账号',
       logout: '退出登录',
     },
     en: {
-      settings: 'Settings Help',
       admin: 'Admin Console',
       profile: 'Administrator',
       logout: 'Log Out',
@@ -92,9 +52,9 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
       {/* Top Icons */}
       <div className="flex-1 flex flex-col items-center gap-4 w-full">
         {railPlatforms.map((p) => {
-          const Icon = platformIcons[p.id] || MessagesSquare;
+          const Icon = platformIcons[p.id];
           const isActive = selectedPlatform === p.id;
-          const theme = platformThemes[p.id] || platformThemes.all;
+          const theme = platformThemes[p.id];
           
           return (
             <button
@@ -166,19 +126,6 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
           </div>
         </button>
 
-        <button
-          type="button"
-          onClick={() => setDevelopmentNoticeTrigger((current) => current + 1)}
-          className="p-2.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-xl transition-all group relative"
-          id="assistant-settings-btn"
-          aria-label={t.settings}
-        >
-          <Settings size={20} />
-          <div className="absolute left-full ml-4 px-2.5 py-1.5 bg-slate-900 text-white text-[10px] rounded-lg opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap z-50 transition-all font-bold uppercase tracking-wider shadow-2xl translate-x-[-4px] group-hover:translate-x-0">
-            {t.settings}
-          </div>
-        </button>
-
         <div className="h-px w-8 bg-slate-100" />
         
         <div className="relative">
@@ -231,11 +178,6 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
           </AnimatePresence>
         </div>
       </div>
-      <DevelopmentNotice
-        trigger={developmentNoticeTrigger}
-        message={lang === 'zh' ? '设置助手功能开发中' : 'Assistant settings are under development'}
-      />
-      <WechatAccountsModal isOpen={isWechatAccountsOpen} onClose={() => setIsWechatAccountsOpen(false)} />
     </div>
   );
 }

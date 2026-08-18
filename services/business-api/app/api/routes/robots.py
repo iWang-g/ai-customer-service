@@ -6,7 +6,7 @@ from app.api.deps import get_current_user, get_db_session
 from app.core.config import get_settings
 from app.models import Robot, RobotProductKnowledgeBase, RobotQaKnowledgeBase, RobotToneKnowledgeBase, User
 from app.schemas.robot import RobotCreate, RobotRead, RobotUpdate
-from app.services.robot_service import create_robot, delete_robot, get_robot, list_robots, serialize_robot, update_robot
+from app.services.robot_service import _knowledge_access_token, create_robot, delete_robot, get_robot, list_robots, serialize_robot, update_robot
 
 router = APIRouter(prefix="/robots", tags=["robots"])
 
@@ -54,6 +54,7 @@ def delete_unused_knowledge_base(
     try:
         response = httpx.delete(
             f"{settings.knowledge_base_url.rstrip('/')}/api/v1/knowledge-bases/{knowledge_base_id}",
+            headers={"Authorization": f"Bearer {_knowledge_access_token(user)}"},
             timeout=5,
             trust_env=False,
         )

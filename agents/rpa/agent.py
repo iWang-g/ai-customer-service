@@ -18,6 +18,14 @@ class ApiError(RuntimeError):
     pass
 
 
+def configure_standard_streams() -> None:
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+
 class EventQueue:
     def __init__(self, data_dir: str, filename: str = "events.db") -> None:
         directory = Path(data_dir)
@@ -129,6 +137,7 @@ class RpaAgent:
         self.api_base_url = ""
         self.access_token = ""
         self.user_id = ""
+        self.app_version = "0.1.0"
         self.node_token = ""
         self.node_id: str | None = None
         self.heartbeat_interval = 30
@@ -154,6 +163,7 @@ class RpaAgent:
         self.api_base_url = str(command["api_base_url"]).rstrip("/")
         self.access_token = str(command["access_token"])
         self.user_id = str(command["user_id"])
+        self.app_version = str(command.get("app_version") or "0.1.0")
         self.event_queue = EventQueue(
             str(command["data_dir"]), str(command.get("queue_filename") or "events.db")
         )
@@ -202,7 +212,7 @@ class RpaAgent:
                 "hostname": socket.gethostname(),
                 "machine_name": platform.node() or None,
                 "supported_platforms": ["pinduoduo", "wechat"],
-                "app_version": "0.1.0",
+                "app_version": self.app_version,
             },
         )
         self.node_token = response["node_token"]
@@ -392,6 +402,7 @@ def uuid_node() -> int:
 
 
 def main() -> int:
+    configure_standard_streams()
     agent = RpaAgent()
     try:
         for line in sys.stdin:

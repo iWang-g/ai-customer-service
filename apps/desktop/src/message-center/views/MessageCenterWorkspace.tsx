@@ -5,7 +5,7 @@ import StatusPanel from '../components/StatusPanel';
 import LogModal from '../components/LogModal';
 import ImportModal from '../components/ImportModal';
 import type { Conversation, BotStatus, LogEntry, Shop, StatusEvent } from '../types';
-import type { ApiUser, CustomerOrdersResponse } from '../../shared/api/client';
+import type { ApiUser, CustomerOrdersResponse, MessageSyncIssueDetail } from '../../shared/api/client';
 
 interface MessageCenterWorkspaceProps {
   lang: 'zh' | 'en';
@@ -30,8 +30,18 @@ interface MessageCenterWorkspaceProps {
   isLoadingMessages: boolean;
   dataError: string;
   onSendMessage: (content: string) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | null }>;
+  onSendImage: (imageDataUrl: string) => Promise<void>;
+  automaticSendNotice: {
+    kind: 'sending' | 'success' | 'error';
+    text: string;
+    version: number;
+  } | null;
   onClearHumanRequired: (conversationId: string) => Promise<void>;
-  onResetConversationTestData: (conversationId: string) => Promise<void>;
+  onClearConversationHistory: (conversationId: string) => Promise<void>;
+  onDeleteConversation: (conversationId: string) => Promise<void>;
+  onLoadMessageSyncIssue: (conversationId: string) => Promise<MessageSyncIssueDetail>;
+  onDismissMessageSyncIssue: (conversationId: string) => Promise<void>;
+  onRebuildMessageQueue: (conversationId: string) => Promise<void>;
   bot: BotStatus;
   logs: LogEntry[];
   statusEvents: StatusEvent[];
@@ -76,8 +86,14 @@ export default function MessageCenterWorkspace({
   isLoadingMessages,
   dataError,
   onSendMessage,
+  onSendImage,
+  automaticSendNotice,
   onClearHumanRequired,
-  onResetConversationTestData,
+  onClearConversationHistory,
+  onDeleteConversation,
+  onLoadMessageSyncIssue,
+  onDismissMessageSyncIssue,
+  onRebuildMessageQueue,
   bot,
   logs,
   statusEvents,
@@ -127,7 +143,8 @@ export default function MessageCenterWorkspace({
           onSearchTermChange={onConversationSearchChange}
           onOpenImportModal={onOpenImportModal}
           onClearHumanRequired={onClearHumanRequired}
-          onResetConversationTestData={onResetConversationTestData}
+          onClearConversationHistory={onClearConversationHistory}
+          onDeleteConversation={onDeleteConversation}
           lang={lang}
         />
       </div>
@@ -137,6 +154,11 @@ export default function MessageCenterWorkspace({
         isLoading={isLoadingMessages}
         error={dataError}
         onSendMessage={onSendMessage}
+        onSendImage={onSendImage}
+        automaticSendNotice={automaticSendNotice}
+        onLoadMessageSyncIssue={onLoadMessageSyncIssue}
+        onDismissMessageSyncIssue={onDismissMessageSyncIssue}
+        onRebuildMessageQueue={onRebuildMessageQueue}
       />
 
       <StatusPanel
@@ -146,6 +168,7 @@ export default function MessageCenterWorkspace({
         onModelChange={onMonitoringModelChange}
         onViewLogs={onViewLogs}
         connectionStatus={connectionStatus}
+        isLoadingConversations={isLoadingConversations}
         customerOrders={customerOrders}
         isLoadingCustomerOrders={isLoadingCustomerOrders}
         onRefreshCustomerOrders={onRefreshCustomerOrders}

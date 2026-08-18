@@ -4,7 +4,6 @@
  */
 
 import LoginScreen from './components/LoginScreen';
-import RegisterScreen from './components/RegisterScreen';
 import AdminApp from '../admin/App';
 import MessageCenterWorkspace from './views/MessageCenterWorkspace';
 import { useMessageCenterController } from './state/useMessageCenterController';
@@ -21,22 +20,9 @@ export default function App() {
   }
 
   if (!controller.isLoggedIn) {
-    if (controller.authMode === 'register') {
-      return (
-        <RegisterScreen
-          onRegister={controller.handleRegister}
-          onShowLogin={() => controller.setAuthMode('login')}
-          lang={controller.lang}
-          onToggleLang={controller.handleToggleLang}
-        />
-      );
-    }
     return (
       <LoginScreen
         onLogin={controller.handleLogin}
-        onShowRegister={() => controller.setAuthMode('register')}
-        lang={controller.lang}
-        onToggleLang={controller.handleToggleLang}
       />
     );
   }
@@ -69,8 +55,14 @@ export default function App() {
       isLoadingMessages={controller.isLoadingMessages}
       dataError={controller.dataError}
       onSendMessage={controller.handleSendMessage}
+      onSendImage={controller.handleSendImage}
+      automaticSendNotice={controller.automaticSendNotice}
       onClearHumanRequired={controller.handleClearHumanRequired}
-      onResetConversationTestData={controller.handleResetConversationTestData}
+      onClearConversationHistory={controller.handleClearConversationHistory}
+      onDeleteConversation={controller.handleDeleteConversation}
+      onLoadMessageSyncIssue={controller.handleLoadMessageSyncIssue}
+      onDismissMessageSyncIssue={controller.handleDismissMessageSyncIssue}
+      onRebuildMessageQueue={controller.handleRebuildMessageQueue}
       bot={controller.bot}
       logs={controller.logs}
       statusEvents={controller.statusEvents}

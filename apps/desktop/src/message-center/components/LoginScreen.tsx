@@ -5,18 +5,16 @@
 
 import React, { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Shield, Key, User, Globe, AlertCircle } from 'lucide-react';
+import { Shield, Key, User, AlertCircle, Eye, EyeOff } from 'lucide-react';
 
 interface LoginScreenProps {
   onLogin: (username: string, password: string) => Promise<void>;
-  onShowRegister: () => void;
-  lang: 'zh' | 'en';
-  onToggleLang: () => void;
 }
 
-export default function LoginScreen({ onLogin, onShowRegister, lang, onToggleLang }: LoginScreenProps) {
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('admin123');
+export default function LoginScreen({ onLogin }: LoginScreenProps) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
@@ -29,10 +27,8 @@ export default function LoginScreen({ onLogin, onShowRegister, lang, onToggleLan
       userPlaceholder: '请输入账号',
       passPlaceholder: '请输入密码',
       submit: '立即登录',
-      register: '没有账号？立即注册',
       errorEmpty: '账号和密码不能为空',
-      mockTips: '开发账号: admin | 密码: admin123',
-      secureTip: '账号由本地业务服务安全验证',
+      secureTip: '账号由业务服务安全验证',
     },
     en: {
       title: 'AI Customer Service Platform',
@@ -42,12 +38,10 @@ export default function LoginScreen({ onLogin, onShowRegister, lang, onToggleLan
       userPlaceholder: 'Please enter account',
       passPlaceholder: 'Please enter password',
       submit: 'Login Now',
-      register: 'No account? Register now',
       errorEmpty: 'Username and password cannot be empty',
-      mockTips: 'Dev Account: admin | Password: admin123',
-      secureTip: 'Credentials are verified by the local business API',
+      secureTip: 'Credentials are verified by the business API',
     }
-  }[lang];
+  }.zh;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -74,18 +68,6 @@ export default function LoginScreen({ onLogin, onShowRegister, lang, onToggleLan
       <div className="absolute top-1/4 left-1/4 w-[500px] h-[500px] bg-sky-100 rounded-full blur-3xl opacity-60 pointer-events-none" />
       <div className="absolute bottom-1/4 right-1/4 w-[400px] h-[400px] bg-indigo-100 rounded-full blur-3xl opacity-40 pointer-events-none" />
       <div className="absolute inset-0 opacity-[0.02] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#0ea5e9 1px, transparent 1px)', backgroundSize: '32px 32px' }} />
-
-      {/* Language Switcher */}
-      <div className="absolute top-6 right-6 z-10">
-        <button
-          onClick={onToggleLang}
-          className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 hover:border-slate-300 rounded-xl text-xs font-bold text-slate-600 transition-all shadow-sm"
-          id="lang-switch-btn"
-        >
-          <Globe size={14} />
-          <span>{lang === 'zh' ? 'English' : '中文'}</span>
-        </button>
-      </div>
 
       <motion.div
         initial={{ opacity: 0, y: 20 }}
@@ -134,13 +116,22 @@ export default function LoginScreen({ onLogin, onShowRegister, lang, onToggleLan
             <div className="relative">
               <Key size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" />
               <input
-                type="password"
+                type={showPassword ? 'text' : 'password'}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder={t.passPlaceholder}
-                className="w-full pl-11 pr-4 py-3 bg-slate-50 border border-slate-200/80 rounded-2xl text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-500/10 focus:border-sky-500 transition-all font-medium"
+                className="w-full pl-11 pr-12 py-3 bg-slate-50 border border-slate-200/80 rounded-2xl text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-500/10 focus:border-sky-500 transition-all font-medium"
                 id="login-password"
               />
+              <button
+                type="button"
+                onClick={() => setShowPassword((visible) => !visible)}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors"
+                aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                title={showPassword ? '隐藏密码' : '显示密码'}
+              >
+                {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
+              </button>
             </div>
           </div>
 
@@ -160,19 +151,7 @@ export default function LoginScreen({ onLogin, onShowRegister, lang, onToggleLan
           </div>
         </form>
 
-        <button
-          type="button"
-          onClick={onShowRegister}
-          className="mt-5 w-full text-center text-xs font-bold text-sky-600 hover:text-sky-700 transition-colors"
-          id="show-register-btn"
-        >
-          {t.register}
-        </button>
-
         <div className="mt-8 pt-6 border-t border-slate-100 flex flex-col items-center gap-3 text-center">
-          <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider bg-slate-50 px-2.5 py-1 rounded-lg">
-            {t.mockTips}
-          </span>
           <span className="text-[10px] text-slate-300 font-semibold uppercase tracking-wider">
             {t.secureTip}
           </span>

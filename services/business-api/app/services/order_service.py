@@ -38,6 +38,7 @@ ORDER_STATUSES = {
 }
 COLLECTION_STATUSES = {"success", "empty", "unavailable"}
 ACTIVE_OUTREACH_STATUSES = {"candidate", "scheduled", "rechecking", "queued"}
+RETRYABLE_OUTREACH_STATUSES = {"failed", "cancelled"}
 logger = logging.getLogger(__name__)
 SHOP_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -126,7 +127,23 @@ def _create_outreach(
         CustomerOutreachRun.strategy_type == strategy_type,
     ))
     if existing is not None:
-        return None
+        if existing.status not in RETRYABLE_OUTREACH_STATUSES:
+            return None
+        existing.robot_id = robot.id
+        existing.conversation_id = conversation.id
+        existing.order_id = order_id
+        existing.source_message_id = source_message_id
+        existing.status = "scheduled"
+        existing.due_at = due_at
+        existing.decision_json = decision
+        existing.message_text = message_text
+        existing.message_id = None
+        existing.send_task_id = None
+        existing.cancel_reason = None
+        existing.completed_at = None
+        db.add(existing)
+        db.flush()
+        return existing
     outreach_key = sha256(
         f"{conversation.platform_account_id}:{customer_key}:{strategy_type}".encode("utf-8")
     ).hexdigest()[:48]
@@ -170,36 +187,18 @@ def maybe_create_order_follow_up(
     summary = (conversation.metadata_json or {}).get("customer_orders")
     if not isinstance(summary, dict) or summary.get("collection_status") != "empty":
         return None
-    intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
-    try:
-        threshold = float(config.get("order_follow_up_confidence", 0.8) or 0.8)
-    except (TypeError, ValueError):
-        threshold = 0.8
-    try:
-        confidence = float(intent.get("outreach_confidence") or 0)
-    except (TypeError, ValueError):
-        confidence = 0
-    if (
-        intent.get("purchase_intent") != "strong"
-        or intent.get("outreach_suggestion") != "create_order_follow_up_candidate"
-        or confidence < threshold
-    ):
-        return None
     customer_key = str(summary.get("customer_key") or _customer_key(conversation, {}))
-    delay_minutes = _config_int(config, "order_follow_up_delay_minutes", 60, 1, 4320)
     return _create_outreach(
         db,
         conversation=conversation,
         robot=robot,
         strategy_type="order_follow_up",
         customer_key=customer_key,
-        due_at=utcnow() + timedelta(minutes=delay_minutes),
+        due_at=utcnow(),
         message_text=text,
         source_message_id=source_message.id,
         decision={
-            "purchase_intent": intent.get("purchase_intent"),
-            "confidence": intent.get("outreach_confidence"),
-            "reason": intent.get("outreach_reason"),
+            "trigger": "orders_explicitly_empty",
             "mark_human_required_after_send": config.get(
                 "order_follow_up_mark_human_required"
             ) is True,
@@ -221,10 +220,11 @@ def _maybe_create_post_receipt(
     text = str(config.get("post_receipt_care_text") or "").strip()
     if not text or conversation.human_required:
         return None
+    if _order_has_after_sale(order):
+        return None
     max_order_age_days = _config_int(config, "post_receipt_care_max_order_age_days", 30, 1, 90)
     if order.ordered_at and order.ordered_at < utcnow() - timedelta(days=max_order_age_days):
         return None
-    delay_days = _config_int(config, "post_receipt_care_delay_days", 2, 0, 30)
     return _create_outreach(
         db,
         conversation=conversation,
@@ -232,7 +232,7 @@ def _maybe_create_post_receipt(
         strategy_type="post_receipt_care",
         customer_key=order.customer_key,
         order_id=order.id,
-        due_at=(order.signed_at or utcnow()) + timedelta(days=delay_days),
+        due_at=utcnow(),
         message_text=text,
         decision={
             "trigger": "order_first_observed_signed",
@@ -303,7 +303,7 @@ def apply_orders_snapshot(
             order.raw_payload = item
             db.add(order)
             db.flush()
-            if first_signed_observation:
+            if normalized_status in {"signed", "completed"}:
                 _maybe_create_post_receipt(db, conversation, order)
             observed_order_ids.add(platform_order_id)
             saved_count += 1
@@ -395,7 +395,12 @@ def _resolve_rechecking_outreach(
         if conversation.human_required:
             _cancel(run, "human_required")
             continue
-        if conversation.awaiting_reply:
+        if run.strategy_type == "order_follow_up" and _has_pending_formal_reply(db, run):
+            run.status = "scheduled"
+            run.due_at = utcnow()
+            run.cancel_reason = "formal_reply_pending"
+            continue
+        if conversation.awaiting_reply and run.strategy_type != "order_follow_up":
             run.status = "scheduled"
             run.due_at = utcnow() + timedelta(minutes=10)
             run.cancel_reason = "new_customer_message"
@@ -451,7 +456,7 @@ def _queue_outreach_send(
             content=run.message_text,
             platform_code=conversation.platform_code,
         ),
-        idempotency_key=f"customer-outreach:{run.id}:text",
+        idempotency_key=f"customer-outreach:{run.id}:{run.due_at.isoformat()}:text",
         source="customer_outreach",
     )
     run.status = "queued"
@@ -464,6 +469,16 @@ def _queue_outreach_send(
 
 def schedule_due_outreach_rechecks(db: Session, *, limit: int = 50) -> int:
     now = utcnow()
+    legacy_delayed_runs = list(db.scalars(select(CustomerOutreachRun).where(
+        CustomerOutreachRun.status == "scheduled",
+        CustomerOutreachRun.due_at > now,
+        CustomerOutreachRun.cancel_reason.is_(None),
+    )).all())
+    for run in legacy_delayed_runs:
+        run.due_at = now
+        db.add(run)
+    if legacy_delayed_runs:
+        db.flush()
     stale_rechecks = list(db.scalars(select(CustomerOutreachRun).where(
         CustomerOutreachRun.status == "rechecking",
         CustomerOutreachRun.updated_at <= now - timedelta(minutes=15),
@@ -489,6 +504,10 @@ def schedule_due_outreach_rechecks(db: Session, *, limit: int = 50) -> int:
         conversation = db.get(Conversation, run.conversation_id)
         if not conversation or not conversation.platform_account_id:
             _cancel(run, "conversation_not_found")
+            db.add(run)
+            continue
+        if run.strategy_type == "order_follow_up" and _has_pending_formal_reply(db, run):
+            run.cancel_reason = "formal_reply_pending"
             db.add(run)
             continue
         existing = db.scalar(select(RpaTask).where(
@@ -520,6 +539,18 @@ def schedule_due_outreach_rechecks(db: Session, *, limit: int = 50) -> int:
     created += _schedule_open_order_rechecks(db, now=now, limit=max(0, limit - created))
     db.commit()
     return created
+
+
+def _has_pending_formal_reply(db: Session, run: CustomerOutreachRun) -> bool:
+    if not run.source_message_id:
+        return False
+    return db.scalar(
+        select(RpaTask.id).where(
+            RpaTask.conversation_id == run.conversation_id,
+            RpaTask.idempotency_key.like(f"auto-reply:%:{run.source_message_id}:text"),
+            RpaTask.status.in_(["waiting_timeout", "queued", "dispatched", "acknowledged"]),
+        ).limit(1)
+    ) is not None
 
 
 def _schedule_open_order_rechecks(

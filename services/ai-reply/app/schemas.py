@@ -6,12 +6,14 @@ from pydantic import BaseModel, Field
 
 
 class ReplyRequest(BaseModel):
+    knowledge_access_token: str = Field(default="", max_length=8192)
     message: str = Field(min_length=1, max_length=10000)
     conversation: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     platform: str = Field(default="", max_length=64)
     shop_name: str = Field(default="", max_length=128)
     customer_name: str = Field(default="", max_length=128)
     customer_orders: dict[str, Any] = Field(default_factory=dict)
+    platform_context: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     qa_base_ids: list[str] = Field(default_factory=list, max_length=32)
     product_base_ids: list[str] = Field(default_factory=list, max_length=32)
     tone_base_id: str = Field(default="", max_length=128)
@@ -48,10 +50,6 @@ class IntentDecision(BaseModel):
     template_key: str = ""
     risk_flags: list[str] = Field(default_factory=list)
     reason: str = ""
-    purchase_intent: Literal["none", "weak", "strong"] = "none"
-    outreach_suggestion: Literal["none", "create_order_follow_up_candidate"] = "none"
-    outreach_confidence: float = Field(default=0, ge=0, le=1)
-    outreach_reason: str = ""
 
 
 class ActionPlan(BaseModel):

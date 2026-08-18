@@ -6,8 +6,10 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.errors import request_validation_exception_handler
 from app.api.routes.auth import router as auth_router
 from app.api.routes.analytics import router as analytics_router
 from app.api.routes.automation import router as automation_router
@@ -21,6 +23,7 @@ from app.api.routes.rpa import router as rpa_router
 from app.api.routes.robots import router as robots_router
 from app.api.routes.settings import router as settings_router
 from app.api.routes.ai_config import router as ai_config_router
+from app.api.routes.collector_rules import router as collector_rules_router
 from app.api.routes.ws import router as ws_router
 from app.core.config import get_settings
 from app.db.session import engine, init_db
@@ -34,6 +37,7 @@ from sqlalchemy.orm import Session
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, version="0.1.0")
+    app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -55,6 +59,7 @@ def create_app() -> FastAPI:
     app.include_router(robots_router, prefix=settings.api_prefix)
     app.include_router(settings_router, prefix=settings.api_prefix)
     app.include_router(ai_config_router, prefix=settings.api_prefix)
+    app.include_router(collector_rules_router, prefix=settings.api_prefix)
     app.include_router(ws_router)
 
     async def outreach_scheduler() -> None:

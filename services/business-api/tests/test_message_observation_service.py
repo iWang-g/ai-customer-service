@@ -174,6 +174,99 @@ class MessageObservationServiceTests(unittest.TestCase):
         self.assertTrue(self.conversation.awaiting_reply)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(AutomationReplyRun)), 0)
 
+    def test_unread_unaligned_snapshot_marks_conversation_for_attention(self) -> None:
+        messages = [{
+            "dom_sequence": 0,
+            "sender_role": "customer",
+            "message_type": "text",
+            "content": "无法与现有队列衔接的新消息",
+            "platform_message_id": "unaligned-new-1",
+        }]
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "unaligned-unread",
+                messages=messages,
+                message_count=1,
+                payload_hash=snapshot_payload_hash(messages),
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "unaligned")
+        self.db.refresh(self.conversation)
+        issue = self.conversation.metadata_json["message_sync_issue"]
+        self.assertEqual(issue["status"], "active")
+        self.assertEqual(issue["observation_id"], "unaligned-unread")
+        self.assertTrue(issue["requires_attention"])
+        self.assertEqual(issue["consecutive_failure_count"], 1)
+
+    def test_second_read_unaligned_snapshot_marks_conversation_for_attention(self) -> None:
+        for index in range(2):
+            messages = [{
+                "dom_sequence": 0,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": f"无法衔接-{index}",
+                "platform_message_id": f"unaligned-read-{index}",
+            }]
+            request = self.request(
+                f"unaligned-read-{index}",
+                messages=messages,
+                message_count=1,
+                payload_hash=snapshot_payload_hash(messages),
+            )
+            request.payload_json["unread"] = False
+            process_message_snapshot(
+                self.db, self.user, self.node, request, write_messages=True
+            )
+            self.db.commit()
+
+        self.db.refresh(self.conversation)
+        issue = self.conversation.metadata_json["message_sync_issue"]
+        self.assertEqual(issue["consecutive_failure_count"], 2)
+        self.assertTrue(issue["requires_attention"])
+
+    def test_later_aligned_snapshot_resolves_sync_issue(self) -> None:
+        messages = [{
+            "dom_sequence": 0,
+            "sender_role": "customer",
+            "message_type": "text",
+            "content": "无法衔接",
+            "platform_message_id": "unaligned-before-recovery",
+        }]
+        process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "unaligned-before-recovery",
+                messages=messages,
+                message_count=1,
+                payload_hash=snapshot_payload_hash(messages),
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request("naturally-recovered"),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "aligned")
+        self.db.refresh(self.conversation)
+        issue = self.conversation.metadata_json["message_sync_issue"]
+        self.assertEqual(issue["status"], "resolved")
+        self.assertFalse(issue["requires_attention"])
+
     def test_formal_snapshot_appends_increment_with_contiguous_sequences(self) -> None:
         result = process_message_snapshot(
             self.db,
@@ -199,6 +292,164 @@ class MessageObservationServiceTests(unittest.TestCase):
         self.assertEqual(self.conversation.latest_message_text, "有货吗")
         self.assertTrue(self.conversation.awaiting_reply)
         self.assertNotIn("shadow_only", result.observation.diagnostics_json)
+
+    def test_product_card_history_aligns_with_later_snapshot(self) -> None:
+        self.db.query(Message).delete()
+        self.conversation.last_message_sequence = 0
+        self.db.commit()
+        product = {
+            "dom_sequence": 0,
+            "sender_role": "customer",
+            "message_type": "product",
+            "content": "食品级保温杯",
+            "platform_message_id": "product-1",
+            "display_mode": "card",
+            "automation_mode": "trigger",
+            "structured_payload": {
+                "title": "食品级保温杯",
+                "price": "29.90",
+                "image_url": "https://img.invalid/product.png",
+            },
+        }
+        bootstrap_request = self.request(
+            "product-bootstrap",
+            messages=[product],
+            message_count=1,
+            payload_hash=snapshot_payload_hash([product]),
+        )
+        bootstrap = process_message_snapshot(
+            self.db, self.user, self.node, bootstrap_request, write_messages=True
+        )
+        self.db.commit()
+        self.assertEqual(bootstrap.observation.alignment_status, "bootstrap")
+
+        self.db.add(Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="亲亲，这款支持食品接触使用。",
+            source="ai",
+        ))
+        self.db.commit()
+        current = [
+            product,
+            {
+                "dom_sequence": 1,
+                "sender_role": "agent",
+                "message_type": "text",
+                "content": "亲亲，这款支持食品接触使用。",
+                "platform_message_id": "agent-echo-1",
+            },
+            {
+                "dom_sequence": 2,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "可以装开水吗",
+                "platform_message_id": "customer-2",
+            },
+        ]
+        incremental_request = self.request(
+            "product-incremental",
+            messages=current,
+            message_count=len(current),
+            payload_hash=snapshot_payload_hash(current),
+        )
+
+        result = process_message_snapshot(
+            self.db, self.user, self.node, incremental_request, write_messages=True
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "aligned")
+        self.assertEqual(result.observation.overlap_size, 2)
+        self.assertEqual([item.content for item in result.appended_messages], ["可以装开水吗"])
+
+    def test_deleted_conversation_bootstrap_does_not_restore_it(self) -> None:
+        self.db.query(Message).delete()
+        self.conversation.last_message_sequence = 0
+        self.conversation.deleted_at = datetime(2026, 8, 6, 14, 0, tzinfo=timezone.utc)
+        self.db.commit()
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request("deleted-bootstrap"),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "bootstrap")
+        self.db.refresh(self.conversation)
+        self.assertIsNotNone(self.conversation.deleted_at)
+
+    def test_platform_nodes_after_customer_do_not_block_reply_source(self) -> None:
+        messages = [
+            *self.messages(),
+            {
+                "dom_sequence": 3,
+                "sender_role": "platform",
+                "message_type": "context",
+                "content": "当前用户来自商品详情页",
+                "display_mode": "card",
+                "automation_mode": "context",
+                "structured_payload": {"title": "测试商品", "product_id": "970947366369"},
+            },
+            {
+                "dom_sequence": 4,
+                "sender_role": "platform",
+                "message_type": "time",
+                "content": "2026年08月14日 09:28:12",
+                "display_mode": "separator",
+                "automation_mode": "ignore",
+            },
+        ]
+        request = self.request(
+            "timeline-after-customer",
+            messages=messages,
+            message_count=len(messages),
+            payload_hash=snapshot_payload_hash(messages),
+        )
+        result = process_message_snapshot(
+            self.db, self.user, self.node, request, write_messages=True
+        )
+        self.db.commit()
+
+        self.assertEqual([item.content for item in result.appended_messages], [
+            "有货吗", "当前用户来自商品详情页", "2026年08月14日 09:28:12",
+        ])
+        self.assertTrue(result.appended_messages[0].automation_eligible)
+        self.assertTrue(all(not item.automation_eligible for item in result.appended_messages[1:]))
+        source = select_inbound_reply_source(self.db, request, result.appended_messages)
+        self.assertIsNotNone(source)
+        self.assertEqual(source.content, "有货吗")
+
+    def test_failed_outbound_message_is_excluded_from_snapshot_alignment_history(self) -> None:
+        failed = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="发送失败且平台不存在",
+            message_status="failed",
+            source="ai",
+        )
+        self.db.add(failed)
+        self.db.commit()
+
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request("failed-excluded"),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "aligned")
+        self.assertEqual([item.content for item in result.appended_messages], ["有货吗"])
+        self.assertEqual(result.appended_messages[0].conversation_sequence, 4)
 
     def test_formal_bootstrap_appends_batch_without_automation_eligibility(self) -> None:
         self.db.query(Message).delete()
@@ -686,6 +937,10 @@ class MessageObservationServiceTests(unittest.TestCase):
         self.assertEqual(outbound_text.platform_message_id, "qa-text-echo")
         self.assertEqual(outbound_image.platform_message_id, "qa-image-echo")
         self.assertEqual(outbound_image.message_status, "sent")
+        self.assertEqual(
+            outbound_image.raw_payload["image_url"],
+            "https://chat-img.pddugc.com/uploaded-answer.png?token=temp",
+        )
 
     def test_snapshot_diagnostics_describe_ordered_snapshot(self) -> None:
         messages = self.messages()
@@ -879,6 +1134,83 @@ class MessageObservationServiceTests(unittest.TestCase):
         self.assertEqual(observation.alignment_status, "failed")
         self.assertIn("payload_hash does not match", observation.error_message or "")
         self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), message_count_before)
+
+    def test_timeline_hash_contract_includes_explicit_time_fields(self) -> None:
+        messages = self.messages()
+        messages[0] = {
+            **messages[0],
+            "time_label": "今天 13:48",
+            "has_explicit_time": True,
+        }
+        observation = observe_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "timeline-hash",
+                messages=messages,
+                payload_hash=snapshot_payload_hash(messages),
+            ),
+        )
+        self.db.commit()
+
+        self.assertEqual(observation.alignment_status, "aligned")
+        self.assertEqual(observation.diagnostics_json["payload_hash_contract"], "timeline_v2")
+
+    def test_intermediate_hash_without_time_fields_remains_accepted(self) -> None:
+        messages = self.messages()
+        messages[0] = {
+            **messages[0],
+            "time_label": "今天 13:48",
+            "has_explicit_time": True,
+        }
+        observation = observe_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "legacy-hash",
+                messages=messages,
+                payload_hash=snapshot_payload_hash(
+                    messages,
+                    include_timeline_fields=False,
+                ),
+            ),
+        )
+        self.db.commit()
+
+        self.assertEqual(observation.alignment_status, "aligned")
+        self.assertEqual(observation.diagnostics_json["payload_hash_contract"], "timeline_v1")
+
+    def test_legacy_hash_without_structured_fields_remains_accepted(self) -> None:
+        messages = self.messages()
+        messages[0] = {
+            **messages[0],
+            "display_mode": "bubble",
+            "automation_mode": "trigger",
+            "structured_payload": None,
+            "collector_rule_version": None,
+            "time_label": "今天 13:48",
+            "has_explicit_time": True,
+        }
+        observation = observe_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "legacy-hash",
+                messages=messages,
+                payload_hash=snapshot_payload_hash(
+                    messages,
+                    include_structured_fields=False,
+                    include_timeline_fields=False,
+                ),
+            ),
+        )
+        self.db.commit()
+
+        self.assertEqual(observation.alignment_status, "aligned")
+        self.assertEqual(observation.diagnostics_json["payload_hash_contract"], "legacy_v1")
 
     def test_schema_rejects_non_continuous_dom_sequence(self) -> None:
         payload = self.request("invalid-dom").payload_json

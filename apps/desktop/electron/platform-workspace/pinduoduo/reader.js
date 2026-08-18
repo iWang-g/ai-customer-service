@@ -19,20 +19,32 @@ function cleanId(value) {
 
 function cleanSnapshotMessage(message, domSequence) {
   if (!message || typeof message !== 'object') return null;
-  const messageType = ['text', 'image', 'product', 'order'].includes(message.message_type)
+  const messageType = ['text', 'image', 'product', 'order', 'system', 'context', 'time', 'unknown'].includes(message.message_type)
     ? message.message_type
-    : 'text';
+    : 'unknown';
   const content = cleanMessageText(message.content) || (messageType === 'image' ? '[image]' : null);
   if (!content) return null;
+  const displayModes = ['bubble', 'card', 'separator', 'notice', 'hidden'];
+  const automationModes = ['trigger', 'context', 'ignore'];
   return {
     dom_sequence: domSequence,
-    sender_role: message.sender_role === 'agent' ? 'agent' : 'customer',
+    sender_role: message.sender_role === 'agent'
+      ? 'agent'
+      : message.sender_role === 'platform' ? 'platform' : 'customer',
     message_type: messageType,
     content,
     image_url: cleanText(message.image_url, 8192),
     image_sha256: cleanText(message.image_sha256, 64),
     media_resource_id: cleanText(message.media_resource_id, 512),
     platform_message_id: cleanId(message.platform_message_id),
+    display_mode: displayModes.includes(message.display_mode) ? message.display_mode : 'bubble',
+    automation_mode: automationModes.includes(message.automation_mode) ? message.automation_mode : 'ignore',
+    structured_payload: message.structured_payload && typeof message.structured_payload === 'object'
+      ? message.structured_payload
+      : null,
+    collector_rule_version: cleanText(message.collector_rule_version, 64),
+    time_label: cleanText(message.time_label, 64),
+    has_explicit_time: Boolean(message.has_explicit_time),
   };
 }
 

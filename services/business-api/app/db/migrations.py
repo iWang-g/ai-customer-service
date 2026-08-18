@@ -44,6 +44,8 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             "human_required_reason": "VARCHAR(64)",
             "human_required_word": "VARCHAR(128)",
             "human_required_at": "DATETIME",
+            "messages_cleared_sequence": "INTEGER NOT NULL DEFAULT 0",
+            "deleted_at": "DATETIME",
         },
         "automation_reply_runs": {
             "trigger_sequence": "INTEGER",
@@ -93,6 +95,24 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                              created_at DESC, id DESC
                     LIMIT 1
                 ) = 'customer' THEN 1 ELSE 0 END"""
+            ))
+
+        if inspector.has_table("ai_model_catalog"):
+            connection.execute(text(
+                "DELETE FROM ai_model_catalog "
+                "WHERE model_id NOT IN ('deepseek-v4-flash', 'deepseek-v4-pro')"
+            ))
+        if inspector.has_table("ai_provider_configs"):
+            connection.execute(text(
+                "UPDATE ai_provider_configs SET model = 'deepseek-v4-flash' "
+                "WHERE model = 'deepseek-chat'"
+            ))
+        if inspector.has_table("robots"):
+            connection.execute(text(
+                "UPDATE robots "
+                "SET config_json = json_set(config_json, '$.model', 'deepseek-v4-flash') "
+                "WHERE json_valid(config_json) = 1 "
+                "AND json_extract(config_json, '$.model') = 'deepseek-chat'"
             ))
 
         # Freeze the legacy display order as the permanent per-conversation queue order.

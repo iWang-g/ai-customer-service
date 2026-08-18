@@ -23,7 +23,7 @@ class QaImageTests(unittest.TestCase):
 
     def test_invalid_image_bytes_are_rejected(self) -> None:
         with self.assertRaises(HTTPException) as context:
-            save_qa_image("answer.png", "image/png", b"not an image")
+            save_qa_image("user-image", "answer.png", "image/png", b"not an image")
         self.assertEqual(context.exception.status_code, 422)
 
 

@@ -22,6 +22,7 @@ interface StatusPanelProps {
   onModelChange: (model: string) => void;
   onViewLogs: () => void;
   connectionStatus: 'connecting' | 'connected' | 'disconnected';
+  isLoadingConversations: boolean;
   customerOrders: CustomerOrdersResponse | null;
   isLoadingCustomerOrders: boolean;
   onRefreshCustomerOrders: () => Promise<void>;
@@ -99,6 +100,7 @@ export default function StatusPanel({
   onModelChange,
   onViewLogs,
   connectionStatus,
+  isLoadingConversations,
   customerOrders,
   isLoadingCustomerOrders,
   onRefreshCustomerOrders,
@@ -191,7 +193,7 @@ export default function StatusPanel({
           <div className="space-y-2">
             <div className="relative" ref={menuRef}>
               <button onClick={() => setIsModelMenuOpen((value) => !value)} className="w-full flex items-center justify-between p-3 bg-white border border-slate-100 rounded-xl hover:shadow-md transition-all group">
-                <div className="flex items-center gap-3"><div className="p-2 bg-indigo-50 rounded-lg text-indigo-500"><Cpu size={16} /></div><span className="text-sm font-semibold text-slate-700">切换模型</span></div>
+                <div className="flex items-center gap-3"><div className="p-2 bg-indigo-50 rounded-lg text-indigo-500"><Cpu size={16} /></div><span className="text-sm font-semibold text-slate-700">查看模型数据</span></div>
                 <ChevronDown size={16} className={`text-slate-300 transition-transform ${isModelMenuOpen ? 'rotate-180' : ''}`} />
               </button>
               {isModelMenuOpen && (
@@ -199,6 +201,7 @@ export default function StatusPanel({
                   {bot.availableModels.map((model) => (
                     <button key={model} onClick={() => { setIsModelMenuOpen(false); onModelChange(model); }} className={`w-full px-4 py-3 text-left text-xs font-semibold hover:bg-slate-50 ${model === bot.model ? 'text-indigo-600 bg-indigo-50' : 'text-slate-600'}`}>{model}</button>
                   ))}
+                  {bot.availableModels.length === 0 && <div className="px-4 py-3 text-xs text-slate-400">暂无可用模型</div>}
                 </div>
               )}
             </div>
@@ -249,16 +252,8 @@ export default function StatusPanel({
             <p className="mt-1 text-[10px] text-slate-400">可点击右上角刷新</p>
           </div>
         )}
-        {customerOrders?.collection_status === 'empty' && (
-          <div className="rounded-2xl border border-emerald-100 bg-emerald-50 p-5 text-center text-xs font-semibold text-emerald-700">当前客户暂无个人订单</div>
-        )}
-        {customerOrders?.collection_status === 'unavailable' && (
-          <div className="rounded-2xl border border-amber-100 bg-amber-50 p-4 text-xs text-amber-700">
-            <p>订单读取失败，不能据此判断客户未下单。</p>
-            {customerOrders.collection_error && (
-              <p className="mt-2 break-all font-mono text-[10px] text-amber-600">{customerOrders.collection_error}</p>
-            )}
-          </div>
+        {(customerOrders?.collection_status === 'empty' || customerOrders?.collection_status === 'unavailable') && (
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 text-center text-xs font-semibold text-slate-600">未读取到订单信息</div>
         )}
         {customerOrders?.orders.map((order) => {
           const product = order.products_json[0] as { title?: string; quantity?: number; image_url?: string } | undefined;
@@ -333,7 +328,7 @@ export default function StatusPanel({
       </div>}
 
       <div className="p-4 bg-white border-t border-brand-border">
-        <div className="flex items-center justify-end px-2">
+        <div className="flex items-center justify-end gap-3 px-2">
           <div className="flex items-center gap-1">
             <div className={`w-1.5 h-1.5 rounded-full ${connectionStatus === 'connected' ? 'bg-green-500 animate-pulse' : connectionStatus === 'connecting' ? 'bg-amber-500 animate-pulse' : 'bg-rose-500'}`} />
             <span className={`text-[10px] font-bold ${connectionStatus === 'connected' ? 'text-green-500' : connectionStatus === 'connecting' ? 'text-amber-500' : 'text-rose-500'}`}>{connectionLabel}</span>

@@ -79,13 +79,22 @@ class SnapshotMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     dom_sequence: int = Field(ge=0, le=9999)
-    sender_role: Literal["customer", "agent"]
-    message_type: Literal["text", "image", "emoji", "file", "video", "product", "order"]
+    sender_role: Literal["customer", "agent", "platform"]
+    message_type: Literal[
+        "text", "image", "emoji", "file", "video", "product", "order",
+        "system", "context", "time", "unknown",
+    ]
     content: str = Field(default="", max_length=100_000)
     image_url: str | None = Field(default=None, max_length=8192)
     image_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
     media_resource_id: str | None = Field(default=None, max_length=512)
     platform_message_id: str | None = Field(default=None, max_length=128)
+    display_mode: Literal["bubble", "card", "separator", "notice", "hidden"] = "bubble"
+    automation_mode: Literal["trigger", "context", "ignore"] = "trigger"
+    structured_payload: dict[str, Any] | None = None
+    collector_rule_version: str | None = Field(default=None, max_length=64)
+    time_label: str | None = Field(default=None, max_length=64)
+    has_explicit_time: bool = False
 
 
 class MessageSnapshotPayload(BaseModel):

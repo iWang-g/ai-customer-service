@@ -5,7 +5,7 @@ import unittest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.models import AiModelCall, AutomationReplyRun, Base, Conversation, Message, Robot, User, utcnow
+from app.models import AiModelCall, AiModelCatalog, AutomationReplyRun, Base, Conversation, Message, Robot, User, utcnow
 from app.services.monitoring_service import get_overview, list_logs, list_recent_events
 
 
@@ -20,6 +20,10 @@ class MonitoringServiceTests(unittest.TestCase):
         self.robot = Robot(user_id=self.user.id, name="测试机器人", enabled=True, status="online")
         self.db.add(self.robot)
         self.db.flush()
+        self.db.add_all([
+            AiModelCatalog(provider="deepseek", model_id="deepseek-v4-flash", display_name="deepseek-v4-flash"),
+            AiModelCatalog(provider="deepseek", model_id="deepseek-v4-pro", display_name="deepseek-v4-pro"),
+        ])
         self.conversation = Conversation(
             user_id=self.user.id,
             platform_code="pinduoduo",
@@ -60,7 +64,7 @@ class MonitoringServiceTests(unittest.TestCase):
                 conversation_id=self.conversation.id,
                 stage="intent",
                 provider="deepseek",
-                model="deepseek-chat",
+                model="deepseek-v4-flash",
                 status="success",
                 input_tokens=10,
                 output_tokens=5,
@@ -73,7 +77,7 @@ class MonitoringServiceTests(unittest.TestCase):
                 conversation_id=self.conversation.id,
                 stage="generation",
                 provider="deepseek",
-                model="deepseek-chat",
+                model="deepseek-v4-flash",
                 status="success",
                 input_tokens=20,
                 output_tokens=8,
@@ -87,7 +91,8 @@ class MonitoringServiceTests(unittest.TestCase):
         self.engine.dispose()
 
     def test_overview_uses_real_model_calls(self) -> None:
-        value = get_overview(self.db, self.user, "deepseek-chat")
+        value = get_overview(self.db, self.user, "deepseek-v4-flash")
+        self.assertEqual(value.available_models, ["deepseek-v4-flash", "deepseek-v4-pro"])
         self.assertEqual(value.metrics.request_count, 2)
         self.assertEqual(value.metrics.success_rate, 100)
         self.assertEqual(value.metrics.average_response_ms, 1250)

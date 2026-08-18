@@ -58,11 +58,9 @@ class OrderServiceTests(unittest.TestCase):
             config_json={
                 "order_follow_up_enabled": True,
                 "order_follow_up_text": "还需要帮助下单吗？",
-                "order_follow_up_delay_minutes": 1,
                 "order_follow_up_mark_human_required": True,
                 "post_receipt_care_enabled": True,
                 "post_receipt_care_text": "欢迎反馈真实体验",
-                "post_receipt_care_delay_days": 1,
                 "post_receipt_care_mark_human_required": True,
             },
         )
@@ -154,7 +152,7 @@ class OrderServiceTests(unittest.TestCase):
         self.assertIsNotNone(run)
         self.assertEqual(run.strategy_type, "post_receipt_care")
 
-    def test_follow_up_requires_strong_model_suggestion_and_empty_orders(self) -> None:
+    def test_follow_up_requires_only_explicitly_empty_orders(self) -> None:
         apply_orders_snapshot(
             self.db,
             self.conversation,
@@ -167,12 +165,7 @@ class OrderServiceTests(unittest.TestCase):
             self.conversation,
             self.robot,
             source_message,
-            {"intent": {
-                "purchase_intent": "strong",
-                "outreach_suggestion": "create_order_follow_up_candidate",
-                "outreach_confidence": 0.9,
-                "outreach_reason": "客户准备购买",
-            }},
+            {"intent": {}},
         )
         self.db.commit()
         self.assertIsNotNone(run)
@@ -181,13 +174,130 @@ class OrderServiceTests(unittest.TestCase):
             self.conversation,
             self.robot,
             source_message,
-            {"intent": {
-                "purchase_intent": "strong",
-                "outreach_suggestion": "create_order_follow_up_candidate",
-                "outreach_confidence": 0.9,
-            }},
+            {"intent": {}},
         )
         self.assertIsNone(duplicate)
+
+    def test_follow_up_is_due_immediately(self) -> None:
+        apply_orders_snapshot(
+            self.db,
+            self.conversation,
+            {"collection_status": "empty", "orders": [], "customer_key": "customer:key"},
+            datetime.now(timezone.utc),
+        )
+        before = datetime.now(timezone.utc)
+        run = maybe_create_order_follow_up(
+            self.db,
+            self.conversation,
+            self.robot,
+            type("Source", (), {"id": "message-immediate"})(),
+            {"intent": {}},
+        )
+        due_at = run.due_at.replace(tzinfo=timezone.utc) if run.due_at.tzinfo is None else run.due_at
+        self.assertLessEqual(due_at, datetime.now(timezone.utc))
+        self.assertGreaterEqual(due_at, before)
+
+    def test_follow_up_waits_for_formal_reply_task_completion(self) -> None:
+        run = self._rechecking_run()
+        run.status = "scheduled"
+        run.source_message_id = "message-pending"
+        self.db.add(RpaTask(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            task_type="send_message",
+            idempotency_key=f"auto-reply:{self.robot.id}:message-pending:text",
+            platform_code="pinduoduo",
+            status="queued",
+        ))
+        self.db.commit()
+
+        self.assertEqual(schedule_due_outreach_rechecks(self.db), 0)
+        self.assertEqual(run.status, "scheduled")
+        self.assertEqual(run.cancel_reason, "formal_reply_pending")
+
+    def test_failed_follow_up_can_be_reactivated_but_completed_cannot(self) -> None:
+        apply_orders_snapshot(
+            self.db,
+            self.conversation,
+            {"collection_status": "empty", "orders": [], "customer_key": "customer:key"},
+            datetime.now(timezone.utc),
+        )
+        source = type("Source", (), {"id": "message-retry"})()
+        first = maybe_create_order_follow_up(
+            self.db, self.conversation, self.robot, source, {"intent": {}}
+        )
+        self.db.commit()
+        first.status = "failed"
+        self.db.commit()
+
+        retried = maybe_create_order_follow_up(
+            self.db, self.conversation, self.robot, source, {"intent": {}}
+        )
+        self.assertEqual(retried.id, first.id)
+        self.assertEqual(retried.status, "scheduled")
+        retried.status = "completed"
+        self.db.commit()
+
+        self.assertIsNone(maybe_create_order_follow_up(
+            self.db, self.conversation, self.robot, source, {"intent": {}}
+        ))
+
+    def test_post_receipt_is_due_immediately(self) -> None:
+        before = datetime.now(timezone.utc)
+        apply_orders_snapshot(
+            self.db,
+            self.conversation,
+            {
+                "collection_status": "success",
+                "customer_key": "customer:key",
+                "orders": [{"platform_order_id": "order-immediate", "status": "signed"}],
+            },
+            before,
+        )
+        run = self.db.scalar(select(CustomerOutreachRun))
+        due_at = run.due_at.replace(tzinfo=timezone.utc) if run.due_at.tzinfo is None else run.due_at
+        self.assertLessEqual(due_at, datetime.now(timezone.utc))
+        self.assertGreaterEqual(due_at, before)
+
+    def test_failed_post_receipt_can_be_reactivated_on_next_signed_snapshot(self) -> None:
+        payload = {
+            "collection_status": "success",
+            "customer_key": "customer:key",
+            "orders": [{"platform_order_id": "order-retry", "status": "signed"}],
+        }
+        apply_orders_snapshot(self.db, self.conversation, payload, datetime.now(timezone.utc))
+        self.db.commit()
+        run = self.db.scalar(select(CustomerOutreachRun))
+        run.status = "failed"
+        self.db.commit()
+
+        apply_orders_snapshot(
+            self.db,
+            self.conversation,
+            payload,
+            datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
+        self.assertEqual(run.status, "scheduled")
+
+    def test_legacy_delayed_run_is_made_due_immediately(self) -> None:
+        run = CustomerOutreachRun(
+            user_id=self.user.id,
+            robot_id=self.robot.id,
+            platform_account_id=self.account.id,
+            conversation_id=self.conversation.id,
+            customer_key="customer:key",
+            strategy_type="order_follow_up",
+            status="scheduled",
+            due_at=datetime.now(timezone.utc) + timedelta(days=2),
+            decision_json={},
+            message_text="立即复查",
+            idempotency_key="customer-outreach:legacy-delay",
+        )
+        self.db.add(run)
+        self.db.commit()
+
+        self.assertEqual(schedule_due_outreach_rechecks(self.db), 1)
+        self.assertEqual(run.status, "rechecking")
 
     def test_due_outreach_creates_low_priority_order_refresh_task(self) -> None:
         run = CustomerOutreachRun(
@@ -449,11 +559,7 @@ class OrderServiceTests(unittest.TestCase):
             self.conversation,
             self.robot,
             source_message,
-            {"intent": {
-                "purchase_intent": "strong",
-                "outreach_suggestion": "create_order_follow_up_candidate",
-                "outreach_confidence": 0.9,
-            }},
+            {"intent": {}},
         )
 
         self.assertIsNotNone(run)

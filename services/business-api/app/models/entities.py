@@ -62,12 +62,24 @@ class AiProviderConfig(Base, TimestampMixin):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), unique=True, index=True, nullable=False)
     provider: Mapped[str] = mapped_column(String(32), default="deepseek", nullable=False)
     base_url: Mapped[str] = mapped_column(String(512), default="https://api.deepseek.com", nullable=False)
-    model: Mapped[str] = mapped_column(String(128), default="deepseek-chat", nullable=False)
+    model: Mapped[str] = mapped_column(String(128), default="deepseek-v4-flash", nullable=False)
     api_key: Mapped[str] = mapped_column(Text, default="", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     temperature: Mapped[float] = mapped_column(default=0.2, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="ai_provider_configs")
+
+
+class AiModelCatalog(Base, TimestampMixin):
+    __tablename__ = "ai_model_catalog"
+    __table_args__ = (UniqueConstraint("provider", "model_id", name="uq_ai_model_provider_id"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    provider: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    available: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class UserSettings(Base, TimestampMixin):
@@ -285,6 +297,8 @@ class Conversation(Base, TimestampMixin):
     human_required_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     human_required_word: Mapped[str | None] = mapped_column(String(128), nullable=True)
     human_required_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    messages_cleared_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="conversations")

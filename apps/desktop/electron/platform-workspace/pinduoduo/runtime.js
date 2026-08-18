@@ -31,6 +31,12 @@ function snapshotHashMessages(messages) {
     image_sha256: message.image_sha256 || null,
     media_resource_id: message.media_resource_id || null,
     platform_message_id: message.platform_message_id || null,
+    display_mode: message.display_mode || 'bubble',
+    automation_mode: message.automation_mode || 'trigger',
+    structured_payload: message.structured_payload || null,
+    collector_rule_version: message.collector_rule_version || null,
+    time_label: message.time_label || null,
+    has_explicit_time: Boolean(message.has_explicit_time),
   }));
 }
 

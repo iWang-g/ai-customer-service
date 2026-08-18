@@ -4,6 +4,7 @@ import hashlib
 import io
 import mimetypes
 import re
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,9 @@ from typing import Any
 from fastapi import HTTPException
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from app.db import DEFAULT_QA_CATEGORIES, connect, dumps, loads, utc_now
+from app.db import DEFAULT_QA_CATEGORIES, connect, dumps, fts_terms, has_chunk_fts, loads, utc_now
 from app.core.config import get_settings
-from app.document_parser import ParsedDocument, chunk_text, parse_document
+from app.document_parser import CHUNK_STRATEGY_VERSION, ParsedDocument, TextChunk, chunk_text, parse_document
 from app.schemas import DocumentCreate, DocumentSearchRequest, KnowledgeBaseCreate, KnowledgeBaseUpdate, QaCategoryCreate, QaEntryCreate, QaMatchRequest
 
 
@@ -25,10 +26,12 @@ def normalize(text: str) -> str:
     return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text.casefold())
 
 
-def asset_directory() -> Path:
+def asset_directory(user_id: str = "") -> Path:
     path = Path(get_settings().asset_path)
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
+    if user_id:
+        path = path / hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -58,7 +61,7 @@ def _normalize_qa_image(data: bytes) -> bytes:
     return output.getvalue()
 
 
-def save_qa_image(filename: str, content_type: str, data: bytes) -> dict[str, Any]:
+def save_qa_image(user_id: str, filename: str, content_type: str, data: bytes) -> dict[str, Any]:
     allowed_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     declared_type = content_type.casefold()
     guessed_type, _ = mimetypes.guess_type(filename)
@@ -67,7 +70,7 @@ def save_qa_image(filename: str, content_type: str, data: bytes) -> dict[str, An
 
     normalized = _normalize_qa_image(data)
     asset_name = f"qa-{uuid.uuid4().hex}.png"
-    (asset_directory() / asset_name).write_bytes(normalized)
+    (asset_directory(user_id) / asset_name).write_bytes(normalized)
     return {
         "image_url": f"/qa-assets/{asset_name}",
         "filename": filename,
@@ -76,30 +79,50 @@ def save_qa_image(filename: str, content_type: str, data: bytes) -> dict[str, An
     }
 
 
-def get_qa_image(asset_name: str) -> tuple[Path, str]:
+def get_qa_image(user_id: str, asset_name: str) -> tuple[Path, str]:
     if Path(asset_name).name != asset_name:
         raise HTTPException(404, "Image not found")
-    path = asset_directory() / asset_name
+    owner_user_id = ""
+    with connect() as db:
+        row = db.execute(
+            """SELECT b.user_id FROM qa_entries q
+            JOIN knowledge_bases b ON b.id = q.base_id
+            WHERE q.image_url = ? AND (b.user_id = ? OR b.is_public = 1)
+            LIMIT 1""",
+            (f"/qa-assets/{asset_name}", user_id),
+        ).fetchone()
+        if row:
+            owner_user_id = row["user_id"]
+    if not owner_user_id:
+        raise HTTPException(404, "Image not found")
+    path = asset_directory(owner_user_id) / asset_name
+    if not path.is_file() and user_id == get_settings().legacy_owner_user_id.strip():
+        path = asset_directory() / asset_name
     if not path.is_file():
         raise HTTPException(404, "Image not found")
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return path, media_type
 
 
-def row_base(row: Any, count: int) -> dict[str, Any]:
+def row_base(row: Any, count: int, viewer_user_id: str) -> dict[str, Any]:
+    is_owner = row["user_id"] == viewer_user_id
     return {
         "id": row["id"], "name": row["name"], "kind": row["kind"],
         "persona": row["persona"], "enabled": bool(row["enabled"]),
+        "is_public": bool(row["is_public"]), "owner_user_id": row["user_id"],
+        "owner_username": row["owner_username"] or row["user_id"],
+        "owner_display_name": row["owner_display_name"] or row["owner_username"] or row["user_id"],
+        "is_owner": is_owner, "read_only": not is_owner,
         "item_count": count, "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
 
 
-def list_bases(kind: str | None = None) -> list[dict[str, Any]]:
+def list_bases(user_id: str, kind: str | None = None) -> list[dict[str, Any]]:
     with connect() as db:
-        query = "SELECT * FROM knowledge_bases"
-        params: list[Any] = []
+        query = "SELECT * FROM knowledge_bases WHERE (user_id = ? OR is_public = 1)"
+        params: list[Any] = [user_id]
         if kind:
-            query += " WHERE kind = ?"
+            query += " AND kind = ?"
             params.append(kind)
         rows = db.execute(query + " ORDER BY updated_at DESC", params).fetchall()
         result = []
@@ -109,13 +132,16 @@ def list_bases(kind: str | None = None) -> list[dict[str, Any]]:
             if table == "documents":
                 count_query += " AND status != 'deleted'"
             count = db.execute(count_query, (row["id"],)).fetchone()[0]
-            result.append(row_base(row, int(count)))
+            result.append(row_base(row, int(count), user_id))
         return result
 
 
-def get_base(base_id: str) -> dict[str, Any] | None:
+def get_base(user_id: str, base_id: str) -> dict[str, Any] | None:
     with connect() as db:
-        row = db.execute("SELECT * FROM knowledge_bases WHERE id = ?", (base_id,)).fetchone()
+        row = db.execute(
+            "SELECT * FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+            (base_id, user_id),
+        ).fetchone()
         if not row:
             return None
         table = "qa_entries" if row["kind"] == "qa" else "documents"
@@ -123,25 +149,35 @@ def get_base(base_id: str) -> dict[str, Any] | None:
         if table == "documents":
             count_query += " AND status != 'deleted'"
         count = db.execute(count_query, (base_id,)).fetchone()[0]
-        return row_base(row, int(count))
+        return row_base(row, int(count), user_id)
 
 
-def create_base(payload: KnowledgeBaseCreate) -> dict[str, Any]:
+def get_owned_base(user_id: str, base_id: str) -> dict[str, Any] | None:
+    value = get_base(user_id, base_id)
+    return value if value and value["is_owner"] else None
+
+
+def create_base(
+    user_id: str,
+    payload: KnowledgeBaseCreate,
+    owner_username: str = "",
+    owner_display_name: str = "",
+) -> dict[str, Any]:
     now = utc_now()
     base_id = new_id("kb")
     with connect() as db:
-        db.execute("INSERT INTO knowledge_bases (id,name,kind,persona,created_at,updated_at) VALUES (?,?,?,?,?,?)", (base_id, payload.name.strip(), payload.kind, payload.persona.strip(), now, now))
+        db.execute("INSERT INTO knowledge_bases (id,user_id,owner_username,owner_display_name,is_public,name,kind,persona,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (base_id, user_id, owner_username or user_id, owner_display_name or owner_username or user_id, 1 if payload.is_public else 0, payload.name.strip(), payload.kind, payload.persona.strip(), now, now))
         if payload.kind == "qa":
             for sort_order, category_name in enumerate(DEFAULT_QA_CATEGORIES):
                 db.execute(
                     "INSERT INTO qa_categories (id,base_id,name,is_builtin,sort_order,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
                     (new_id("qac"), base_id, category_name, 1, sort_order, now, now),
                 )
-    return get_base(base_id)  # type: ignore[return-value]
+    return get_base(user_id, base_id)  # type: ignore[return-value]
 
 
-def update_base(base_id: str, payload: KnowledgeBaseUpdate) -> dict[str, Any]:
-    current = get_base(base_id)
+def update_base(user_id: str, base_id: str, payload: KnowledgeBaseUpdate) -> dict[str, Any]:
+    current = get_owned_base(user_id, base_id)
     if not current:
         raise HTTPException(404, "Knowledge base not found")
     fields: list[str] = []
@@ -152,19 +188,23 @@ def update_base(base_id: str, payload: KnowledgeBaseUpdate) -> dict[str, Any]:
         fields.append("persona = ?"); values.append(payload.persona.strip())
     if payload.enabled is not None:
         fields.append("enabled = ?"); values.append(1 if payload.enabled else 0)
+    if payload.is_public is not None:
+        fields.append("is_public = ?"); values.append(1 if payload.is_public else 0)
     if fields:
         fields.append("updated_at = ?"); values.extend([utc_now(), base_id])
         with connect() as db:
-            db.execute(f"UPDATE knowledge_bases SET {', '.join(fields)} WHERE id = ?", values)
-    return get_base(base_id)  # type: ignore[return-value]
+            db.execute(f"UPDATE knowledge_bases SET {', '.join(fields)} WHERE id = ? AND user_id = ?", [*values[:-1], base_id, user_id])
+    return get_base(user_id, base_id)  # type: ignore[return-value]
 
 
-def delete_base(base_id: str) -> dict[str, Any]:
-    current = get_base(base_id)
+def delete_base(user_id: str, base_id: str) -> dict[str, Any]:
+    current = get_owned_base(user_id, base_id)
     if not current:
         raise HTTPException(404, "Knowledge base not found")
     with connect() as db:
-        db.execute("DELETE FROM knowledge_bases WHERE id = ?", (base_id,))
+        if has_chunk_fts(db):
+            db.execute("DELETE FROM document_chunks_fts WHERE base_id = ?", (base_id,))
+        db.execute("DELETE FROM knowledge_bases WHERE id = ? AND user_id = ?", (base_id, user_id))
     return current
 
 
@@ -176,8 +216,8 @@ def qa_category_dict(row: Any, item_count: int = 0) -> dict[str, Any]:
     }
 
 
-def list_qa_categories(base_id: str) -> list[dict[str, Any]]:
-    base = get_base(base_id)
+def list_qa_categories(user_id: str, base_id: str) -> list[dict[str, Any]]:
+    base = get_base(user_id, base_id)
     if not base or base["kind"] != "qa":
         raise HTTPException(404, "QA knowledge base not found")
     with connect() as db:
@@ -193,8 +233,8 @@ def list_qa_categories(base_id: str) -> list[dict[str, Any]]:
         return [qa_category_dict(row, int(row["item_count"])) for row in rows]
 
 
-def create_qa_category(base_id: str, payload: QaCategoryCreate) -> dict[str, Any]:
-    base = get_base(base_id)
+def create_qa_category(user_id: str, base_id: str, payload: QaCategoryCreate) -> dict[str, Any]:
+    base = get_owned_base(user_id, base_id)
     if not base or base["kind"] != "qa":
         raise HTTPException(404, "QA knowledge base not found")
     name = payload.name.strip()
@@ -222,13 +262,14 @@ def create_qa_category(base_id: str, payload: QaCategoryCreate) -> dict[str, Any
 
 
 def list_qa_entries(
+    user_id: str,
     base_id: str,
     category_id: str | None = None,
     keyword: str = "",
     page: int = 1,
     page_size: int = 20,
 ) -> dict[str, Any]:
-    if not get_base(base_id):
+    if not get_base(user_id, base_id):
         raise HTTPException(404, "Knowledge base not found")
     with connect() as db:
         conditions = ["base_id = ?"]
@@ -295,8 +336,8 @@ def resolve_qa_category(db: Any, base_id: str, category_id: str, category_name: 
     return category_id, name
 
 
-def create_qa_entry(base_id: str, payload: QaEntryCreate) -> dict[str, Any]:
-    base = get_base(base_id)
+def create_qa_entry(user_id: str, base_id: str, payload: QaEntryCreate) -> dict[str, Any]:
+    base = get_owned_base(user_id, base_id)
     if not base or base["kind"] != "qa":
         raise HTTPException(404, "QA knowledge base not found")
     now = utc_now(); entry_id = new_id("qa")
@@ -308,10 +349,15 @@ def create_qa_entry(base_id: str, payload: QaEntryCreate) -> dict[str, Any]:
     return qa_dict(row)
 
 
-def update_qa_entry(entry_id: str, payload: QaEntryCreate) -> dict[str, Any]:
+def update_qa_entry(user_id: str, entry_id: str, payload: QaEntryCreate) -> dict[str, Any]:
     now = utc_now()
     with connect() as db:
-        current = db.execute("SELECT * FROM qa_entries WHERE id = ?", (entry_id,)).fetchone()
+        current = db.execute(
+            """SELECT qa_entries.* FROM qa_entries
+            JOIN knowledge_bases ON knowledge_bases.id = qa_entries.base_id
+            WHERE qa_entries.id = ? AND knowledge_bases.user_id = ?""",
+            (entry_id, user_id),
+        ).fetchone()
         if not current:
             raise HTTPException(404, "QA entry not found")
         category_id, category_name = resolve_qa_category(db, current["base_id"], payload.category_id, payload.category)
@@ -321,16 +367,21 @@ def update_qa_entry(entry_id: str, payload: QaEntryCreate) -> dict[str, Any]:
     return qa_dict(row)
 
 
-def delete_qa_entry(entry_id: str) -> dict[str, Any]:
+def delete_qa_entry(user_id: str, entry_id: str) -> dict[str, Any]:
     with connect() as db:
-        current = db.execute("SELECT * FROM qa_entries WHERE id = ?", (entry_id,)).fetchone()
+        current = db.execute(
+            """SELECT qa_entries.* FROM qa_entries
+            JOIN knowledge_bases ON knowledge_bases.id = qa_entries.base_id
+            WHERE qa_entries.id = ? AND knowledge_bases.user_id = ?""",
+            (entry_id, user_id),
+        ).fetchone()
         if not current:
             raise HTTPException(404, "QA entry not found")
         db.execute("DELETE FROM qa_entries WHERE id = ?", (entry_id,))
     return qa_dict(current)
 
 
-def match_qa(payload: QaMatchRequest) -> dict[str, Any]:
+def match_qa(user_id: str, payload: QaMatchRequest) -> dict[str, Any]:
     query = normalize(payload.query)
     base_ids = set(payload.base_ids)
     with connect() as db:
@@ -338,7 +389,9 @@ def match_qa(payload: QaMatchRequest) -> dict[str, Any]:
             """SELECT qa_entries.* FROM qa_entries
             JOIN knowledge_bases ON knowledge_bases.id = qa_entries.base_id
             WHERE qa_entries.enabled = 1 AND knowledge_bases.enabled = 1
+              AND (knowledge_bases.user_id = ? OR knowledge_bases.is_public = 1)
             ORDER BY qa_entries.weight DESC, qa_entries.updated_at DESC"""
+            , (user_id,)
         ).fetchall()
         filtered = [row for row in rows if not base_ids or row["base_id"] in base_ids]
 
@@ -372,8 +425,8 @@ def match_qa(payload: QaMatchRequest) -> dict[str, Any]:
         }
 
 
-def create_document(payload: DocumentCreate) -> dict[str, Any]:
-    base = get_base(payload.base_id)
+def create_document(user_id: str, payload: DocumentCreate) -> dict[str, Any]:
+    base = get_owned_base(user_id, payload.base_id)
     if not base or base["kind"] != "product":
         raise HTTPException(404, "Product knowledge base not found")
     return _persist_document(
@@ -411,17 +464,11 @@ def _persist_document(
         chunks = chunk_text(content)
         db.execute(
             """INSERT INTO documents
-            (id,base_id,title,content,status,original_filename,file_type,file_size,content_hash,error_message,chunk_count,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (doc_id, base_id, title, content, "ready", original_filename, file_type, file_size, content_hash, "", len(chunks), now, now),
+            (id,base_id,title,content,status,original_filename,file_type,file_size,content_hash,error_message,chunk_count,chunk_strategy_version,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (doc_id, base_id, title, content, "ready", original_filename, file_type, file_size, content_hash, "", len(chunks), CHUNK_STRATEGY_VERSION, now, now),
         )
-        for item in chunks:
-            db.execute(
-                """INSERT INTO document_chunks
-                (id,document_id,base_id,chunk_index,title_path,content,created_at)
-                VALUES (?,?,?,?,?,?,?)""",
-                (new_id("chunk"), doc_id, base_id, item.index, item.title_path, item.content, now),
-            )
+        _insert_document_chunks(db, doc_id, base_id, title, chunks, now)
         db.execute("UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", (now, base_id))
         row = db.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
     return {**document_dict(row), "duplicate": False}
@@ -437,14 +484,15 @@ def document_dict(row: Any) -> dict[str, Any]:
         "file_size": int(row["file_size"] or 0) if "file_size" in row.keys() else 0,
         "status": row["status"],
         "chunk_count": int(row["chunk_count"] or 0) if "chunk_count" in row.keys() else 0,
+        "chunk_strategy_version": row["chunk_strategy_version"] if "chunk_strategy_version" in row.keys() else "legacy-v1",
         "error_message": row["error_message"] if "error_message" in row.keys() else "",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
 
 
-def import_document(base_id: str, filename: str, data: bytes) -> dict[str, Any]:
-    base = get_base(base_id)
+def import_document(user_id: str, base_id: str, filename: str, data: bytes) -> dict[str, Any]:
+    base = get_owned_base(user_id, base_id)
     if not base or base["kind"] != "product":
         raise HTTPException(404, "Product knowledge base not found")
     try:
@@ -462,8 +510,8 @@ def import_document(base_id: str, filename: str, data: bytes) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from exc
 
 
-def list_documents(base_id: str) -> list[dict[str, Any]]:
-    base = get_base(base_id)
+def list_documents(user_id: str, base_id: str) -> list[dict[str, Any]]:
+    base = get_base(user_id, base_id)
     if not base:
         raise HTTPException(404, "Knowledge base not found")
     with connect() as db:
@@ -474,23 +522,29 @@ def list_documents(base_id: str) -> list[dict[str, Any]]:
     return [document_dict(row) for row in rows]
 
 
-def get_document(document_id: str) -> dict[str, Any]:
+def get_document(user_id: str, document_id: str) -> dict[str, Any]:
     with connect() as db:
         row = db.execute(
-            "SELECT * FROM documents WHERE id = ? AND status != 'deleted'",
-            (document_id,),
+            """SELECT documents.* FROM documents
+            JOIN knowledge_bases ON knowledge_bases.id = documents.base_id
+            WHERE documents.id = ? AND documents.status != 'deleted'
+              AND (knowledge_bases.user_id = ? OR knowledge_bases.is_public = 1)""",
+            (document_id, user_id),
         ).fetchone()
     if not row:
         raise HTTPException(404, "Document not found")
     return {**document_dict(row), "content": row["content"]}
 
 
-def list_document_chunks(document_id: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+def list_document_chunks(user_id: str, document_id: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
     offset = (page - 1) * page_size
     with connect() as db:
         document = db.execute(
-            "SELECT id FROM documents WHERE id = ? AND status != 'deleted'",
-            (document_id,),
+            """SELECT documents.id FROM documents
+            JOIN knowledge_bases ON knowledge_bases.id = documents.base_id
+            WHERE documents.id = ? AND documents.status != 'deleted'
+              AND (knowledge_bases.user_id = ? OR knowledge_bases.is_public = 1)""",
+            (document_id, user_id),
         ).fetchone()
         if not document:
             raise HTTPException(404, "Document not found")
@@ -499,7 +553,8 @@ def list_document_chunks(document_id: str, page: int = 1, page_size: int = 50) -
             (document_id,),
         ).fetchone()[0])
         rows = db.execute(
-            """SELECT id, document_id, base_id, chunk_index, title_path, content, enabled, created_at
+            """SELECT id, document_id, base_id, chunk_index, title_path, content,
+                   chunk_type, metadata_json, strategy_version, enabled, created_at
             FROM document_chunks
             WHERE document_id = ?
             ORDER BY chunk_index
@@ -515,6 +570,9 @@ def list_document_chunks(document_id: str, page: int = 1, page_size: int = 50) -
                 "chunk_index": int(row["chunk_index"]),
                 "title_path": row["title_path"],
                 "content": row["content"],
+                "chunk_type": row["chunk_type"],
+                "metadata": loads(row["metadata_json"], {}),
+                "strategy_version": row["strategy_version"],
                 "enabled": bool(row["enabled"]),
                 "created_at": row["created_at"],
             }
@@ -527,38 +585,210 @@ def list_document_chunks(document_id: str, page: int = 1, page_size: int = 50) -
     }
 
 
-def delete_document(document_id: str) -> dict[str, Any]:
+def delete_document(user_id: str, document_id: str) -> dict[str, Any]:
     now = utc_now()
     with connect() as db:
-        row = db.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+        row = db.execute(
+            """SELECT documents.* FROM documents
+            JOIN knowledge_bases ON knowledge_bases.id = documents.base_id
+            WHERE documents.id = ? AND knowledge_bases.user_id = ?""",
+            (document_id, user_id),
+        ).fetchone()
         if not row:
             raise HTTPException(404, "Document not found")
         db.execute("UPDATE documents SET status = 'deleted', updated_at = ? WHERE id = ?", (now, document_id))
+        if has_chunk_fts(db):
+            db.execute("DELETE FROM document_chunks_fts WHERE document_id = ?", (document_id,))
         db.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
         db.execute("UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", (now, row["base_id"]))
     return document_dict(row)
 
 
-def search_documents(payload: DocumentSearchRequest) -> dict[str, Any]:
+def _insert_document_chunks(
+    db: Any,
+    document_id: str,
+    base_id: str,
+    source_title: str,
+    chunks: list[TextChunk],
+    created_at: str,
+) -> None:
+    for item in chunks:
+        chunk_id = new_id("chunk")
+        metadata = item.metadata or {}
+        db.execute(
+            """INSERT INTO document_chunks
+            (id,document_id,base_id,chunk_index,title_path,content,chunk_type,metadata_json,strategy_version,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                chunk_id, document_id, base_id, item.index, item.title_path, item.content,
+                item.chunk_type, dumps(metadata), CHUNK_STRATEGY_VERSION, created_at,
+            ),
+        )
+        if has_chunk_fts(db):
+            db.execute(
+                """INSERT INTO document_chunks_fts
+                (chunk_id,document_id,base_id,source_title,title_path,content,
+                 source_title_terms,title_path_terms,content_terms)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    chunk_id, document_id, base_id, source_title, item.title_path, item.content,
+                    fts_terms(source_title), fts_terms(item.title_path), fts_terms(item.content),
+                ),
+            )
+
+
+def reprocess_document(user_id: str, document_id: str) -> dict[str, Any]:
+    now = utc_now()
+    with connect() as db:
+        row = db.execute(
+            """SELECT documents.* FROM documents
+            JOIN knowledge_bases ON knowledge_bases.id = documents.base_id
+            WHERE documents.id = ? AND documents.status != 'deleted'
+              AND knowledge_bases.user_id = ?""",
+            (document_id, user_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Document not found")
+        chunks = chunk_text(row["content"])
+        if has_chunk_fts(db):
+            db.execute("DELETE FROM document_chunks_fts WHERE document_id = ?", (document_id,))
+        db.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+        _insert_document_chunks(db, row["id"], row["base_id"], row["title"], chunks, now)
+        db.execute(
+            """UPDATE documents SET chunk_count = ?, chunk_strategy_version = ?,
+               error_message = '', status = 'ready', updated_at = ? WHERE id = ?""",
+            (len(chunks), CHUNK_STRATEGY_VERSION, now, document_id),
+        )
+        db.execute("UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", (now, row["base_id"]))
+        updated = db.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+    return document_dict(updated)
+
+
+def _keyword_candidates(db: Any, user_id: str, payload: DocumentSearchRequest) -> list[dict[str, Any]]:
     query = payload.query.casefold()
     terms = [item for item in re.findall(r"[0-9a-zA-Z][0-9a-zA-Z_-]{1,}", query) if item]
     cjk = "".join(re.findall(r"[\u4e00-\u9fff]", query))
     terms.extend(cjk[index : index + size] for size in (2, 3) for index in range(max(0, len(cjk) - size + 1)))
     terms = list(dict.fromkeys(term for term in terms if term))
     base_ids = set(payload.base_ids)
-    with connect() as db:
-        rows = db.execute(
-            """SELECT c.*, d.title AS source_title, d.status AS document_status
-            FROM document_chunks c JOIN documents d ON d.id = c.document_id
-            WHERE c.enabled = 1 AND d.status = 'ready'"""
-        ).fetchall()
-    results = []
+    rows = db.execute(
+        """SELECT c.*, d.title AS source_title, d.status AS document_status
+        FROM document_chunks c
+        JOIN documents d ON d.id = c.document_id
+        JOIN knowledge_bases b ON b.id = c.base_id
+        WHERE c.enabled = 1 AND d.status = 'ready' AND (b.user_id = ? OR b.is_public = 1)""",
+        (user_id,),
+    ).fetchall()
+    results: list[dict[str, Any]] = []
     for row in rows:
         if base_ids and row["base_id"] not in base_ids:
             continue
         haystack = f"{row['source_title']} {row['title_path']} {row['content']}".casefold()
         score = sum(haystack.count(term) for term in terms)
         if score:
-            results.append({"source_id": row["document_id"], "chunk_id": row["id"], "base_id": row["base_id"], "source_title": row["source_title"], "snippet": row["content"][:1200], "score": score})
-    results.sort(key=lambda item: item["score"], reverse=True)
-    return {"results": results[: payload.top_k], "metadata": {"mode": "keyword", "count": len(results)}}
+            results.append({"row": row, "rank": float(score)})
+    results.sort(key=lambda item: item["rank"], reverse=True)
+    return results
+
+
+def _fts_candidates(db: Any, user_id: str, payload: DocumentSearchRequest) -> list[dict[str, Any]]:
+    tokens = fts_terms(payload.query).split()
+    if not tokens or not has_chunk_fts(db):
+        return []
+    match_query = " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens[:64])
+    conditions = ["c.enabled = 1", "d.status = 'ready'", "(b.user_id = ? OR b.is_public = 1)"]
+    parameters: list[Any] = [match_query, user_id]
+    if payload.base_ids:
+        placeholders = ",".join("?" for _ in payload.base_ids)
+        conditions.append(f"c.base_id IN ({placeholders})")
+        parameters.extend(payload.base_ids)
+    rows = db.execute(
+        f"""SELECT c.*, d.title AS source_title,
+               bm25(document_chunks_fts, 0.0, 0.0, 0.0, 6.0, 4.0, 1.0, 6.0, 4.0, 1.0) AS bm25_score
+        FROM document_chunks_fts
+        JOIN document_chunks c ON c.id = document_chunks_fts.chunk_id
+        JOIN documents d ON d.id = c.document_id
+        JOIN knowledge_bases b ON b.id = c.base_id
+        WHERE document_chunks_fts MATCH ? AND {' AND '.join(conditions)}
+        ORDER BY bm25_score ASC
+        LIMIT ?""",
+        (*parameters, max(payload.top_k * 6, 20)),
+    ).fetchall()
+    return [{"row": row, "rank": abs(float(row["bm25_score"]))} for row in rows]
+
+
+def _expanded_snippet(db: Any, row: Any, reserved_chunk_ids: set[str]) -> tuple[str, list[str]]:
+    neighbors = db.execute(
+        """SELECT id, chunk_index, title_path, content FROM document_chunks
+        WHERE document_id = ? AND enabled = 1 AND chunk_index BETWEEN ? AND ?
+        ORDER BY chunk_index""",
+        (row["document_id"], max(0, int(row["chunk_index"]) - 1), int(row["chunk_index"]) + 1),
+    ).fetchall()
+    selected = []
+    total_length = 0
+    for neighbor in neighbors:
+        if neighbor["id"] != row["id"] and neighbor["title_path"] != row["title_path"]:
+            continue
+        if neighbor["id"] != row["id"] and neighbor["id"] in reserved_chunk_ids:
+            continue
+        content = str(neighbor["content"] or "").strip()
+        if not content:
+            continue
+        if selected and total_length + len(content) > 1600:
+            continue
+        selected.append(neighbor)
+        total_length += len(content)
+    if not any(item["id"] == row["id"] for item in selected):
+        selected = [row]
+    chunk_ids = [item["id"] for item in selected]
+    snippet_parts: list[str] = []
+    for item in selected:
+        content = str(item["content"] or "").strip()
+        if content and not any(content in existing or existing in content for existing in snippet_parts):
+            snippet_parts.append(content)
+    return "\n".join(snippet_parts)[:1800], chunk_ids
+
+
+def search_documents(user_id: str, payload: DocumentSearchRequest) -> dict[str, Any]:
+    with connect() as db:
+        mode = "fts5_bm25"
+        try:
+            candidates = _fts_candidates(db, user_id, payload)
+        except sqlite3.OperationalError:
+            candidates = []
+        if not candidates:
+            mode = "keyword"
+            candidates = _keyword_candidates(db, user_id, payload)
+
+        results: list[dict[str, Any]] = []
+        reserved_chunk_ids: set[str] = set()
+        for candidate in candidates:
+            row = candidate["row"]
+            if row["id"] in reserved_chunk_ids:
+                continue
+            snippet, context_chunk_ids = _expanded_snippet(db, row, reserved_chunk_ids)
+            if not snippet:
+                continue
+            reserved_chunk_ids.update(context_chunk_ids)
+            results.append({
+                "source_id": row["document_id"],
+                "chunk_id": row["id"],
+                "context_chunk_ids": context_chunk_ids,
+                "base_id": row["base_id"],
+                "source_title": row["source_title"],
+                "title_path": row["title_path"],
+                "chunk_type": row["chunk_type"],
+                "snippet": snippet,
+                "score": round(float(candidate["rank"]), 6),
+            })
+            if len(results) >= payload.top_k:
+                break
+    return {
+        "results": results,
+        "metadata": {
+            "mode": mode,
+            "candidate_count": len(candidates),
+            "count": len(results),
+            "chunk_strategy_version": CHUNK_STRATEGY_VERSION,
+        },
+    }

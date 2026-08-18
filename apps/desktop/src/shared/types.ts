@@ -6,12 +6,25 @@ export interface Platform {
 
 export interface Message {
   id: string;
-  sender: 'user' | 'bot' | 'agent';
+  sender: 'user' | 'bot' | 'agent' | 'platform';
   content: string;
   timestamp: string;
+  deliveryStatus?: 'sending' | 'sent';
   media?: {
     type: 'image';
     url: string;
+  };
+  timeline?: {
+    type: 'text' | 'image' | 'product' | 'order' | 'system' | 'context' | 'time' | 'unknown';
+    displayMode: 'bubble' | 'card' | 'separator' | 'notice' | 'hidden';
+    data?: {
+      title?: string;
+      product_id?: string | null;
+      price?: number | null;
+      price_label?: string | null;
+      image_url?: string | null;
+      source_label?: string | null;
+    };
   };
 }
 
@@ -29,6 +42,16 @@ export interface Conversation {
   humanRequired?: boolean;
   humanRequiredReason?: string | null;
   humanRequiredWord?: string | null;
+  syncIssue?: {
+    observationId: string;
+    firstDetectedAt: string;
+    latestDetectedAt: string;
+    unread: boolean;
+    messageCount: number;
+    consecutiveFailureCount: number;
+    requiresAttention: boolean;
+    dismissedAt: string | null;
+  } | null;
   time: string;
   messages: Message[];
 }

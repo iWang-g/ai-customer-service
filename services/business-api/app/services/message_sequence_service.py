@@ -37,6 +37,16 @@ def _value(item: object, key: str, default: Any = None) -> Any:
     return getattr(item, key, default)
 
 
+def _payload_value(item: object, key: str, default: Any = None) -> Any:
+    explicit = _value(item, key)
+    if explicit is not None:
+        return explicit
+    raw_payload = _value(item, "raw_payload", {})
+    if isinstance(raw_payload, Mapping):
+        return raw_payload.get(key, default)
+    return default
+
+
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
@@ -76,14 +86,12 @@ def normalize_image_url(value: Any) -> str:
 
 
 def message_type(item: object) -> str:
-    explicit = str(_value(item, "message_type") or "").strip().lower()
+    explicit = str(_payload_value(item, "message_type") or "").strip().lower()
     if explicit:
         return explicit
-    raw_payload = _value(item, "raw_payload", {})
-    if isinstance(raw_payload, Mapping):
-        media_type = str(raw_payload.get("media_type") or "").strip().lower()
-        if media_type:
-            return media_type
+    media_type = str(_payload_value(item, "media_type") or "").strip().lower()
+    if media_type:
+        return media_type
     return "image" if str(_value(item, "content") or "").strip() in {"[图片]", "[image]"} else "text"
 
 
@@ -112,7 +120,13 @@ def _image_evidence(item: object) -> str:
 def message_fingerprint(item: object) -> str:
     sender = str(_value(item, "sender_role") or "").strip().lower()
     kind = message_type(item)
-    evidence = _image_evidence(item) if kind == "image" else normalize_text(_value(item, "content"))
+    if kind == "image":
+        evidence = _image_evidence(item)
+    else:
+        structured = _payload_value(item, "structured_payload")
+        evidence = normalize_text(_value(item, "content"))
+        if isinstance(structured, Mapping):
+            evidence += "|" + json.dumps(structured, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"{sender}|{kind}|{evidence}"
 
 
@@ -123,7 +137,12 @@ def longest_tail_overlap(history: Sequence[str], current: Sequence[str]) -> int:
     return 0
 
 
-def snapshot_payload_hash(messages: Iterable[object]) -> str:
+def snapshot_payload_hash(
+    messages: Iterable[object],
+    *,
+    include_structured_fields: bool = True,
+    include_timeline_fields: bool = True,
+) -> str:
     normalized = [
         {
             "dom_sequence": int(_value(item, "dom_sequence", index)),
@@ -134,6 +153,24 @@ def snapshot_payload_hash(messages: Iterable[object]) -> str:
             "image_sha256": _value(item, "image_sha256"),
             "media_resource_id": _value(item, "media_resource_id"),
             "platform_message_id": _value(item, "platform_message_id"),
+            **(
+                {
+                    "display_mode": _value(item, "display_mode", "bubble") or "bubble",
+                    "automation_mode": _value(item, "automation_mode", "trigger") or "trigger",
+                    "structured_payload": _payload_value(item, "structured_payload"),
+                    "collector_rule_version": _payload_value(item, "collector_rule_version"),
+                }
+                if include_structured_fields
+                else {}
+            ),
+            **(
+                {
+                    "time_label": _value(item, "time_label") or None,
+                    "has_explicit_time": bool(_value(item, "has_explicit_time", False)),
+                }
+                if include_timeline_fields
+                else {}
+            ),
         }
         for index, item in enumerate(messages)
     ]

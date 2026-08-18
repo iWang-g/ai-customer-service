@@ -1,0 +1,8 @@
+[Unit]
+Description=Back up AI Customer Service data
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ai-customer-service/deploy/production/scripts/backup.sh

@@ -34,10 +34,10 @@ export default function ImportModal({
 
   const t = {
     zh: {
-      title: '导入桌面客服窗口',
-      subtitle: '从已登录的拼多多店铺导入历史会话',
+      title: '导入最近会话消息',
+      subtitle: '从已登录的拼多多店铺读取最近会话消息',
       searchPlaceholder: '搜索客户名、店铺或消息预览...',
-      importBtn: '导入会话',
+      importBtn: '导入消息',
       importingTitle: '正在读取聊天记录',
       importingSubtitle: '正在切换到目标店铺和客户会话，请稍候...',
       emptyTitle: '未检测到可导入会话',
@@ -48,10 +48,10 @@ export default function ImportModal({
       imported: '已读取',
     },
     en: {
-      title: 'Import Desktop Session',
-      subtitle: 'Import historical conversations from logged-in Pinduoduo shops',
+      title: 'Import Recent Messages',
+      subtitle: 'Read recent conversation messages from logged-in Pinduoduo shops',
       searchPlaceholder: 'Search customer, shop, or preview...',
-      importBtn: 'Import Session',
+      importBtn: 'Import Messages',
       importingTitle: 'Reading conversation history',
       importingSubtitle: 'Switching to the target shop and customer session...',
       emptyTitle: 'No importable conversations found',
@@ -83,6 +83,7 @@ export default function ImportModal({
       onClose();
     } catch (importError) {
       setActionError(importError instanceof Error ? importError.message : t.retry);
+    } finally {
       setImportingId(null);
     }
   };
@@ -95,7 +96,7 @@ export default function ImportModal({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            onClick={() => { if (!importingId) onClose(); }}
+            onClick={onClose}
             className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
           />
           <motion.div
@@ -105,6 +106,15 @@ export default function ImportModal({
             className="relative w-full max-w-lg bg-white rounded-3xl shadow-2xl overflow-hidden flex flex-col"
             id="import-modal-content"
           >
+            <button
+              type="button"
+              onClick={onClose}
+              className="absolute right-4 top-4 z-10 p-2 hover:bg-slate-100 rounded-xl transition-colors text-slate-400"
+              id="close-import-modal-btn"
+              aria-label="Close"
+            >
+              <X size={20} />
+            </button>
             {importingId ? (
               <div className="p-10 flex flex-col items-center justify-center text-center min-h-[320px]">
                 <LoaderCircle size={56} className="text-sky-500 animate-spin mb-6" />
@@ -121,9 +131,7 @@ export default function ImportModal({
                       <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{t.subtitle}</p>
                     </div>
                   </div>
-                  <button onClick={onClose} className="p-2 hover:bg-slate-100 rounded-xl transition-colors text-slate-400" id="close-import-modal-btn" aria-label="Close">
-                    <X size={20} />
-                  </button>
+                  <div className="w-9 shrink-0" aria-hidden="true" />
                 </div>
                 <div className="p-4 bg-slate-50 border-b border-slate-100 flex gap-2">
                   <div className="relative flex-1">

@@ -14,7 +14,7 @@ class RpaReplyBundleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)
-        self.db = Session(self.engine)
+        self.db = Session(self.engine, autoflush=False)
         self.user = User(
             username="reply-bundle",
             display_name="Reply Bundle Test",
@@ -27,9 +27,20 @@ class RpaReplyBundleTests(unittest.TestCase):
             platform_code="pinduoduo",
             external_conversation_id="customer-1",
             awaiting_reply=True,
+            last_message_sequence=2,
         )
         self.db.add(self.conversation)
         self.db.flush()
+        self.customer_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="Customer question",
+            message_status="sent",
+            conversation_sequence=1,
+        )
+        self.db.add(self.customer_message)
         self.message = Message(
             conversation_id=self.conversation.id,
             user_id=self.user.id,
@@ -37,6 +48,7 @@ class RpaReplyBundleTests(unittest.TestCase):
             sender_role="agent",
             content="Text answer",
             message_status="queued",
+            conversation_sequence=2,
         )
         self.db.add(self.message)
         self.db.flush()
@@ -163,6 +175,10 @@ class RpaReplyBundleTests(unittest.TestCase):
         self.assertFalse(self.conversation.awaiting_reply)
 
     def test_failed_reply_keeps_conversation_awaiting_reply(self) -> None:
+        self.conversation.latest_message_text = self.message.content
+        self.conversation.latest_message_at = self.message.collected_at
+        self.db.commit()
+
         complete_task(
             self.db,
             self.task,
@@ -175,6 +191,7 @@ class RpaReplyBundleTests(unittest.TestCase):
 
         self.db.refresh(self.conversation)
         self.assertTrue(self.conversation.awaiting_reply)
+        self.assertEqual(self.conversation.latest_message_text, "Customer question")
 
 
 if __name__ == "__main__":

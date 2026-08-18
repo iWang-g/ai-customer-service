@@ -115,6 +115,52 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply_run.trigger_sequence, 1)
         self.assertFalse(reply_run.document_retrieval_used)
 
+    async def test_completed_auto_reply_broadcasts_queued_message_for_optimistic_ui(self) -> None:
+        response = create_send_task(
+            self.db,
+            self.user,
+            SendMessageRequest(
+                conversation_id=self.conversation.id,
+                content="Optimistic automatic reply",
+            ),
+            idempotency_key="auto-reply:optimistic",
+            source="automation",
+        )
+        request = ReplyRunRequest(
+            conversation_id=self.conversation.id,
+            source_message_id=self.source_message.id,
+        )
+        result = {
+            "decision": "auto_send",
+            "text": "Optimistic automatic reply",
+            "confidence": 1.0,
+            "risk_flags": [],
+            "provider": "test",
+            "trace_id": "trace-optimistic",
+            "intent": {},
+            "qa_match": None,
+            "retrieval": [],
+            "model_call_details": [],
+            "task_ids": [response.task_id],
+        }
+        with (
+            patch(
+                "app.services.automation_service._execute_bound_reply",
+                new=AsyncMock(return_value=result),
+            ),
+            patch("app.services.realtime.realtime_manager.broadcast", new=AsyncMock()) as broadcast,
+        ):
+            await run_reply(self.db, self.user, request)
+
+        payloads = [call.args[1] for call in broadcast.await_args_list]
+        self.assertEqual(payloads[0]["type"], "automation.reply.started")
+        self.assertEqual(payloads[0]["conversation_id"], self.conversation.id)
+        payload = payloads[-1]
+        self.assertEqual(payload["type"], "automation.reply.completed")
+        self.assertEqual(payload["task_id"], response.task_id)
+        self.assertEqual(payload["message"]["id"], response.message.id)
+        self.assertEqual(payload["message"]["message_status"], "queued")
+
     def test_auto_send_idempotency_key_reuses_message_and_task(self) -> None:
         request = SendMessageRequest(
             conversation_id=self.conversation.id,

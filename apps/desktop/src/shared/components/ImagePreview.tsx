@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Image as ImageIcon, X } from 'lucide-react';
-import { getQaImageUrl } from '../api/client';
+import { loadQaImageUrl } from '../api/client';
 
 interface ImagePreviewProps {
   src: string;
@@ -12,7 +12,27 @@ interface ImagePreviewProps {
 export default function ImagePreview({ src, alt = '图片', className = '', previewClassName = '' }: ImagePreviewProps) {
   const [open, setOpen] = useState(false);
   const [failed, setFailed] = useState(false);
-  const url = getQaImageUrl(src);
+  const [url, setUrl] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    setFailed(false);
+    void loadQaImageUrl(src).then((nextUrl) => {
+      if (!active) {
+        if (nextUrl.startsWith('blob:')) URL.revokeObjectURL(nextUrl);
+        return;
+      }
+      objectUrl = nextUrl.startsWith('blob:') ? nextUrl : '';
+      setUrl(nextUrl);
+    }).catch(() => {
+      if (active) setFailed(true);
+    });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [src]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -26,7 +46,7 @@ export default function ImagePreview({ src, alt = '图片', className = '', prev
   return (
     <>
       <button type="button" onClick={() => setOpen(true)} className={`inline-flex overflow-hidden rounded-lg border border-slate-200 bg-slate-50 ${className}`} title="点击查看大图">
-        {failed ? (
+        {failed || !url ? (
           <span className="flex h-12 w-12 flex-col items-center justify-center gap-0.5 text-[9px] text-slate-400">
             <ImageIcon className="h-4 w-4" />
             加载失败

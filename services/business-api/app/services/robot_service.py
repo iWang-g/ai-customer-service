@@ -8,6 +8,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AiModelCatalog,
     PlatformAccount,
     Robot,
     RobotPlatformScope,
@@ -18,6 +19,8 @@ from app.models import (
 )
 from app.schemas.robot import RobotCreate, RobotPlatformScope as RobotPlatformScopeInput, RobotRead, RobotUpdate
 from app.core.config import get_settings
+from app.core.security import create_token
+from datetime import timedelta
 
 
 def _unique_ids(values: Iterable[str]) -> list[str]:
@@ -119,11 +122,27 @@ def _validate_platform_scopes(
     return scopes
 
 
-def _knowledge_base(base_id: str) -> dict[str, Any]:
+def _knowledge_access_token(user: User) -> str:
+    settings = get_settings()
+    return create_token(
+        settings.jwt_secret_key,
+        subject=user.id,
+        token_type="access",
+        expires_delta=timedelta(minutes=5),
+        extra_claims={
+            "username": user.username,
+            "display_name": getattr(user, "display_name", "") or user.username,
+            "role": user.role,
+        },
+    )
+
+
+def _knowledge_base(user: User, base_id: str) -> dict[str, Any]:
     settings = get_settings()
     try:
         response = httpx.get(
             f"{settings.knowledge_base_url.rstrip('/')}/api/v1/knowledge-bases/{base_id}",
+            headers={"Authorization": f"Bearer {_knowledge_access_token(user)}"},
             timeout=5,
             trust_env=False,
         )
@@ -145,7 +164,7 @@ def _knowledge_base(base_id: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _validate_knowledge_bases(qa_ids: list[str], product_ids: list[str], tone_id: str | None) -> None:
+def _validate_knowledge_bases(user: User, qa_ids: list[str], product_ids: list[str], tone_id: str | None) -> None:
     expected = {
         **{base_id: "qa" for base_id in _unique_ids(qa_ids)},
         **{base_id: "product" for base_id in _unique_ids(product_ids)},
@@ -153,7 +172,7 @@ def _validate_knowledge_bases(qa_ids: list[str], product_ids: list[str], tone_id
     if tone_id and tone_id.strip():
         expected[tone_id.strip()] = "tone"
     for base_id, expected_kind in expected.items():
-        value = _knowledge_base(base_id)
+        value = _knowledge_base(user, base_id)
         if value.get("kind") != expected_kind:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -164,6 +183,20 @@ def _validate_knowledge_bases(qa_ids: list[str], product_ids: list[str], tone_id
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Knowledge base is disabled: {base_id}",
             )
+
+
+def _validate_model(db: Session, config: dict[str, Any]) -> None:
+    model_id = str(config.get("model") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择机器人模型")
+    if db.scalar(select(AiModelCatalog.id).limit(1)) is None:
+        return
+    row = db.scalar(select(AiModelCatalog).where(
+        AiModelCatalog.model_id == model_id,
+        AiModelCatalog.available.is_(True),
+    ))
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"AI 模型当前不可用：{model_id}")
 
 
 def replace_robot_relations(
@@ -177,7 +210,7 @@ def replace_robot_relations(
     scopes: list[RobotPlatformScopeInput],
 ) -> None:
     scopes = _validate_platform_scopes(db, user, scopes)
-    _validate_knowledge_bases(qa_ids, product_ids, tone_id)
+    _validate_knowledge_bases(user, qa_ids, product_ids, tone_id)
     db.execute(delete(RobotQaKnowledgeBase).where(RobotQaKnowledgeBase.robot_id == robot.id))
     db.execute(delete(RobotProductKnowledgeBase).where(RobotProductKnowledgeBase.robot_id == robot.id))
     db.execute(delete(RobotToneKnowledgeBase).where(RobotToneKnowledgeBase.robot_id == robot.id))
@@ -208,6 +241,7 @@ def replace_robot_relations(
 
 def create_robot(db: Session, user: User, request: RobotCreate) -> Robot:
     config = request.config_json if isinstance(request.config_json, dict) else {}
+    _validate_model(db, config)
     qa_ids = request.qa_knowledge_base_ids or _config_relations(config)[0]
     product_ids = request.product_knowledge_base_ids or _config_relations(config)[1]
     tone_id = request.tone_knowledge_base_id or _config_relations(config)[2]
@@ -229,6 +263,7 @@ def update_robot(db: Session, user: User, robot_id: str, request: RobotUpdate) -
     if request.status is not None:
         robot.status = request.status
     if request.config_json is not None:
+        _validate_model(db, request.config_json)
         robot.config_json = request.config_json
     relation_fields = {"qa_knowledge_base_ids", "product_knowledge_base_ids", "tone_knowledge_base_id", "platform_scopes"}
     if relation_fields.intersection(request.model_fields_set):

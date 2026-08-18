@@ -11,8 +11,12 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", alias="AI_REPLY_HOST")
     port: int = Field(default=8020, alias="AI_REPLY_PORT")
     knowledge_base_url: str = Field(default="http://127.0.0.1:8010", alias="KNOWLEDGE_BASE_URL")
+    knowledge_base_public_url: str = Field(
+        default="",
+        alias="KNOWLEDGE_BASE_PUBLIC_URL",
+    )
     provider: str = Field(default="local", alias="AI_PROVIDER")
-    model: str = Field(default="deepseek-chat", alias="AI_MODEL")
+    model: str = Field(default="deepseek-v4-flash", alias="AI_MODEL")
     provider_base_url: str = Field(default="https://api.deepseek.com", alias="AI_PROVIDER_BASE_URL")
     provider_api_key: str = Field(default="", alias="AI_PROVIDER_API_KEY")
     deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")

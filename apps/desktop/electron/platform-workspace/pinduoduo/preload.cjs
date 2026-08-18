@@ -11,6 +11,7 @@ const SWITCH_TIMEOUT_MS = 4000;
 const SWITCH_POLL_MS = 100;
 const IMAGE_CONFIRMATION_HARD_TIMEOUT_MS = 60000;
 const MANUAL_ACTIVITY_PAUSE_MS = 5000;
+const PAGE_ACTIVITY_REPORT_INTERVAL_MS = 5000;
 const IDENTITY_STABLE_MS = 1000;
 const HANDLED_UNREAD_RETRY_MS = 30000;
 const MANUAL_VERIFICATION_PATTERN = /安全验证|请完成验证|风险验证|拖动.{0,8}滑块|滑块验证|账号异常|盗号风险|存在盗号风险|安全风险|立即修改密码|验证码错误|验证码已发送/i;
@@ -107,10 +108,67 @@ function loadSelectors() {
   if (!argument) return FALLBACK_SELECTORS;
   try {
     const parsed = JSON.parse(decodeURIComponent(argument.slice(prefix.length)));
-    return { ...FALLBACK_SELECTORS, ...parsed };
+    const configuredSelectors = parsed?.selectors || parsed;
+    if (parsed?.rules) collectorRules = normalizeCollectorRules(parsed.rules);
+    return { ...FALLBACK_SELECTORS, ...configuredSelectors };
   } catch {
     return FALLBACK_SELECTORS;
   }
+}
+
+const DEFAULT_COLLECTOR_RULES = {
+  version: 'bundled',
+  platform: 'pinduoduo',
+  classification: {
+    system_selectors: ['.msg-system', '[class*="System"]'],
+    context_selectors: ['[class*="BuyerFromCard"]', '[class*="UserFrom"]'],
+    product_selectors: ['[class*="GoodsCard"]', '[class*="goods"]', '[class*="product"]'],
+    order_selectors: ['.order-card', '.kwaishop-cs-BizOrderCard', '[class*="OrderCard"]'],
+    ignored_text_patterns: ['^没有更多了$', '^暂无更多(?:消息)?$'],
+    context_text_patterns: ['^当前用户来自.*(?:商品详情页|店铺|直播间|搜索|活动页)'],
+    product_text_patterns: ['(?:商品\\s*ID\\s*[：:]?\\s*\\d{6,}|查看商品规格)'],
+    system_text_patterns: ['(?:撤回了一条消息|邀请下单.*立即使用)$'],
+  },
+};
+let collectorRules = DEFAULT_COLLECTOR_RULES;
+
+function stringArray(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string').slice(0, 100) : [];
+}
+
+function normalizeCollectorRules(value) {
+  if (!value || value.platform !== 'pinduoduo') return DEFAULT_COLLECTOR_RULES;
+  const configured = value.classification || {};
+  const defaults = DEFAULT_COLLECTOR_RULES.classification;
+  return {
+    version: typeof value.version === 'string' ? value.version.slice(0, 64) : 'remote',
+    platform: 'pinduoduo',
+    classification: Object.fromEntries(Object.keys(defaults).map((key) => [
+      key,
+      stringArray(configured[key]).length ? stringArray(configured[key]) : defaults[key],
+    ])),
+  };
+}
+
+function matchesConfiguredSelector(element, key) {
+  for (const selector of collectorRules.classification[key] || []) {
+    try {
+      if (element.matches(selector) || element.querySelector(selector)) return true;
+    } catch {
+      // Ignore invalid remotely configured selectors.
+    }
+  }
+  return false;
+}
+
+function matchesConfiguredText(value, key) {
+  return (collectorRules.classification[key] || []).some((pattern) => {
+    try {
+      return new RegExp(pattern, 'i').test(value);
+    } catch {
+      return false;
+    }
+  });
 }
 
 const selectors = loadSelectors();
@@ -129,6 +187,20 @@ function diagnostic(stage, details = {}, level = 'info') {
 function text(value, limit = MAX_TEXT) {
   const cleaned = String(value || '').replace(/\s+/g, ' ').trim();
   return cleaned ? cleaned.slice(0, limit) : null;
+}
+
+let lastPageActivityReportedAt = 0;
+
+function emitPageActivity(activityType) {
+  const now = Date.now();
+  if (now - lastPageActivityReportedAt < PAGE_ACTIVITY_REPORT_INTERVAL_MS) return;
+  lastPageActivityReportedAt = now;
+  ipcRenderer.send(CHANNEL, {
+    version: 1,
+    type: 'page_activity',
+    activity_type: activityType,
+    observed_at: new Date().toISOString(),
+  });
 }
 
 function messageText(value, limit = MAX_TEXT) {
@@ -432,16 +504,32 @@ function contentImage(element, contentElement) {
   return images.find((image) => !isLikelyAvatarImage(image, element)) || null;
 }
 
+function hasProductCardEvidence(element, contentElement) {
+  const explicit = attribute(element, ['data-message-type', 'data-msg-type']);
+  if (explicit && /goods|product|mall/i.test(explicit)) return true;
+  const content = messageText(contentElement?.innerText || contentElement?.textContent) || '';
+  const hasProductId = /\u5546\u54c1\s*ID\s*[\uff1a:]?\s*\d{6,}/i.test(content);
+  const hasProductAction = /\u67e5\u770b\u5546\u54c1\u89c4\u683c/.test(content);
+  const hasPrice = /[\uffe5\u00a5]\s*\d+(?:\.\d{1,2})?/.test(content);
+  const hasImage = Boolean(contentImage(element, contentElement));
+  const selectorMatched = matchesConfiguredSelector(element, 'product_selectors');
+  return (
+    (hasProductAction && (hasProductId || hasImage))
+    || (hasProductId && hasImage && hasPrice)
+    || (selectorMatched && hasImage && (hasProductId || hasProductAction || hasPrice))
+  );
+}
+
 function messageType(element, contentElement) {
   const explicit = attribute(element, ['data-message-type', 'data-msg-type']);
   if (explicit && /image|pic/i.test(explicit)) return 'image';
   if (explicit && /goods|product|mall/i.test(explicit)) return 'product';
   if (explicit && /order/i.test(explicit)) return 'order';
   if (explicit && /system|notice/i.test(explicit)) return 'notice';
-  if (element.querySelector('.msg-system, [class*="System"]')) return 'notice';
-  if (element.querySelector('[class*="BuyerFromCard"]')) return 'lead';
-  if (element.querySelector('.order-card, .kwaishop-cs-BizOrderCard, [class*="OrderCard"]')) return 'order';
-  if (element.querySelector('[class*="goods"], [class*="product"]')) return 'product';
+  if (matchesConfiguredSelector(element, 'system_selectors')) return 'system';
+  if (matchesConfiguredSelector(element, 'context_selectors')) return 'context';
+  if (matchesConfiguredSelector(element, 'order_selectors')) return 'order';
+  if (hasProductCardEvidence(element, contentElement)) return 'product';
   if (contentImage(element, contentElement)) return 'image';
   return 'text';
 }
@@ -452,13 +540,47 @@ function messageTimeLabel(element) {
     || text(timeElement?.textContent, 64);
 }
 
-function isIgnoredMessage(element, type, content) {
-  if (['notice', 'system', 'lead'].includes(type)) return true;
-  if (element.querySelector('[class*="BuyerFromCard"]')) return true;
+function hasKnownSender(element) {
+  if (element.querySelector('.buyer-item, .cs-item')) return true;
+  const explicit = attribute(element, ['data-sender-role', 'data-direction', 'data-from']);
+  if (explicit) return true;
+  const marker = `${element.className || ''} ${element.getAttribute('aria-label') || ''}`.toLowerCase();
+  return /(^|[\s_-])(right|left|self|mine|send|seller|outgoing|buyer|customer|incoming)([\s_-]|$)/.test(marker);
+}
+
+function isIgnoredMessage(_element, _type, content) {
   const normalized = content.replace(/\s+/g, ' ').trim();
   if (isPlatformSystemPrompt(normalized)) return true;
-  if (/^(?:(?:\d{4}\s*(?:[-/.]|\u5e74))?\d{1,2}\s*(?:[-/.]|\u6708)\s*\d{1,2}\s*(?:\u65e5)?|\u4eca\u5929|\u6628\u5929|\u524d\u5929)\s+\d{1,2}:\d{2}(?::\d{2})?$/.test(normalized)) return true;
-  return /^(?:\u5f53\u524d\u7528\u6237\u6765\u81ea.*(?:\u5546\u54c1\u8be6\u60c5\u9875|\u5e97\u94fa|\u76f4\u64ad\u95f4|\u641c\u7d22|\u6d3b\u52a8\u9875)|(?:\u5bf9\u65b9|\u60a8|\u4f60)?\u64a4\u56de\u4e86\u4e00\u6761\u6d88\u606f|.*\u9080\u8bf7\u4e0b\u5355.*\u7acb\u5373\u4f7f\u7528)/.test(normalized);
+  return matchesConfiguredText(normalized, 'ignored_text_patterns');
+}
+
+const FULL_TIME_LABEL_PATTERN = /^(?:(?:\d{4}\s*(?:[-/.]|年))?\d{1,2}\s*(?:[-/.]|月)\s*\d{1,2}\s*(?:日)?|今天|昨天|前天)\s+\d{1,2}:\d{2}(?::\d{2})?$/;
+
+function structuredCardPayload(element, type, content, imageUrl) {
+  if (!['product', 'order', 'context', 'unknown'].includes(type)) return null;
+  const normalized = content.replace(/\s+/g, ' ').trim();
+  const lines = content.split(/\n+/).map((item) => item.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const productId = normalized.match(/(?:商品\s*ID|商品ID|ID)\s*[：:]?\s*([0-9]{6,})/i)?.[1] || null;
+  const priceLine = lines.find((item) => /^[￥¥]\s*[0-9]/.test(item)) || null;
+  const price = normalized.match(/[￥¥]\s*([0-9]+(?:\.[0-9]{1,2})?)/)?.[1] || null;
+  const sourceLabel = lines.find((item) => /^当前用户来自\s*/.test(item)) || null;
+  const title = lines.find((item) => !(
+    /^(?:商品\s*ID|商品ID|ID)\s*[：:]?/i.test(item)
+    || /^当前用户来自\s*/.test(item)
+    || /^[￥¥]\s*[0-9]/.test(item)
+    || /^(?:复制|查看商品规格)$/.test(item)
+  )) || normalized;
+  const links = [...element.querySelectorAll('a[href]')];
+  const linkUrl = links.map((link) => link.href).find((value) => /^https?:/i.test(value || '')) || null;
+  return {
+    title: title.slice(0, 512),
+    product_id: productId,
+    price: price ? Number(price) : null,
+    price_label: priceLine,
+    image_url: imageUrl,
+    platform_url: linkUrl,
+    source_label: sourceLabel,
+  };
 }
 
 function stripLeadingTimeLabel(content, timeLabel) {
@@ -468,8 +590,10 @@ function stripLeadingTimeLabel(content, timeLabel) {
 
 function readMessage(element) {
   const contentElement = queryFirst(element, selectors.messageContent) || element;
-  const type = messageType(element, contentElement);
-  const image = type === 'image' ? contentImage(element, contentElement) : null;
+  let type = messageType(element, contentElement);
+  const image = ['image', 'product', 'order', 'context'].includes(type)
+    ? contentImage(element, contentElement)
+    : null;
   let imageUrl = null;
   if (image) {
     try {
@@ -482,21 +606,46 @@ function readMessage(element) {
       imageUrl = null;
     }
   }
+  const timeLabel = messageTimeLabel(element);
   let content = messageText(contentElement.innerText || contentElement.textContent);
-  content = stripLeadingTimeLabel(content || '', messageTimeLabel(element));
+  const originalContent = content || '';
+  if (FULL_TIME_LABEL_PATTERN.test(originalContent.replace(/\s+/g, ' ').trim())) type = 'time';
+  if (type !== 'time') content = stripLeadingTimeLabel(originalContent, timeLabel);
+  const normalizedContent = (content || '').replace(/\s+/g, ' ').trim();
+  if (matchesConfiguredText(normalizedContent, 'context_text_patterns')) type = 'context';
+  else if (matchesConfiguredText(normalizedContent, 'system_text_patterns')) type = 'system';
+  else if (
+    matchesConfiguredText(normalizedContent, 'product_text_patterns')
+    && hasProductCardEvidence(element, contentElement)
+  ) type = 'product';
+  else if (type === 'text' && !hasKnownSender(element)) type = 'unknown';
   if (!content && type === 'image') content = '[image]';
   if (!content && type === 'product') content = '[product]';
   if (!content && type === 'order') content = '[order]';
+  if (!content && type === 'context') content = '[context]';
   if (!content || isIgnoredMessage(element, type, content)) return null;
   const sender = text(element.querySelector('.nickname')?.textContent, 128)
     || attribute(element, ['data-sender-name', 'data-nickname']);
+  const resolvedSenderRole = ['system', 'time', 'context', 'unknown'].includes(type)
+    ? 'platform'
+    : senderRole(element);
   return {
     platform_message_id: attribute(element, ['data-message-id', 'data-msg-id', 'data-id', 'id']),
-    sender_role: senderRole(element),
+    sender_role: resolvedSenderRole,
     sender_name: sender,
     content,
     message_type: type,
     image_url: imageUrl,
+    display_mode: type === 'time' ? 'separator'
+      : type === 'system' ? 'notice'
+        : ['product', 'order', 'context', 'unknown'].includes(type) ? 'card' : 'bubble',
+    automation_mode: type === 'text' || type === 'image' || (
+      resolvedSenderRole === 'customer' && (type === 'product' || type === 'order')
+    ) ? 'trigger' : type === 'context' || type === 'product' || type === 'order' ? 'context' : 'ignore',
+    structured_payload: structuredCardPayload(element, type, content, imageUrl),
+    collector_rule_version: collectorRules.version,
+    time_label: timeLabel,
+    has_explicit_time: Boolean(timeLabel),
   };
 }
 
@@ -505,7 +654,6 @@ function readSnapshotMessages(elements) {
   for (const element of elements) {
     const message = readMessage(element);
     if (!message) continue;
-    if (!['text', 'image'].includes(message.message_type)) continue;
     messages.push({
       dom_sequence: messages.length,
       sender_role: message.sender_role,
@@ -513,6 +661,12 @@ function readSnapshotMessages(elements) {
       content: message.content,
       image_url: message.image_url,
       platform_message_id: message.platform_message_id,
+      display_mode: message.display_mode,
+      automation_mode: message.automation_mode,
+      structured_payload: message.structured_payload,
+      collector_rule_version: message.collector_rule_version,
+      time_label: message.time_label,
+      has_explicit_time: message.has_explicit_time,
     });
   }
   return messages;
@@ -864,17 +1018,31 @@ function personalOrderPanelState() {
   const personalTab = findVisibleTextElement('个人订单', selectors.personalOrdersTab);
   const panel = personalTab?.closest?.('.right-panel-container') || document.querySelector('.right-panel-container');
   const value = text(panel?.innerText || panel?.textContent, 12000) || '';
+  const filterCounts = [...value.matchAll(/(?:全部|未完成|待发货)\s*[（(]?\s*(\d+)\s*[）)]?/g)]
+    .map((match) => Number(match[1]));
   const selected = Boolean(
     personalTab?.classList?.contains('bar-select')
     || personalTab?.getAttribute?.('aria-selected') === 'true'
   );
+  const hasLoadingIndicator = panel ? [
+    ...panel.querySelectorAll(
+      '.ant-spin-spinning,.semi-spin,[aria-busy="true"],[class*="loading"],[class*="Loading"]',
+    ),
+  ].some(visibleElement) : false;
+  const explicitEmptyText = /(?:(?:近\s*)?\d+\s*(?:天|个?月|年)\s*(?:内)?\s*)?(?:暂无|没有|无)(?:更多)?(?:个人)?订单|(?:当前客户|该客户)\s*(?:暂无|没有|无)(?:更多)?订单/.test(value);
   return {
     personal_tab_selected: selected,
     has_personal_filters: /全部\s*\d*\s+未完成\s*\d*\s+待发货/.test(value),
+    filter_counts: filterCounts,
+    filters_confirm_empty: filterCounts.length >= 3 && filterCounts.every((count) => count === 0),
+    explicit_empty_text: explicitEmptyText,
+    has_loading_indicator: hasLoadingIndicator,
     has_store_pending_notice: /店铺待支付订单不再提供聊天催付|您可使用催支付/.test(value),
     has_store_pending_action: /(?:^|\s)催支付(?:\s|$)/.test(value),
     has_personal_action: /查看说明书|查看视频|改价/.test(value),
     has_order_marker: /订单编号/.test(value),
+    has_latest_orders_label: value.includes('最新订单'),
+    has_personal_orders_label: value.includes('个人订单'),
     panel_text_length: value.length,
   };
 }
@@ -969,17 +1137,22 @@ async function collectCustomerOrders() {
         page_summary: { visible_count: uniqueOrders.length, total_count: uniqueOrders.length, has_more: false },
       };
     }
-    const panelText = text(document.body?.innerText, 12000) || '';
-    const hasUnparsedOrder = /订单编号\s*[：:]?\s*[\d-]{8,}/.test(panelText);
-    // The pagination footer is an empty-state signal only when no order marker is present.
+    const hasUnparsedOrder = personalPanel.state.has_order_marker;
+    const explicitEmptyText = personalPanel.state.explicit_empty_text;
+    // A stable personal-order panel with three zero filters is also a confirmed empty state.
     const explicitEmpty = !hasUnparsedOrder
-      && /暂无(?:个人)?订单|当前客户(?:暂无|没有)订单|该客户(?:暂无|没有)订单|近\d+天没有更多订单/.test(panelText);
+      && !personalPanel.state.has_loading_indicator
+      && (explicitEmptyText || personalPanel.state.filters_confirm_empty);
     diagnostic(explicitEmpty ? 'order_collection_empty' : 'order_collection_unavailable', {
       phase,
       error: explicitEmpty ? null : 'order_cards_and_empty_state_not_found',
       has_unparsed_order: hasUnparsedOrder,
-      body_has_latest_orders_label: panelText.includes('最新订单'),
-      body_has_personal_orders_label: panelText.includes('个人订单'),
+      explicit_empty_text: explicitEmptyText,
+      filters_confirm_empty: personalPanel.state.filters_confirm_empty,
+      filter_counts: personalPanel.state.filter_counts,
+      has_loading_indicator: personalPanel.state.has_loading_indicator,
+      panel_has_latest_orders_label: personalPanel.state.has_latest_orders_label,
+      panel_has_personal_orders_label: personalPanel.state.has_personal_orders_label,
       label_candidates: orderLabelCandidates(),
     }, explicitEmpty ? 'info' : 'warn');
     return {
@@ -1348,30 +1521,6 @@ function currentReplyText(input) {
   return 'value' in input ? String(input.value || '') : String(input.textContent || '');
 }
 
-function findReplySendButton(input) {
-  const roots = [
-    input.closest?.('form'),
-    input.parentElement,
-    input.parentElement?.parentElement,
-    document,
-  ].filter(Boolean);
-  const textPattern = /^发送$|发送消息|立即发送|send/i;
-  for (const root of roots) {
-    const candidates = [
-      ...queryCandidates(root, selectors.replySendButton),
-      ...queryCandidates(root, ['button', '[role="button"]']),
-    ];
-    const button = candidates.find((candidate) => {
-      if (!isVisible(candidate) || candidate.disabled || candidate === input) return false;
-      const label = text(candidate.textContent, 80) || attribute(candidate, ['aria-label', 'title', 'data-testid']);
-      const marker = `${candidate.className || ''} ${candidate.id || ''}`;
-      return textPattern.test(label || '') || /(^|[-_\s])(send|reply)([-_\s]|$)/i.test(marker);
-    });
-    if (button) return button;
-  }
-  return null;
-}
-
 function clickSendButton(button) {
   const rect = button.getBoundingClientRect();
   const init = {
@@ -1652,22 +1801,15 @@ async function sendMessage(requestId, targetKey, customerName, content) {
       return;
     }
 
-    const sendButton = findReplySendButton(input);
-    if (sendButton) clickSendButton(sendButton);
-    let method = sendButton ? 'click' : null;
-    let sent = await waitForReplyInputEmpty(input);
-    if (!sent) {
-      dispatchEnterToSend(input);
-      method = 'enter';
-      sent = await waitForReplyInputEmpty(input);
-    }
+    dispatchEnterToSend(input);
+    const method = 'enter';
+    const sent = await waitForReplyInputEmpty(input);
     diagnostic('message_send_attempt_completed', {
       conversation_key: entry.key,
       customer_name: entry.conversation.customer_name,
       sent,
       method,
-      click_attempted: Boolean(sendButton),
-      enter_fallback_attempted: method === 'enter',
+      enter_attempted: true,
       content_length: content.length,
     });
     emit('message_send_result', {
@@ -1676,7 +1818,7 @@ async function sendMessage(requestId, targetKey, customerName, content) {
       conversation_key: entry.key,
       customer_name: entry.conversation.customer_name,
       method,
-      error: sent ? null : 'reply_input_not_cleared_after_click_and_enter',
+      error: sent ? null : 'reply_input_not_cleared_after_enter',
     });
   } catch (error) {
     diagnostic('message_send_exception', {
@@ -2158,6 +2300,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('pointerdown', (event) => {
     if (event.isTrusted) {
       manualPauseUntil = Date.now() + MANUAL_ACTIVITY_PAUSE_MS;
+      emitPageActivity('pointerdown');
       diagnostic('manual_activity_pause_started', {
         event_type: 'pointerdown',
         pause_ms: MANUAL_ACTIVITY_PAUSE_MS,
@@ -2167,6 +2310,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keydown', (event) => {
     if (event.isTrusted) {
       manualPauseUntil = Date.now() + MANUAL_ACTIVITY_PAUSE_MS;
+      emitPageActivity('keydown');
       diagnostic('manual_activity_pause_started', {
         event_type: 'keydown',
         key: event.key,
@@ -2178,6 +2322,13 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 ipcRenderer.on('pdd-adapter:command', (_event, command) => {
+  if (command?.type === 'collector-rules') {
+    collectorRules = normalizeCollectorRules(command.rules);
+    lastSnapshot = null;
+    diagnostic('collector_rules_updated', { version: collectorRules.version });
+    scheduleScan(0, 'collector_rules_updated');
+    return;
+  }
   if (command?.type === 'set-store-actor-state') {
     storeActorBusy = command.state !== 'idle' && command.state !== 'cancelled';
     if (!storeActorBusy) {

@@ -1,5 +1,6 @@
 import { BrowserWindow, WebContentsView, session, shell, clipboard, nativeImage } from 'electron';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { classifyPddPage } from './pinduoduo/detector.js';
 import { PddCollectionRuntime } from './pinduoduo/runtime.js';
@@ -19,6 +20,9 @@ const IMAGE_SEND_CONFIRMATION_TIMEOUT_MS = 70000;
 const STORE_SCAN_TIMEOUT_MS = 10000;
 const UNREAD_COLLECTION_TIMEOUT_MS = 15000;
 const BACKGROUND_ACCOUNT_LOAD_TIMEOUT_MS = 30000;
+const SESSION_HEALTH_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const SESSION_IDLE_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+const SESSION_REFRESH_TIMEOUT_MS = 30000;
 const UNAVAILABLE_LOGIN_STATUSES = new Set(['login_required', 'risk_control', 'account_mismatch']);
 export const PDD_PENDING_ACCOUNT_ALIAS = '待识别店铺名称';
 const GENERIC_ACCOUNT_ALIAS = /^(拼多多|拼多多商家后台|拼多多商家管理后台|拼多多客服平台|商家后台|客服平台)$/;
@@ -93,9 +97,18 @@ export class PddWorkspaceManager {
     pddPreloadPath = null,
     rpaManager = null,
     diagnosticLogger = null,
+    knowledgeBaseUrl = 'http://127.0.0.1:8010',
+    businessApiUrl = 'http://127.0.0.1:8001/api/v1',
+    collectorRulesCachePath = null,
+    rendererAdditionalArguments = [],
     homeUrl = PDD_HOME_URL,
     workspaceShellUrl = null,
     loadWorkspaceShell = true,
+    sessionHealthCheckIntervalMs = SESSION_HEALTH_CHECK_INTERVAL_MS,
+    sessionIdleRefreshIntervalMs = SESSION_IDLE_REFRESH_INTERVAL_MS,
+    sessionRefreshTimeoutMs = SESSION_REFRESH_TIMEOUT_MS,
+    pageClassifier = classifyPddPage,
+    now = () => Date.now(),
   }) {
     this.registry = registry;
     this.devServerUrl = devServerUrl;
@@ -104,9 +117,19 @@ export class PddWorkspaceManager {
     this.pddPreloadPath = pddPreloadPath;
     this.rpaManager = rpaManager;
     this.diagnosticLogger = diagnosticLogger;
+    this.knowledgeBaseOrigin = new URL(knowledgeBaseUrl).origin;
+    this.businessApiUrl = businessApiUrl.replace(/\/$/, '');
+    this.collectorRulesCachePath = collectorRulesCachePath;
+    this.collectorRules = this.#loadCachedCollectorRules();
+    this.rendererAdditionalArguments = [...rendererAdditionalArguments];
     this.homeUrl = homeUrl;
     this.workspaceShellUrl = workspaceShellUrl;
     this.loadWorkspaceShell = loadWorkspaceShell;
+    this.sessionHealthCheckIntervalMs = sessionHealthCheckIntervalMs;
+    this.sessionIdleRefreshIntervalMs = sessionIdleRefreshIntervalMs;
+    this.sessionRefreshTimeoutMs = sessionRefreshTimeoutMs;
+    this.pageClassifier = pageClassifier;
+    this.now = now;
     this.window = null;
     this.userId = null;
     this.activeAccountId = null;
@@ -128,6 +151,10 @@ export class PddWorkspaceManager {
     this.queuedBackgroundAccounts = new Set();
     this.backgroundLoadRunning = false;
     this.backgroundLoadGeneration = 0;
+    this.sessionHealthTimer = null;
+    this.sessionHealthCheckRunning = false;
+    this.sessionHealthGeneration = 0;
+    this.sessionHealthByAccount = new Map();
     this.verifiedAccountIdentities = new Set();
     this.overlayOpen = false;
     this.isQuitting = false;
@@ -172,15 +199,67 @@ export class PddWorkspaceManager {
     this.#syncRpaAccounts();
     await this.#ensureInitialAccount();
     this.#scheduleBackgroundAccountLoads();
+    this.#startSessionHealthMonitor();
     this.#publishState();
   }
 
-  async bindUser(userId) {
+  async bindUser(userId, accessToken = null) {
     if (!userId) throw new Error('缺少当前用户信息');
     if (this.userId && this.userId !== userId) await this.closeForLogout();
     this.userId = userId;
+    await this.#refreshCollectorRules(accessToken);
+    this.#startSessionHealthMonitor();
     this.#syncRpaAccounts();
     this.#publishState();
+  }
+
+  async #refreshCollectorRules(providedAccessToken = null) {
+    const accessToken = providedAccessToken || this.rpaManager?.accessToken;
+    if (!accessToken) return;
+    try {
+      const response = await fetch(`${this.businessApiUrl}/collector-rules/pinduoduo`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const rules = await response.json();
+      if (!rules || rules.platform !== 'pinduoduo' || typeof rules.version !== 'string') {
+        throw new Error('invalid collector rules');
+      }
+      this.collectorRules = rules;
+      this.#saveCollectorRules(rules);
+      for (const view of this.views.values()) {
+        if (!view.webContents.isDestroyed()) {
+          view.webContents.send('pdd-adapter:command', { type: 'collector-rules', rules });
+        }
+      }
+    } catch (error) {
+      this.#writeDiagnostic('system', 'collector_rules_refresh_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      }, 'warn');
+    }
+  }
+
+  #loadCachedCollectorRules() {
+    if (!this.collectorRulesCachePath) return null;
+    try {
+      const rules = JSON.parse(fs.readFileSync(this.collectorRulesCachePath, 'utf8'));
+      return rules?.platform === 'pinduoduo' && typeof rules.version === 'string' ? rules : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #saveCollectorRules(rules) {
+    if (!this.collectorRulesCachePath) return;
+    try {
+      fs.mkdirSync(path.dirname(this.collectorRulesCachePath), { recursive: true });
+      fs.writeFileSync(this.collectorRulesCachePath, JSON.stringify(rules), 'utf8');
+    } catch (error) {
+      this.#writeDiagnostic('system', 'collector_rules_cache_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      }, 'warn');
+    }
   }
 
   async #createWindow() {
@@ -198,6 +277,7 @@ export class PddWorkspaceManager {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
+        additionalArguments: this.rendererAdditionalArguments,
       },
     });
 
@@ -521,7 +601,11 @@ export class PddWorkspaceManager {
 
   async #downloadImage(imageUrl, signal = undefined) {
     if (!/^https?:\/\//i.test(String(imageUrl || ''))) throw new Error('图片地址无效');
-    const response = await fetch(imageUrl, { signal });
+    const headers = new Headers();
+    if (new URL(imageUrl).origin === this.knowledgeBaseOrigin && this.rpaManager?.accessToken) {
+      headers.set('Authorization', `Bearer ${this.rpaManager.accessToken}`);
+    }
+    const response = await fetch(imageUrl, { signal, headers });
     if (!response.ok) throw new Error(`图片下载失败（HTTP ${response.status}）`);
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.startsWith('image/')) throw new Error('远程资源不是图片');
@@ -543,6 +627,7 @@ export class PddWorkspaceManager {
       accountId: account.id,
       rescan: ({ reasons }) => this.#scanStore(account.id, reasons),
       onStateChange: ({ state, error }) => {
+        if (state !== 'idle' && state !== 'cancelled') this.#markSessionActivity(account.id);
         const view = this.views.get(account.id);
         if (view && !view.webContents.isDestroyed()) {
           view.webContents.send('pdd-adapter:command', {
@@ -874,6 +959,7 @@ export class PddWorkspaceManager {
   }
 
   async closeForLogout() {
+    this.#stopSessionHealthMonitor();
     this.#cancelBackgroundAccountLoads();
     await this.#flushAccountStorage();
     for (const accountId of [...this.views.keys()]) this.#destroyView(accountId);
@@ -891,6 +977,7 @@ export class PddWorkspaceManager {
 
   async prepareToQuit() {
     this.isQuitting = true;
+    this.#stopSessionHealthMonitor();
     this.#cancelBackgroundAccountLoads();
     await this.#flushAccountStorage();
     for (const accountId of [...this.views.keys()]) this.#destroyView(accountId);
@@ -1001,6 +1088,185 @@ export class PddWorkspaceManager {
     this.initialViewLoads.clear();
   }
 
+  #startSessionHealthMonitor() {
+    if (this.sessionHealthTimer || !this.userId || this.sessionHealthCheckIntervalMs <= 0) return;
+    this.sessionHealthTimer = setInterval(() => {
+      void this.#runSessionHealthChecks();
+    }, this.sessionHealthCheckIntervalMs);
+    this.sessionHealthTimer.unref?.();
+    this.#writeDiagnostic('system', 'session_health_monitor_started', {
+      check_interval_ms: this.sessionHealthCheckIntervalMs,
+      idle_refresh_interval_ms: this.sessionIdleRefreshIntervalMs,
+    });
+  }
+
+  #stopSessionHealthMonitor() {
+    if (this.sessionHealthTimer) clearInterval(this.sessionHealthTimer);
+    this.sessionHealthTimer = null;
+    this.sessionHealthCheckRunning = false;
+    this.sessionHealthGeneration += 1;
+    this.sessionHealthByAccount.clear();
+  }
+
+  #markSessionActivity(accountId, observedAt = this.now()) {
+    const health = this.sessionHealthByAccount.get(accountId) || {
+      lastCheckedAt: null,
+      lastRefreshAt: null,
+      refreshing: false,
+    };
+    health.lastActivityAt = Math.max(health.lastActivityAt || 0, observedAt);
+    this.sessionHealthByAccount.set(accountId, health);
+  }
+
+  async #runSessionHealthChecks() {
+    if (this.sessionHealthCheckRunning || !this.userId) return;
+    const generation = this.sessionHealthGeneration;
+    this.sessionHealthCheckRunning = true;
+    try {
+      for (const account of this.registry.list(this.userId)) {
+        if (generation !== this.sessionHealthGeneration || !this.userId) return;
+        await this.#checkAccountSession(account, generation);
+      }
+    } finally {
+      if (generation === this.sessionHealthGeneration) this.sessionHealthCheckRunning = false;
+    }
+  }
+
+  async #checkAccountSession(account, generation) {
+    if (generation !== this.sessionHealthGeneration) return;
+    const checkedAt = this.now();
+    const previous = this.sessionHealthByAccount.get(account.id) || {};
+    const health = {
+      lastActivityAt: previous.lastActivityAt || checkedAt,
+      lastCheckedAt: checkedAt,
+      lastRefreshAt: previous.lastRefreshAt || null,
+      refreshing: Boolean(previous.refreshing),
+    };
+    this.sessionHealthByAccount.set(account.id, health);
+
+    const view = this.views.get(account.id);
+    if (account.paused || account.archivedAt || !view || view.webContents.isDestroyed()) {
+      this.#writeDiagnostic(account.id, 'session_health_check_skipped', {
+        reason: account.paused ? 'paused' : account.archivedAt ? 'archived' : 'view_unavailable',
+      }, 'debug');
+      return;
+    }
+
+    const contents = view.webContents;
+    const pageStatus = this.pageClassifier(contents.getURL());
+    this.#writeDiagnostic(account.id, 'session_health_checked', {
+      page_status: pageStatus,
+      login_status: account.loginStatus || 'unknown',
+      page_path: diagnosticPagePath(contents.getURL()),
+      loading: contents.isLoading(),
+      actor_state: this.storeActors.get(account.id)?.state || 'idle',
+      idle_for_ms: Math.max(0, checkedAt - health.lastActivityAt),
+    }, 'debug');
+
+    if (UNAVAILABLE_LOGIN_STATUSES.has(pageStatus)) {
+      this.#setAccountLoginStatus(account.id, pageStatus);
+      this.#writeDiagnostic(account.id, 'session_login_unavailable', {
+        page_status: pageStatus,
+        page_path: diagnosticPagePath(contents.getURL()),
+      }, 'warn');
+      return;
+    }
+    if (pageStatus !== 'online' || account.loginStatus !== 'online') {
+      this.#writeDiagnostic(account.id, 'session_idle_refresh_skipped', {
+        reason: pageStatus !== 'online' ? 'page_not_online' : 'login_not_online',
+      }, 'debug');
+      return;
+    }
+    if (health.refreshing || contents.isLoading()) {
+      this.#writeDiagnostic(account.id, 'session_idle_refresh_skipped', {
+        reason: health.refreshing ? 'refresh_in_progress' : 'page_loading',
+      }, 'debug');
+      return;
+    }
+
+    const actor = this.storeActors.get(account.id);
+    if (actor && actor.state !== 'idle' && actor.state !== 'cancelled') {
+      this.#writeDiagnostic(account.id, 'session_idle_refresh_skipped', {
+        reason: 'store_actor_busy',
+        actor_state: actor.state,
+      }, 'debug');
+      return;
+    }
+    if (checkedAt - health.lastActivityAt < this.sessionIdleRefreshIntervalMs) return;
+    if (health.lastRefreshAt && checkedAt - health.lastRefreshAt < this.sessionIdleRefreshIntervalMs) return;
+    if (generation !== this.sessionHealthGeneration) return;
+
+    await this.#getStoreActor(account)
+      .enqueue(
+        'session_refresh',
+        () => this.#refreshIdleAccountPage(account, view),
+        { coalesceKey: 'session_refresh', rescanAfter: false },
+      )
+      .catch((error) => {
+        this.#writeDiagnostic(account.id, 'session_idle_refresh_failed', {
+          error: error?.message || String(error),
+        }, 'warn');
+      });
+  }
+
+  async #refreshIdleAccountPage(account, view) {
+    const health = this.sessionHealthByAccount.get(account.id);
+    if (!health || health.refreshing) return;
+    if (this.views.get(account.id) !== view || view.webContents.isDestroyed()) return;
+
+    const contents = view.webContents;
+    if (contents.isLoading() || this.pageClassifier(contents.getURL()) !== 'online') return;
+    health.refreshing = true;
+    this.#writeDiagnostic(account.id, 'session_idle_refresh_started', {
+      page_path: diagnosticPagePath(contents.getURL()),
+      idle_for_ms: Math.max(0, this.now() - health.lastActivityAt),
+    });
+    try {
+      const loadCompleted = this.#waitForSessionRefresh(contents);
+      contents.reload();
+      await loadCompleted;
+      const completedAt = this.now();
+      health.lastRefreshAt = completedAt;
+      health.lastActivityAt = completedAt;
+      this.#writeDiagnostic(account.id, 'session_idle_refresh_completed', {
+        page_path: diagnosticPagePath(contents.getURL()),
+      });
+    } finally {
+      health.refreshing = false;
+    }
+  }
+
+  #waitForSessionRefresh(contents) {
+    return new Promise((resolve, reject) => {
+      let mainFrameFailed = null;
+      const cleanup = () => {
+        clearTimeout(timer);
+        contents.removeListener('did-fail-load', onFailed);
+        contents.removeListener('did-stop-loading', onStopped);
+        contents.removeListener('render-process-gone', onGone);
+      };
+      const onFailed = (_event, errorCode, errorDescription, _url, isMainFrame) => {
+        if (isMainFrame && errorCode !== -3) mainFrameFailed = new Error(errorDescription);
+      };
+      const onStopped = () => {
+        cleanup();
+        if (mainFrameFailed) reject(mainFrameFailed);
+        else resolve();
+      };
+      const onGone = (_event, details) => {
+        cleanup();
+        reject(new Error(`店铺页面渲染进程异常：${details.reason}`));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('店铺页面保活刷新超时'));
+      }, this.sessionRefreshTimeoutMs);
+      contents.on('did-fail-load', onFailed);
+      contents.once('did-stop-loading', onStopped);
+      contents.once('render-process-gone', onGone);
+    });
+  }
+
   #ensureView(account) {
     const existing = this.views.get(account.id);
     if (existing && !existing.webContents.isDestroyed()) return existing;
@@ -1013,13 +1279,14 @@ export class PddWorkspaceManager {
         sandbox: true,
         spellcheck: false,
         ...(this.pddPreloadPath ? { preload: this.pddPreloadPath } : {}),
-        additionalArguments: [serializedSelectorArgument()],
+        additionalArguments: [serializedSelectorArgument(this.collectorRules)],
       },
     });
     view.setBackgroundColor('#ffffff');
     view.setVisible(false);
     view.webContents.setBackgroundThrottling(false);
     this.views.set(account.id, view);
+    this.#markSessionActivity(account.id);
     this.#createCollector(account.id);
     this.window.contentView.addChildView(view);
     this.#configureSession(view.webContents.session);
@@ -1064,6 +1331,7 @@ export class PddWorkspaceManager {
     };
 
     contents.on('did-start-loading', () => {
+      this.#markSessionActivity(accountId);
       mainFrameLoadFailed = false;
       setStatus('loading');
       this.#writeDiagnostic(accountId, 'view_load_started', {
@@ -1099,6 +1367,7 @@ export class PddWorkspaceManager {
       }, 'error');
     });
     contents.on('did-navigate', (_event, url) => {
+      this.#markSessionActivity(accountId);
       this.#updateLoginStatus(accountId, url);
       this.#writeDiagnostic(accountId, 'view_navigated', {
         page_path: diagnosticPagePath(url),
@@ -1106,6 +1375,7 @@ export class PddWorkspaceManager {
       this.#publishState();
     });
     contents.on('did-navigate-in-page', (_event, url) => {
+      this.#markSessionActivity(accountId);
       this.#updateLoginStatus(accountId, url);
       this.#writeDiagnostic(accountId, 'view_navigated_in_page', {
         page_path: diagnosticPagePath(url),
@@ -1116,6 +1386,11 @@ export class PddWorkspaceManager {
       if (channel !== 'pdd-adapter:event') return;
       if (payload?.type === 'diagnostic') {
         this.diagnosticLogger?.write(accountId, payload);
+        return;
+      }
+      if (payload?.type === 'page_activity') {
+        const observedAt = Date.parse(payload.observed_at || '');
+        this.#markSessionActivity(accountId, Number.isFinite(observedAt) ? observedAt : this.now());
         return;
       }
       if (payload?.type === 'account_name_detection') {
@@ -1247,6 +1522,7 @@ export class PddWorkspaceManager {
 
   #destroyView(accountId) {
     this.#cancelStoreActor(accountId, '店铺页面已关闭，任务已取消');
+    this.sessionHealthByAccount.delete(accountId);
     this.verifiedAccountIdentities.delete(accountId);
     this.initialViewLoads.delete(accountId);
     const view = this.views.get(accountId);
@@ -1398,14 +1674,33 @@ export class PddWorkspaceManager {
     this.runtime.set(accountId, { ...this.runtime.get(accountId), ...updates });
   }
 
-  async refreshCustomerOrders({ platformAccountId, externalConversationId, customerName }) {
+  async sendImageData({ platformAccountId, externalConversationId, customerName, imageDataUrl }) {
     this.#requireUser();
+    const match = String(imageDataUrl || '').match(/^data:image\/(?:png|jpeg|webp);base64,([a-z0-9+/=]+)$/i);
+    if (!match) {
+      throw new Error('图片内容无效');
+    }
+    if (Buffer.byteLength(match[1], 'base64') > 10 * 1024 * 1024) {
+      throw new Error('图片不能超过 10 MB');
+    }
     const account = this.registry.list(this.userId).find(
       (candidate) => candidate.platformAccountId === platformAccountId
         && !candidate.paused
-        && !candidate.archivedAt
         && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
         && this.#isAccountIdentityVerified(candidate),
+    );
+    if (!account) throw new Error('未找到消息对应的拼多多店铺，请确认店铺已登录');
+    const image = nativeImage.createFromDataURL(imageDataUrl);
+    if (image.isEmpty()) throw new Error('图片内容无效');
+    return this.#getStoreActor(account).enqueue('send_image', ({ setState }) => (
+      this.#sendImageNow(account, externalConversationId, customerName, image, setState)
+    ));
+  }
+
+  async refreshCustomerOrders({ platformAccountId, externalConversationId, customerName }) {
+    this.#requireUser();
+    const account = this.registry.list(this.userId).find(
+      (candidate) => candidate.platformAccountId === platformAccountId,
     );
     if (!account) throw new Error('未找到订单对应的拼多多店铺，请确认店铺已登录');
     const conversationKey = externalConversationId || `name:${customerName}`;
@@ -1420,11 +1715,7 @@ export class PddWorkspaceManager {
   }) {
     this.#requireUser();
     const account = this.registry.list(this.userId).find(
-      (candidate) => candidate.platformAccountId === platformAccountId
-        && !candidate.paused
-        && !candidate.archivedAt
-        && !UNAVAILABLE_LOGIN_STATUSES.has(candidate.loginStatus)
-        && this.#isAccountIdentityVerified(candidate),
+      (candidate) => candidate.platformAccountId === platformAccountId,
     );
     if (!account) throw new Error('未找到会话对应的可用拼多多店铺');
     if (!externalConversationId) throw new Error('会话缺少平台会话标识，无法安全重置');
@@ -1475,7 +1766,7 @@ export class PddWorkspaceManager {
 
   #updateLoginStatus(accountId, value) {
     try {
-      const status = classifyPddPage(value);
+      const status = this.pageClassifier(value);
       if (['login_required', 'online', 'risk_control'].includes(status)) {
         this.#setAccountLoginStatus(accountId, status);
       }

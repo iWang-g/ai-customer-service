@@ -6,9 +6,9 @@
 
 ## 已实现能力
 
-- **账号与消息中心**：客服注册、登录、令牌刷新，会话与消息分页，WebSocket 实时事件，人工发送文本和图片。
+- **账号与消息中心**：客服登录、令牌刷新，会话与消息分页，WebSocket 实时事件，人工发送文本和图片；公开注册已关闭。
 - **拼多多工作区**：多店铺添加、切换、重命名、暂停、移除与恢复；内嵌原平台页面并采集会话、消息和客户订单。
-- **本机 RPA**：由 Electron 管理 Python 子进程，完成节点注册、心跳、店铺同步、任务拉取、消息发送和本地失败重试。
+- **本机 RPA**：开发环境由 Electron 管理 Python 子进程，正式安装包使用独立 `rpa-agent.exe`，完成节点注册、心跳、店铺同步、任务拉取、消息发送和本地失败重试。
 - **AI 自动回复**：QA 优先匹配、产品知识检索、语气约束、上下文配置、兜底回复、超时安抚及人工接管。
 - **安全与运营策略**：入站敏感词拦截、出站违禁词替换、待人工状态、购买意向跟进和签收关怀。
 - **管理后台**：机器人和店铺范围配置，QA/产品/语气知识库，模型配置与连通性测试，邮件模板，运行概览、日志和事件。
@@ -64,7 +64,7 @@ pnpm dev:desktop
 - 用户名：`admin`
 - 密码：`admin123`
 
-登录页也可以注册普通客服账号。开发环境默认给新账号初始化示例会话，设置 `SEED_DEMO_DATA=false` 可关闭。默认凭据和 JWT 密钥仅用于本地开发，部署前必须覆盖。
+公开注册已关闭，新增账号由服务端管理员维护。开发环境可通过配置初始化示例会话，设置 `SEED_DEMO_DATA=false` 可关闭。默认凭据和 JWT 密钥仅用于本地开发，部署前必须覆盖。
 
 ### 启用拼多多消息写入
 
@@ -100,7 +100,7 @@ pnpm lint
 # 构建桌面端前端
 pnpm build
 
-# 构建 Windows NSIS 安装包
+# 校验远程配置、构建独立 RPA 并生成 Windows NSIS 安装包
 pnpm dist
 
 # 业务 API 与 RPA 冒烟测试
@@ -113,7 +113,7 @@ pnpm --dir apps/desktop test:pdd-collector
 pnpm --dir apps/desktop test:store-actor
 ```
 
-`pnpm build` 输出到 `apps/desktop/dist/`，`pnpm dist` 输出到 `apps/desktop/release/`。
+`pnpm build` 输出到 `apps/desktop/dist/`，`pnpm dist` 输出到 `apps/desktop/release-windows/<构建时间>/`。发布环境和构建要求详见 `apps/desktop/RELEASE.md`。
 
 三个 Python 服务的单元测试可分别运行，避免它们同名的 `app` 包互相影响：
 

@@ -1,0 +1,117 @@
+name: ai-customer-service
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  networks:
+    - backend
+
+services:
+  knowledge-base:
+    <<: *service-defaults
+    build:
+      context: ../../services/knowledge-base
+    image: ai-customer-service/knowledge-base:1.0.0
+    environment:
+      KB_HOST: 0.0.0.0
+      KB_PORT: 8010
+      KB_DATABASE_PATH: /data/knowledge-base.db
+      KB_ASSET_PATH: /data/assets
+      KB_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      KB_CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-null}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      KB_LEGACY_OWNER_USER_ID: ${KB_LEGACY_OWNER_USER_ID:-}
+    ports:
+      - "127.0.0.1:8010:8010"
+    volumes:
+      - ./data/knowledge-base:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/healthz', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    mem_limit: 1g
+
+  ai-reply:
+    <<: *service-defaults
+    build:
+      context: ../../services/ai-reply
+    image: ai-customer-service/ai-reply:1.0.0
+    environment:
+      AI_REPLY_HOST: 0.0.0.0
+      AI_REPLY_PORT: 8020
+      KNOWLEDGE_BASE_URL: http://knowledge-base:8010
+      KNOWLEDGE_BASE_PUBLIC_URL: ${KNOWLEDGE_BASE_PUBLIC_URL:-http://43.139.142.142/kb-api}
+      AI_PROVIDER: ${AI_PROVIDER:-local}
+      AI_MODEL: ${AI_MODEL:-deepseek-v4-flash}
+      AI_PROVIDER_BASE_URL: ${AI_PROVIDER_BASE_URL:-https://api.deepseek.com}
+      AI_PROVIDER_API_KEY: ${AI_PROVIDER_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      AI_TEMPERATURE: ${AI_TEMPERATURE:-0.2}
+      AI_REQUEST_TIMEOUT_SECONDS: ${AI_REQUEST_TIMEOUT_SECONDS:-20}
+    expose:
+      - "8020"
+    depends_on:
+      knowledge-base:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/healthz', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    mem_limit: 512m
+
+  business-api:
+    <<: *service-defaults
+    build:
+      context: ../../services/business-api
+    image: ai-customer-service/business-api:1.0.0
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: sqlite:////data/business-api.db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-14}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?DEFAULT_ADMIN_PASSWORD is required}
+      DEFAULT_ADMIN_DISPLAY_NAME: ${DEFAULT_ADMIN_DISPLAY_NAME:-Administrator}
+      SEED_DEMO_DATA: "false"
+      AUTO_CREATE_TABLES: "true"
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-null}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AI_REPLY_BASE_URL: http://ai-reply:8020
+      AI_PROVIDER: ${AI_PROVIDER:-deepseek}
+      AI_PROVIDER_BASE_URL: ${AI_PROVIDER_BASE_URL:-https://api.deepseek.com}
+      AI_PROVIDER_API_KEY: ${AI_PROVIDER_API_KEY:-}
+      KNOWLEDGE_BASE_URL: http://knowledge-base:8010
+      PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED: ${PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED:-true}
+      PDD_COLLECTOR_RULES_JSON: ${PDD_COLLECTOR_RULES_JSON:-}
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - ./data/business-api:/data
+    depends_on:
+      knowledge-base:
+        condition: service_healthy
+      ai-reply:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    mem_limit: 768m
+
+networks:
+  backend:
+    driver: bridge

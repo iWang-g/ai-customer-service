@@ -12,12 +12,14 @@ class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     kind: KnowledgeKind
     persona: str = Field(default="", max_length=2000)
+    is_public: bool = False
 
 
 class KnowledgeBaseUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     persona: str | None = Field(default=None, max_length=2000)
     enabled: bool | None = None
+    is_public: bool | None = None
 
 
 class KnowledgeBaseRead(BaseModel):
@@ -26,6 +28,12 @@ class KnowledgeBaseRead(BaseModel):
     kind: KnowledgeKind
     persona: str
     enabled: bool
+    is_public: bool
+    owner_user_id: str
+    owner_username: str
+    owner_display_name: str
+    is_owner: bool
+    read_only: bool
     item_count: int
     created_at: str
     updated_at: str
@@ -93,6 +101,7 @@ class DocumentRead(BaseModel):
     file_size: int
     status: str
     chunk_count: int
+    chunk_strategy_version: str
     error_message: str
     created_at: str
     updated_at: str

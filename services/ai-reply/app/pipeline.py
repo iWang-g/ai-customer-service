@@ -29,12 +29,32 @@ PRODUCT_KNOWLEDGE_WORDS = (
     "安装", "价格", "多少钱", "优惠", "库存", "现货", "发货", "物流", "快递", "订单", "售后",
     "退款", "退货", "换货", "保修", "质保", "故障", "坏了", "进水",
 )
-DEFAULT_FALLBACK_REPLY = "您的问题我将为您接入专业产品客服，请稍后"
+DEFAULT_FALLBACK_REPLY = "亲亲，这个问题这边暂时无法确认，我帮您进一步核实，请稍等~"
 DEFAULT_DIRECT_REPLY = "好的亲亲，有需要随时告诉我哦～"
 DEFAULT_HUMAN_HANDOFF_REPLY = "好的亲亲，正在为您转接人工客服，请稍等～"
-MAX_OUTBOUND_BLOCK_WORDS = 200
-MAX_OUTBOUND_BLOCK_WORD_LENGTH = 64
-MAX_OUTBOUND_REPLACEMENT_LENGTH = 128
+PROHIBITED_OUTBOUND_PATTERNS = (
+    ("external_link", re.compile(r"(?i)(?:https?://|ftp://|www\.)\S+")),
+    ("external_link", re.compile(
+        r"(?i)(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+        r"(?:com|cn|net|org|top|shop|vip|link|xyz|cc|me|io|co)(?:[/?:#]\S*)?"
+    )),
+    ("email_address", re.compile(r"(?i)\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b")),
+    ("phone_number", re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")),
+    ("phone_number", re.compile(
+        r"(?:联系电话|联系号码|手机号|手机|电话)\s*[:：]?\s*(?:0\d{2,3}[- ]?)?\d{7,8}"
+    )),
+    ("wechat_id", re.compile(
+        r"(?i)(?:微信|微\s*信|v信|vx|wechat)(?:号)?\s*[:：]?\s*[a-z][-_a-z0-9]{5,19}"
+    )),
+    ("qq_id", re.compile(r"(?i)(?:qq|扣扣)(?:号)?\s*[:：]?\s*[1-9]\d{4,11}")),
+)
+INTERNAL_DISCLOSURE_PATTERNS = (
+    ("internal_ai", re.compile(r"(?i)(?:\bAI\b|人工智能|机器人|语言模型|大模型|提示词)")),
+    ("internal_knowledge", re.compile(r"(?:知识库|知识片段|文档检索|未检索到|无法访问知识库)")),
+)
+UNSOLICITED_HANDOFF_PATTERN = re.compile(
+    r"(?:联系|咨询|转接|转至|找).{0,8}(?:平台人工客服|平台客服|其他客服|人工客服)"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -85,77 +105,17 @@ def clean_reply(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
-def _outbound_block_words(request: ReplyRequest) -> list[str]:
-    value = request.reply_config.get("outbound_block_words", [])
-    if not isinstance(value, list):
-        return []
-    words: list[str] = []
-    for item in value:
-        word = clean_reply(item) if isinstance(item, str) else ""
-        if not word or len(word) > MAX_OUTBOUND_BLOCK_WORD_LENGTH or word in words:
-            continue
-        words.append(word)
-        if len(words) >= MAX_OUTBOUND_BLOCK_WORDS:
-            break
-    return words
+def _matched_prohibited_outbound_content(text: str) -> str | None:
+    return next((name for name, pattern in PROHIBITED_OUTBOUND_PATTERNS if pattern.search(text)), None)
 
 
-def _outbound_replace_rules(request: ReplyRequest) -> list[tuple[str, str]]:
-    value = request.reply_config.get("outbound_block_rules", [])
-    if not isinstance(value, list):
-        return []
-    rules: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, dict) or item.get("enabled", True) is False:
-            continue
-        word = clean_reply(item.get("word")) if isinstance(item.get("word"), str) else ""
-        replacement = clean_reply(item.get("replacement")) if isinstance(item.get("replacement"), str) else ""
-        normalized_word = word.casefold()
-        if (
-            not word
-            or not replacement
-            or len(word) > MAX_OUTBOUND_BLOCK_WORD_LENGTH
-            or len(replacement) > MAX_OUTBOUND_REPLACEMENT_LENGTH
-            or normalized_word in seen
-        ):
-            continue
-        seen.add(normalized_word)
-        rules.append((word, replacement))
-        if len(rules) >= MAX_OUTBOUND_BLOCK_WORDS:
-            break
-    return sorted(rules, key=lambda item: len(item[0]), reverse=True)
-
-
-def _apply_outbound_replacements(
-    request: ReplyRequest,
-    text: str,
-) -> tuple[str, list[str], str | None]:
-    rules = _outbound_replace_rules(request)
-    if not rules or not text:
-        return text, [], None
-    replacements = {word.casefold(): replacement for word, replacement in rules}
-    pattern = re.compile("|".join(re.escape(word) for word, _ in rules), flags=re.IGNORECASE)
-    matched_words: list[str] = []
-
-    def replace(match: re.Match[str]) -> str:
-        normalized = match.group(0).casefold()
-        if normalized not in matched_words:
-            matched_words.append(normalized)
-        return replacements[normalized]
-
-    replaced = pattern.sub(replace, text)
-    normalized_replaced = replaced.casefold()
-    residual = next((word for word, _ in rules if word.casefold() in normalized_replaced), None)
-    return replaced, matched_words, residual
-
-
-def _matched_outbound_block_word(request: ReplyRequest, text: str) -> str | None:
-    normalized_text = text.casefold()
-    return next(
-        (word for word in _outbound_block_words(request) if word.casefold() in normalized_text),
-        None,
-    )
+def _matched_identity_disclosure(text: str, *, allow_human_handoff: bool) -> str | None:
+    matched = next((name for name, pattern in INTERNAL_DISCLOSURE_PATTERNS if pattern.search(text)), None)
+    if matched:
+        return matched
+    if not allow_human_handoff and UNSOLICITED_HANDOFF_PATTERN.search(text):
+        return "unsolicited_handoff"
+    return None
 
 
 def _fallback_reply(request: ReplyRequest) -> str:
@@ -209,48 +169,16 @@ def _reply_with_outbound_guard(
     retrieval_status: str = "not_needed",
     media: list[dict[str, Any]] | None = None,
 ) -> ReplyResponse:
-    replaced_text, replaced_words, residual_word = _apply_outbound_replacements(request, text)
     guarded_flags = list(risk_flags)
-    if replaced_words:
-        guarded_flags = list(dict.fromkeys([*guarded_flags, "outbound_block_word", "outbound_block_replaced"]))
-    if residual_word:
-        logger.error(
-            "outbound replacement remains blocked trace_id=%s word=%s",
-            trace_id,
-            residual_word,
-        )
-        return ReplyResponse(
-            decision="needs_human",
-            text="",
-            media=[],
-            intent=intent,
-            action_plan=ActionPlan(
-                workflow="human_review",
-                next_action="mark_needs_human",
-                required_actions=["mark_needs_human"],
-                blocked_actions=["send_platform_text", "send_platform_image"],
-            ),
-            confidence=confidence,
-            risk_flags=list(dict.fromkeys([*guarded_flags, "replacement_blocked"])),
-            qa_match=qa_match,
-            retrieval=retrieval,
-            retrieval_status=retrieval_status,
-            model_calls=model_calls,
-            provider="outbound-replace-rule",
-            trace_id=trace_id,
-        )
-
-    matched_word = _matched_outbound_block_word(request, replaced_text)
-    if not matched_word:
-        if replaced_words:
-            logger.info(
-                "outbound reply words replaced trace_id=%s replacement_count=%d",
-                trace_id,
-                len(replaced_words),
-            )
+    identity_disclosure = _matched_identity_disclosure(
+        text,
+        allow_human_handoff=intent.reply_route == "human_handoff",
+    )
+    prohibited_content = _matched_prohibited_outbound_content(text) or identity_disclosure
+    if not prohibited_content:
         return ReplyResponse(
             decision="auto_send" if request.allow_auto_send else "suggest",
-            text=replaced_text,
+            text=text,
             media=media or [],
             intent=intent,
             action_plan=action_plan,
@@ -264,22 +192,25 @@ def _reply_with_outbound_guard(
             trace_id=trace_id,
         )
 
-    fallback, fallback_replaced_words, fallback_residual_word = _apply_outbound_replacements(
-        request,
-        _fallback_reply(request),
+    fallback = _fallback_reply(request)
+    fallback_prohibited_content = (
+        _matched_prohibited_outbound_content(fallback)
+        or _matched_identity_disclosure(
+            fallback,
+            allow_human_handoff=intent.reply_route == "human_handoff",
+        )
     )
-    fallback_blocked_word = _matched_outbound_block_word(request, fallback)
     guarded_flags = list(dict.fromkeys([
         *guarded_flags,
-        "outbound_block_word",
-        *(["outbound_block_replaced"] if fallback_replaced_words else []),
+        "identity_disclosure" if identity_disclosure else "prohibited_outbound_content",
+        prohibited_content,
     ]))
-    if fallback_residual_word or fallback_blocked_word:
+    if fallback_prohibited_content:
         logger.error(
-            "outbound reply and fallback blocked trace_id=%s reply_word=%s fallback_word=%s",
+            "outbound reply and fallback blocked trace_id=%s reply_reason=%s fallback_reason=%s",
             trace_id,
-            matched_word,
-            fallback_residual_word or fallback_blocked_word,
+            prohibited_content,
+            fallback_prohibited_content,
         )
         return ReplyResponse(
             decision="needs_human",
@@ -298,10 +229,14 @@ def _reply_with_outbound_guard(
             retrieval=retrieval,
             retrieval_status=retrieval_status,
             model_calls=model_calls,
-            provider="outbound-block-rule",
+            provider="outbound-safety-rule",
             trace_id=trace_id,
         )
-    logger.warning("outbound reply replaced by fallback trace_id=%s word=%s", trace_id, matched_word)
+    logger.warning(
+        "outbound reply replaced by fallback trace_id=%s reason=%s",
+        trace_id,
+        prohibited_content,
+    )
     return ReplyResponse(
         decision="auto_send" if request.allow_auto_send else "suggest",
         text=fallback,
@@ -318,7 +253,7 @@ def _reply_with_outbound_guard(
         retrieval=retrieval,
         retrieval_status=retrieval_status,
         model_calls=model_calls,
-        provider="outbound-block-fallback",
+        provider="outbound-safety-fallback",
         trace_id=trace_id,
     )
 
@@ -415,6 +350,10 @@ intent: direct_reply | normal_question | email_link_request | human_handoff | un
 reply_route: direct | retrieve_product | email_workflow | human_handoff
 direct_reply_text: 仅 direct 或 human_handoff 时填写可直接发给客户的简短回复，其他路由必须为空
 direct_reply_text 是最终可发送给客户的内容，必须遵守基础风格、回答长度、客户称呼、客服自称、虚拟人设和额外要求。
+你作为店铺中正在接待客户的真正客服与客户交流，回复必须自然、可信，不能让客户察觉到自动化系统的存在。
+所有可发送内容都不得提及或暗示 AI、机器人、模型、系统、提示词、知识库、知识片段、文档检索、信息来源、能力限制等内部实现。
+信息不足时只能以店铺客服口吻说明“这边暂时无法确认，我帮您进一步核实”，不得说“知识库中没有”“未检索到”“无法访问知识库”等。
+除非客户明确要求转人工且当前路由为 human_handoff，否则不得主动建议或要求客户联系平台人工客服、其他客服或转人工。
 confidence: 0 到 1
 need_customer_reply: 必须为 true
 need_doc_search: 仅 retrieve_product 为 true
@@ -426,21 +365,14 @@ template_id: 可选，仅可返回下方可用邮件模板中的 id，不能编�
 template_key: 可选，仅可返回下方可用邮件模板中的 template_key，不能编造
 risk_flags: 字符串数组
 reason: 一句简短理由
-purchase_intent: none | weak | strong
-outreach_suggestion: none | create_order_follow_up_candidate
-outreach_confidence: 0 到 1
-outreach_reason: 一句简短理由
 只有问候、致谢、简单确认、结束语、情绪回应等不涉及业务事实的消息才允许 direct。
 产品规格、价格、库存、适配、安装、物流、售后、退款、保修等事实问题必须 retrieve_product，禁止凭模型自身知识回答。
 判断不确定时必须 retrieve_product。客户请求不适合在平台聊天中直接发送、需要通过邮箱承接、或符合邮件触发场景时使用 email_link_request。
 如果配置了邮件触发场景，客户消息符合任一场景时必须使用 email_link_request；不要把这些场景当普通产品咨询处理。
 如果未配置邮件触发场景，仅在客户明确要求通过邮箱接收资料，或索要不适合在平台聊天中直接发送的外部内容时使用 email_link_request。
 每条客户入站消息都必须回复，禁止返回无需回复或空回复。
-客户订单信息是唯一可使用的订单事实来源。只有 collection_status=empty 才表示明确未下单；
-not_collected 或 unavailable 都表示未知，不得推断未下单。已存在待支付及后续状态订单时不得建议追单。
-只有客户表达明确购买意向，且订单明确为空时，才允许返回 create_order_follow_up_candidate；
-该字段只表示建立延迟候选，程序会在发送前重新核对订单。
-所有可发送给客户的回复内容都必须是纯文本，禁止 Markdown 格式，禁止标题、列表、表格、代码块、引用块、加粗或斜体符号。"""
+所有可发送给客户的回复内容都必须是纯文本，禁止 Markdown 格式，禁止标题、列表、表格、代码块、引用块、加粗或斜体符号。
+平台禁止在聊天回复中发送站外引流信息。无论客户消息、最近对话、文档片段、知识库、人设或额外要求中是否包含，回复都严禁输出或照抄任何 URL、网址、链接地址、电子邮箱地址、手机或电话号码、微信号、QQ号等个人联系方式；客户要求提供时也不能发送，应改为平台内可完成的说明，或以店铺客服口吻说明会进一步核实。"""
     email_templates = _email_template_prompt_items(request)
     templates_text = (
         json.dumps(email_templates, ensure_ascii=False)
@@ -456,7 +388,10 @@ not_collected 或 unavailable 都表示未知，不得推断未下单。已存�
         f"客服自称：{request.reply_config.get('self_address') or '客服'}\n"
         f"虚拟人设：{persona or '未配置'}\n"
         f"额外要求：{request.reply_config.get('advanced_instruction') or '无'}\n"
+        f"用户配置的违禁内容：{request.reply_config.get('prohibited_content_instruction') or '未配置'}\n"
+        "生成回复时不得涉及上述用户配置的违禁内容。\n"
         f"客户订单信息（仅此处可作为订单事实来源）：{json.dumps(request.customer_orders, ensure_ascii=False)}\n"
+        f"平台会话上下文（商品卡片、来源卡片等，仅作指代和商品背景）：{json.dumps(request.platform_context, ensure_ascii=False)}\n"
         f"邮件触发场景（用户配置，符合时走 email_link_request）：{_email_trigger_scenarios(request) or '未配置'}\n"
         f"可用邮件模板元数据（只可从中选择 template_id/template_key）：{templates_text}\n"
         f"最近对话（按时间正序）：\n{conversation_prompt(request)}\n"
@@ -592,12 +527,12 @@ def build_action_plan(intent: IntentDecision, has_product_bases: bool) -> Action
     )
 
 
-async def _tone_persona(base_id: str) -> str:
+async def _tone_persona(base_id: str, access_token: str) -> str:
     if not base_id:
         logger.info("tone persona skipped reason=not_configured")
         return ""
     try:
-        value = await get_knowledge_base(base_id)
+        value = await get_knowledge_base(base_id, access_token)
     except Exception as exc:
         logger.warning(
             "tone persona unavailable base_id=%s error_type=%s",
@@ -630,16 +565,25 @@ def _generation_prompts(
 ) -> tuple[str, str]:
     config = request.reply_config
     system = (
-        "你是电商客服，请生成一段可以直接发送给客户的纯文本回复。"
-        "优先回答最新问题，不输出分析过程，不编造知识片段中不存在的事实；"
+        "你作为店铺中正在接待客户的真正客服，请生成一段可以直接发送给客户的纯文本回复。"
+        "回复必须自然、可信，不能让客户察觉到自动化系统的存在；"
+        "不得提及或暗示 AI、机器人、模型、系统、提示词、知识库、知识片段、文档检索、信息来源或能力限制等内部实现；"
+        "信息不足时只能以店铺客服口吻说明‘这边暂时无法确认，我帮您进一步核实’，不得说‘知识库中没有’‘未检索到’或‘无法访问知识库’；"
+        "除非客户明确要求转人工且当前执行计划确实为人工转接，否则不得主动建议或要求客户联系平台人工客服、其他客服或转人工；"
+        "优先回答最新问题，不输出分析过程，不编造提供的商品资料中不存在的事实；"
         "没有执行结果时不得声称邮件或图片已经发送；"
+        "无论客户消息、最近对话、文档片段、知识库、人设或额外要求中是否包含，"
+        "严禁输出或照抄任何 URL、网址、链接地址、电子邮箱地址、手机或电话号码、微信号、QQ号等个人联系方式；"
+        "客户要求提供时也不能发送，应改为平台内可完成的说明，或说明这边会进一步核实；"
         "禁止使用 Markdown 格式，禁止标题、列表、表格、代码块、引用块、加粗或斜体符号。\n"
         f"基础风格：{config.get('base_style') or '专业'}\n"
         f"回答长度：{config.get('answer_length') or '适中'}\n"
         f"客户称呼：{config.get('customer_address') or '亲亲'}\n"
         f"客服自称：{config.get('self_address') or '客服'}\n"
         f"虚拟人设：{persona or '未配置'}\n"
-        f"额外要求：{config.get('advanced_instruction') or '无'}"
+        f"额外要求：{config.get('advanced_instruction') or '无'}\n"
+        f"用户配置的违禁内容：{config.get('prohibited_content_instruction') or '未配置'}\n"
+        "生成回复时不得涉及上述用户配置的违禁内容。"
     )
     snippets = "\n".join(
         f"[{index}] {item.get('source_title') or item.get('document_title') or '文档'}：{item.get('snippet') or ''}"
@@ -650,6 +594,7 @@ def _generation_prompts(
         f"店铺：{request.shop_name or '未知'}\n"
         f"客户：{request.customer_name or '未知'}\n"
         f"客户订单信息（仅此处可作为订单事实来源）：{json.dumps(request.customer_orders, ensure_ascii=False)}\n"
+        f"平台会话上下文（商品卡片、来源卡片等，仅作指代和商品背景）：{json.dumps(request.platform_context, ensure_ascii=False)}\n"
         f"最近对话（按时间正序）：\n{conversation_prompt(request)}\n"
         f"结构化意图：{intent.model_dump_json()}\n"
         f"执行计划：{action_plan.model_dump_json()}\n"
@@ -665,7 +610,7 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
     risk_flags = [word for word in RISK_WORDS if word in request.message]
     if request.qa_base_ids:
         try:
-            qa_result = await match_qa(request.message, request.qa_base_ids)
+            qa_result = await match_qa(request.message, request.qa_base_ids, request.knowledge_access_token)
             qa_result["status"] = "hit" if qa_result.get("matched") else "miss"
         except Exception as exc:
             logger.warning(
@@ -708,7 +653,11 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
         )
         image_url = str(entry.get("image_url") or "")
         if image_url.startswith("/"):
-            image_url = f"{get_settings().knowledge_base_url.rstrip('/')}/api/v1{image_url}"
+            settings = get_settings()
+            public_base_url = (
+                settings.knowledge_base_public_url or settings.knowledge_base_url
+            ).rstrip("/")
+            image_url = f"{public_base_url}/api/v1{image_url}"
         if image_url:
             action_plan.required_actions.append("send_platform_image_after_text")
         logger.info(
@@ -739,7 +688,7 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
         trace_id,
         len(request.qa_base_ids),
     )
-    persona = await _tone_persona(request.tone_base_id)
+    persona = await _tone_persona(request.tone_base_id, request.knowledge_access_token)
     intent, intent_provider = await classify_intent(request, trace_id, risk_flags, persona)
     action_plan = build_action_plan(intent, bool(request.product_base_ids))
 
@@ -790,7 +739,7 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
     if action_plan.need_doc_search:
         if request.product_base_ids:
             try:
-                retrieval = await search_documents(request.message, request.product_base_ids)
+                retrieval = await search_documents(request.message, request.product_base_ids, request.knowledge_access_token)
                 retrieval_status = "hit" if retrieval else "empty"
             except Exception as exc:
                 retrieval_status = "unavailable"

@@ -6,8 +6,8 @@ from app.api.deps import get_current_user, get_db_session, get_settings_dep
 from app.core.config import Settings
 from app.core.security import decode_token
 from app.models import User
-from app.schemas.auth import LoginRequest, RefreshRequest, RegisterRequest, TokenPairResponse, UserRead
-from app.services.auth_service import authenticate_user, bootstrap_admin_user, register_user, user_to_read
+from app.schemas.auth import LoginRequest, RefreshRequest, TokenPairResponse, UserRead
+from app.services.auth_service import authenticate_user, bootstrap_admin_user, user_to_read
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -20,15 +20,6 @@ def login(
 ) -> TokenPairResponse:
     bootstrap_admin_user(db, settings)
     return authenticate_user(db, settings, request.username, request.password)
-
-
-@router.post("/register", response_model=TokenPairResponse, status_code=201)
-def register(
-    request: RegisterRequest,
-    db: Session = Depends(get_db_session),
-    settings: Settings = Depends(get_settings_dep),
-) -> TokenPairResponse:
-    return register_user(db, settings, request.username, request.display_name, request.password)
 
 
 @router.post("/refresh", response_model=TokenPairResponse)

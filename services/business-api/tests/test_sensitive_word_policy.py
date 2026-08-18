@@ -177,7 +177,7 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
             TestReplyRequest(robot_id=self.robot.id, message="我要给差评"),
         )
 
-        self.assertEqual(result["text"], "已收到您的消息，正在为您转接人工客服，请稍等～")
+        self.assertEqual(result["text"], "亲亲，已收到您的消息，正在为您核实，请稍等~")
 
     async def test_fallback_reply_is_queued_before_conversation_is_marked_human_required(self) -> None:
         self.robot.config_json = {

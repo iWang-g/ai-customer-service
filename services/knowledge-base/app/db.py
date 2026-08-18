@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -55,6 +56,22 @@ def dumps(value: Any) -> str:
 def loads(value: str | None, default: Any) -> Any:
     if not value:
         return default
+
+
+def fts_terms(value: str) -> str:
+    normalized = str(value or "").casefold()
+    tokens = re.findall(r"[0-9a-z][0-9a-z_.-]{1,}", normalized)
+    for sequence in re.findall(r"[\u4e00-\u9fff]+", normalized):
+        tokens.extend(sequence[index:index + size]
+                      for size in (2, 3)
+                      for index in range(max(0, len(sequence) - size + 1)))
+    return " ".join(dict.fromkeys(token for token in tokens if token))
+
+
+def has_chunk_fts(db: sqlite3.Connection) -> bool:
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_chunks_fts'"
+    ).fetchone() is not None
     try:
         return json.loads(value)
     except (TypeError, ValueError):
@@ -67,6 +84,10 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS knowledge_bases (
                 id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                owner_username TEXT NOT NULL DEFAULT '',
+                owner_display_name TEXT NOT NULL DEFAULT '',
+                is_public INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL,
                 kind TEXT NOT NULL CHECK(kind IN ('qa', 'product', 'tone')),
                 persona TEXT NOT NULL DEFAULT '',
@@ -110,6 +131,7 @@ def init_db() -> None:
                 content_hash TEXT NOT NULL DEFAULT '',
                 error_message TEXT NOT NULL DEFAULT '',
                 chunk_count INTEGER NOT NULL DEFAULT 0,
+                chunk_strategy_version TEXT NOT NULL DEFAULT 'legacy-v1',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -120,6 +142,9 @@ def init_db() -> None:
                 chunk_index INTEGER NOT NULL,
                 title_path TEXT NOT NULL DEFAULT '',
                 content TEXT NOT NULL,
+                chunk_type TEXT NOT NULL DEFAULT 'prose',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                strategy_version TEXT NOT NULL DEFAULT 'legacy-v1',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 UNIQUE(document_id, chunk_index)
@@ -138,15 +163,95 @@ def init_db() -> None:
             "content_hash": "TEXT NOT NULL DEFAULT ''",
             "error_message": "TEXT NOT NULL DEFAULT ''",
             "chunk_count": "INTEGER NOT NULL DEFAULT 0",
+            "chunk_strategy_version": "TEXT NOT NULL DEFAULT 'legacy-v1'",
         }
         for name, definition in additions.items():
             if name not in existing:
                 db.execute(f'ALTER TABLE documents ADD COLUMN "{name}" {definition}')
 
+        chunk_columns = {row[1] for row in db.execute("PRAGMA table_info(document_chunks)").fetchall()}
+        chunk_additions = {
+            "chunk_type": "TEXT NOT NULL DEFAULT 'prose'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            "strategy_version": "TEXT NOT NULL DEFAULT 'legacy-v1'",
+        }
+        for name, definition in chunk_additions.items():
+            if name not in chunk_columns:
+                db.execute(f'ALTER TABLE document_chunks ADD COLUMN "{name}" {definition}')
+
+        try:
+            expected_fts_columns = [
+                "chunk_id", "document_id", "base_id", "source_title", "title_path", "content",
+                "source_title_terms", "title_path_terms", "content_terms",
+            ]
+            existing_fts_columns = [
+                row[1] for row in db.execute("PRAGMA table_info(document_chunks_fts)").fetchall()
+            ]
+            if existing_fts_columns and existing_fts_columns != expected_fts_columns:
+                db.execute("DROP TABLE document_chunks_fts")
+            db.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
+                    chunk_id UNINDEXED,
+                    document_id UNINDEXED,
+                    base_id UNINDEXED,
+                    source_title,
+                    title_path,
+                    content,
+                    source_title_terms,
+                    title_path_terms,
+                    content_terms,
+                    tokenize = 'unicode61 remove_diacritics 2'
+                )"""
+            )
+            db.execute("DELETE FROM document_chunks_fts")
+            chunk_rows = db.execute(
+                """SELECT c.id, c.document_id, c.base_id, d.title, c.title_path, c.content
+                FROM document_chunks c JOIN documents d ON d.id = c.document_id
+                WHERE c.enabled = 1 AND d.status = 'ready'"""
+            ).fetchall()
+            db.executemany(
+                """INSERT INTO document_chunks_fts
+                (chunk_id,document_id,base_id,source_title,title_path,content,
+                 source_title_terms,title_path_terms,content_terms)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                [(
+                    row["id"], row["document_id"], row["base_id"], row["title"],
+                    row["title_path"], row["content"],
+                    fts_terms(row["title"]), fts_terms(row["title_path"]), fts_terms(row["content"]),
+                ) for row in chunk_rows],
+            )
+        except sqlite3.OperationalError:
+            db.execute("DROP TABLE IF EXISTS document_chunks_fts")
+
         qa_entry_columns = {row[1] for row in db.execute("PRAGMA table_info(qa_entries)").fetchall()}
         if "category_id" not in qa_entry_columns:
             db.execute("ALTER TABLE qa_entries ADD COLUMN category_id TEXT DEFAULT NULL REFERENCES qa_categories(id) ON DELETE SET NULL")
         db.execute("CREATE INDEX IF NOT EXISTS ix_qa_entries_category ON qa_entries(base_id, category_id)")
+
+        base_columns = {row[1] for row in db.execute("PRAGMA table_info(knowledge_bases)").fetchall()}
+        if "user_id" not in base_columns:
+            db.execute("ALTER TABLE knowledge_bases ADD COLUMN user_id TEXT")
+        if "owner_username" not in base_columns:
+            db.execute("ALTER TABLE knowledge_bases ADD COLUMN owner_username TEXT NOT NULL DEFAULT ''")
+        if "owner_display_name" not in base_columns:
+            db.execute("ALTER TABLE knowledge_bases ADD COLUMN owner_display_name TEXT NOT NULL DEFAULT ''")
+        if "is_public" not in base_columns:
+            db.execute("ALTER TABLE knowledge_bases ADD COLUMN is_public INTEGER NOT NULL DEFAULT 0")
+        unowned_count = int(db.execute(
+            "SELECT COUNT(*) FROM knowledge_bases WHERE user_id IS NULL OR TRIM(user_id) = ''"
+        ).fetchone()[0])
+        if unowned_count:
+            legacy_owner = get_settings().legacy_owner_user_id.strip()
+            if not legacy_owner:
+                raise RuntimeError(
+                    "KB_LEGACY_OWNER_USER_ID is required to assign existing knowledge bases"
+                )
+            db.execute(
+                "UPDATE knowledge_bases SET user_id = ? WHERE user_id IS NULL OR TRIM(user_id) = ''",
+                (legacy_owner,),
+            )
+        db.execute("CREATE INDEX IF NOT EXISTS ix_knowledge_bases_user ON knowledge_bases(user_id, kind)")
+        db.execute("CREATE INDEX IF NOT EXISTS ix_knowledge_bases_public ON knowledge_bases(is_public, kind)")
 
         now = utc_now()
         qa_base_ids = [row[0] for row in db.execute("SELECT id FROM knowledge_bases WHERE kind = 'qa'").fetchall()]

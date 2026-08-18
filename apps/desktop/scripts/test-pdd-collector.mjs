@@ -117,7 +117,7 @@ assert.deepEqual(
   'identical occurrences must remain in the ordered snapshot',
 );
 assert.equal(messageSnapshot.payload_json.messages[0].platform_sent_at, undefined);
-assert.equal(messageSnapshot.payload_json.messages[0].time_label, undefined);
+assert.equal(messageSnapshot.payload_json.messages[0].time_label, null);
 const firstObservationId = messageSnapshot.payload_json.observation_id;
 dualTrackAccount.runtime.ingest(dualTrackSnapshot);
 assert.equal(

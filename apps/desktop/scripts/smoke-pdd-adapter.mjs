@@ -54,7 +54,11 @@ function fixture() {
           <div class="buyer-item"><span class="msg-content">Battery capacity?</span></div>
         </li>
         <li id="middlePanel_List_lead" class="clearfix onemsg">
-          <div class="BuyerFromCard"><span class="msg-content">Lead card</span></div>
+          <div class="BuyerFromCard"><span class="msg-content">
+            <span>当前用户来自 商品详情页</span><br>
+            <span>来源商品标题</span><br>
+            <span>￥10.00</span>
+          </span></div>
         </li>
         <li id="middlePanel_List_notice" class="clearfix onemsg">
           <div class="msg-system"><span class="msg-content">System notice</span></div>
@@ -66,7 +70,25 @@ function fixture() {
           <span class="message-time">2026&#x5E74;07&#x6708;25&#x65E5; 15:19</span>
           <div class="buyer-item"><span class="msg-content">Hello again</span></div>
         </li>
+        <li id="middlePanel_List_product" class="clearfix onemsg">
+          <span class="message-time">2026&#x5E74;08&#x6708;14&#x65E5; 09:24:36</span>
+          <div class="buyer-item"><div class="msg-content">
+            <div>商品ID：970947366369</div><div>复制</div>
+            <img src="https://img.example.com/product.jpeg">
+            <div>水杯古风床头新款小众彩绘三层正宗3d打印网红</div>
+            <div>￥10 /2人团</div><div>查看商品规格</div>
+          </div></div>
+        </li>
+        <li id="middlePanel_List_agent-product-reference" class="clearfix onemsg">
+          <div class="cs-item"><span class="msg-content">亲亲，您咨询的商品ID 970947366369 暂时无法确认库存，我帮您进一步核实。</span></div>
+        </li>
       </main>
+      <aside class="right-panel-container">
+        <button class="LatestOrder">最新订单</button>
+        <button class="PersonalOrder bar-select" aria-selected="true">个人订单</button>
+        <div>全部 未完成 待发货 待签收 已签收 退款中</div>
+        <div>3年内无订单</div>
+      </aside>
       <textarea id="replyTextarea"></textarea>
       <button id="replySendButton">发送</button>
       <script>
@@ -224,7 +246,7 @@ app.whenReady().then(async () => {
     item.type === 'snapshot'
     && item.conversations?.some((conversation) => (
       conversation.external_conversation_id === '8715744365612'
-      && conversation.snapshot_messages?.length === 4
+      && conversation.snapshot_messages?.length === 8
     ))
   ));
   const unreadSnapshot = buyerBSnapshot();
@@ -264,8 +286,8 @@ app.whenReady().then(async () => {
   const collected = initialConversation.snapshot_messages || [];
   assert.equal(
     collected.length,
-    4,
-    'conversation previews, lead cards, and system nodes must be filtered',
+    8,
+    'conversation previews must be filtered while platform timeline nodes are retained',
   );
   assert.equal(
     collected.filter((item) => item.content === 'Hello again').length,
@@ -287,11 +309,15 @@ app.whenReady().then(async () => {
     [
       'middlePanel_List_message-a',
       'middlePanel_List_message-b',
+      'middlePanel_List_lead',
+      'middlePanel_List_notice',
       'middlePanel_List_message-c',
       'middlePanel_List_message-d',
+      'middlePanel_List_product',
+      'middlePanel_List_agent-product-reference',
     ],
   );
-  assert.deepEqual(collected.map((item) => item.dom_sequence), [0, 1, 2, 3]);
+  assert.deepEqual(collected.map((item) => item.dom_sequence), [0, 1, 2, 3, 4, 5, 6, 7]);
   assert.equal(collected[0].sender_role, 'agent');
   assert.equal(collected[0].content, 'First line\nSecond line', 'message line breaks must survive DOM collection');
   assert.equal(collected[1].sender_role, 'customer');
@@ -301,17 +327,51 @@ app.whenReady().then(async () => {
     [
       'middlePanel_List_message-a',
       'middlePanel_List_message-b',
+      'middlePanel_List_lead',
+      'middlePanel_List_notice',
       'middlePanel_List_message-c',
       'middlePanel_List_message-d',
+      'middlePanel_List_product',
+      'middlePanel_List_agent-product-reference',
     ],
   );
   assert.deepEqual(
     initialConversation.snapshot_messages.map((item) => item.dom_sequence),
-    [0, 1, 2, 3],
-    'shadow snapshot sequence must remain continuous after system-node filtering',
+    [0, 1, 2, 3, 4, 5, 6, 7],
+    'timeline sequence must remain continuous across platform nodes',
+  );
+  assert.equal(collected[2].message_type, 'context');
+  assert.equal(collected[2].automation_mode, 'context');
+  assert.equal(collected[2].sender_role, 'platform');
+  assert.equal(collected[2].display_mode, 'card');
+  assert.equal(collected[2].structured_payload.source_label, '当前用户来自 商品详情页');
+  assert.equal(collected[2].structured_payload.title, '来源商品标题');
+  assert.equal(collected[3].message_type, 'system');
+  assert.equal(collected[3].automation_mode, 'ignore');
+  assert.equal(collected[6].message_type, 'product', 'a customer product card must not degrade to an image');
+  assert.equal(collected[6].sender_role, 'customer');
+  assert.equal(collected[6].display_mode, 'card');
+  assert.equal(collected[6].automation_mode, 'trigger', 'a customer product card must trigger a reply');
+  assert.equal(collected[6].structured_payload.product_id, '970947366369');
+  assert.equal(collected[6].structured_payload.title, '水杯古风床头新款小众彩绘三层正宗3d打印网红');
+  assert.equal(collected[6].structured_payload.price, 10);
+  assert.equal(collected[6].structured_payload.price_label, '￥10 /2人团');
+  assert.equal(collected[6].time_label, '2026年08月14日 09:24:36');
+  assert.equal(collected[7].sender_role, 'agent');
+  assert.equal(
+    collected[7].message_type,
+    'text',
+    'an ordinary agent reply that mentions a product ID must remain a text message',
+  );
+  assert.equal(collected[7].display_mode, 'bubble');
+  assert.equal(
+    initialConversation.customer_orders?.collection_status,
+    'empty',
+    'a stable personal-order panel showing 3年内无订单 must be treated as a normal empty state',
   );
   assert.equal(initialConversation.snapshot_messages[0].platform_sent_at, undefined);
-  assert.equal(initialConversation.snapshot_messages[0].time_label, undefined);
+  assert.equal(initialConversation.snapshot_messages[0].time_label, null);
+  assert.equal(initialConversation.snapshot_messages[1].time_label, '2026年07月23日 16:17:38');
   assert.ok(snapshot.snapshot_id);
   const buyerB = unreadSnapshot?.conversations?.find(
     (conversation) => conversation.external_conversation_id === '9922334455667',
@@ -382,7 +442,7 @@ app.whenReady().then(async () => {
     requestId: sendRequestId,
     conversationKey: '9922334455667',
     customerName: 'Buyer B',
-    content: '点击发送验收消息',
+    content: 'Enter 发送验收消息',
   });
   const prepareDeadline = Date.now() + 7000;
   while (
@@ -394,25 +454,24 @@ app.whenReady().then(async () => {
   const sendResult = messages.find((item) => (
     item.type === 'message_send_result' && item.request_id === sendRequestId
   ));
-  assert.equal(sendResult?.status, 'sent', 'message must be sent by the platform button');
-  assert.equal(sendResult?.method, 'click');
+  assert.equal(sendResult?.status, 'sent', 'message must be sent directly with Enter');
+  assert.equal(sendResult?.method, 'enter');
   assert.equal(sendResult?.conversation_key, '9922334455667');
   const sentText = await window.webContents.executeJavaScript('document.querySelector("#replyTextarea").value');
   assert.equal(sentText, '');
   assert.equal(
     messages.some((item) => item.type === 'message_send_result' && item.status === 'failed'),
     false,
-    'button send must not fail before the Enter fallback test',
+    'Enter send must not fail',
   );
 
-  await window.webContents.executeJavaScript("document.body.dataset.forceEnter = '1'");
-  const enterRequestId = 'adapter-smoke-send-message-enter-fallback';
+  const enterRequestId = 'adapter-smoke-send-message-enter-repeat';
   window.webContents.send('pdd-adapter:command', {
     type: 'send-message',
     requestId: enterRequestId,
     conversationKey: '9922334455667',
     customerName: 'Buyer B',
-    content: 'Enter 兜底验收消息',
+    content: '再次 Enter 发送验收消息',
   });
   const enterDeadline = Date.now() + 7000;
   while (
@@ -424,7 +483,7 @@ app.whenReady().then(async () => {
   const enterResult = messages.find((item) => (
     item.type === 'message_send_result' && item.request_id === enterRequestId
   ));
-  assert.equal(enterResult?.status, 'sent', 'Enter fallback must send when button does not clear input');
+  assert.equal(enterResult?.status, 'sent', 'repeated Enter sending must succeed');
   assert.equal(enterResult?.method, 'enter');
 
   const imageRequestId = 'adapter-smoke-image-dom-confirmation';

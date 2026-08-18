@@ -1,5 +1,25 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+function readRuntimeArgument(name) {
+  const prefix = `--${name}=`;
+  const argument = process.argv.find((value) => value.startsWith(prefix));
+  if (!argument) return null;
+  try {
+    return decodeURIComponent(argument.slice(prefix.length));
+  } catch {
+    return null;
+  }
+}
+
+const runtimeConfig = {
+  businessApiUrl: readRuntimeArgument('acs-business-api-url'),
+  knowledgeBaseUrl: readRuntimeArgument('acs-knowledge-base-url'),
+  websocketUrl: readRuntimeArgument('acs-websocket-url'),
+};
+if (Object.values(runtimeConfig).every(Boolean)) {
+  contextBridge.exposeInMainWorld('desktopConfig', Object.freeze(runtimeConfig));
+}
+
 contextBridge.exposeInMainWorld('desktopBridge', {
   notifyHumanRequired: (payload) => ipcRenderer.invoke('desktop:notify-human-required', payload),
   clearHumanRequiredNotifications: () => ipcRenderer.invoke('desktop:clear-human-required-notifications'),
@@ -30,6 +50,7 @@ contextBridge.exposeInMainWorld('desktopBridge', {
   ),
   sendPddMessage: (payload) => ipcRenderer.invoke('pdd-workspace:send-message', payload),
   sendPddImage: (payload) => ipcRenderer.invoke('pdd-workspace:send-image', payload),
+  sendPddImageData: (payload) => ipcRenderer.invoke('pdd-workspace:send-image-data', payload),
   getWechatAccounts: () => ipcRenderer.invoke('wechat:get-accounts'),
   identifyWechatAccounts: (payload) => ipcRenderer.invoke('wechat:identify-accounts', payload),
   onShowWechatAccounts: (listener) => {

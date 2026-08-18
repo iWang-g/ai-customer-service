@@ -8,11 +8,14 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from app.db import init_db
-from app.schemas import DocumentCreate, KnowledgeBaseCreate
-from app.service import create_base, create_document, delete_document, get_document, list_document_chunks
+from app.db import connect
+from app.document_parser import CHUNK_STRATEGY_VERSION, chunk_text
+from app.schemas import DocumentCreate, DocumentSearchRequest, KnowledgeBaseCreate
+from app.service import create_base, create_document, delete_document, get_document, list_document_chunks, reprocess_document, search_documents
 
 
 class ProductDocumentTests(unittest.TestCase):
+    user_id = "user-product"
     def setUp(self) -> None:
         test_temp_root = Path(__file__).resolve().parents[1] / ".tmp"
         test_temp_root.mkdir(exist_ok=True)
@@ -29,34 +32,120 @@ class ProductDocumentTests(unittest.TestCase):
                 path.unlink()
 
     def test_document_detail_and_chunks_return_processed_content(self) -> None:
-        base = create_base(KnowledgeBaseCreate(name="产品资料库", kind="product"))
+        base = create_base(self.user_id, KnowledgeBaseCreate(name="产品资料库", kind="product"))
         content = "# 产品参数\n\n" + ("键盘支持三模连接。" * 100)
-        created = create_document(DocumentCreate(base_id=base["id"], title="键盘资料", content=content))
+        created = create_document(self.user_id, DocumentCreate(base_id=base["id"], title="键盘资料", content=content))
 
-        detail = get_document(created["id"])
+        detail = get_document(self.user_id, created["id"])
         self.assertEqual(detail["content"], content)
         self.assertGreater(detail["chunk_count"], 1)
 
-        first_page = list_document_chunks(created["id"], page=1, page_size=1)
+        first_page = list_document_chunks(self.user_id, created["id"], page=1, page_size=1)
         self.assertEqual(first_page["total"], detail["chunk_count"])
         self.assertEqual(first_page["page_size"], 1)
         self.assertEqual(len(first_page["items"]), 1)
         self.assertEqual(first_page["items"][0]["chunk_index"], 0)
         self.assertEqual(first_page["items"][0]["title_path"], "产品参数")
+        self.assertEqual(first_page["items"][0]["strategy_version"], CHUNK_STRATEGY_VERSION)
+        self.assertEqual(detail["chunk_strategy_version"], CHUNK_STRATEGY_VERSION)
         self.assertTrue(first_page["items"][0]["enabled"])
 
-        second_page = list_document_chunks(created["id"], page=2, page_size=1)
+        second_page = list_document_chunks(self.user_id, created["id"], page=2, page_size=1)
         self.assertEqual(second_page["items"][0]["chunk_index"], 1)
 
     def test_deleted_document_detail_is_not_available(self) -> None:
-        base = create_base(KnowledgeBaseCreate(name="产品资料库", kind="product"))
-        created = create_document(DocumentCreate(base_id=base["id"], title="键盘资料", content="支持 USB 连接"))
-        delete_document(created["id"])
+        base = create_base(self.user_id, KnowledgeBaseCreate(name="产品资料库", kind="product"))
+        created = create_document(self.user_id, DocumentCreate(base_id=base["id"], title="键盘资料", content="支持 USB 连接"))
+        delete_document(self.user_id, created["id"])
 
         for read in (get_document, list_document_chunks):
             with self.assertRaises(HTTPException) as raised:
-                read(created["id"])
+                read(self.user_id, created["id"])
             self.assertEqual(raised.exception.status_code, 404)
+
+    def test_structured_chunking_preserves_heading_path_and_table_rows(self) -> None:
+        content = """# 键盘 K1
+
+## 连接方式
+
+键盘支持蓝牙连接。也支持 2.4G 接收器连接。还支持 USB 有线连接。
+
+## 产品参数
+
+轴体 | 青轴
+续航 | 80 小时
+重量 | 780 克
+"""
+        chunks = chunk_text(content, target_chars=18, max_chars=45, overlap_chars=8)
+        self.assertTrue(any(item.title_path == "键盘 K1 > 连接方式" for item in chunks))
+        parameter_chunks = [item for item in chunks if item.title_path.endswith("产品参数")]
+        self.assertTrue(parameter_chunks)
+        self.assertTrue(all(item.chunk_type == "table" for item in parameter_chunks))
+        self.assertTrue(all(item.content not in {"还支持 USB 有线连接。"} for item in chunks))
+        parameter_text = "\n".join(item.content for item in parameter_chunks)
+        self.assertEqual(parameter_text.count("轴体 | 青轴"), 1)
+        self.assertEqual(parameter_text.count("续航 | 80 小时"), 1)
+
+    def test_search_prefers_title_and_expands_adjacent_same_section(self) -> None:
+        base = create_base(self.user_id, KnowledgeBaseCreate(name="键盘产品库", kind="product"))
+        content = """# Aurora K9
+
+## 连接方式
+
+Aurora K9 支持蓝牙连接，首次配对请长按 Fn 加数字一。
+
+蓝牙配对完成后，指示灯会停止闪烁并保持常亮。
+
+如果搜索不到设备，请先关闭旧设备的蓝牙连接后重试。
+
+## 售后政策
+
+商品提供一年质保，非人为故障可以申请检测。
+"""
+        created = create_document(
+            self.user_id,
+            DocumentCreate(base_id=base["id"], title="Aurora K9 使用说明", content=content),
+        )
+        result = search_documents(
+            self.user_id,
+            DocumentSearchRequest(query="Aurora K9 蓝牙怎么配对", base_ids=[base["id"]], top_k=3),
+        )
+        self.assertTrue(result["results"])
+        first = result["results"][0]
+        self.assertEqual(first["source_id"], created["id"])
+        self.assertIn("连接方式", first["title_path"])
+        self.assertIn("首次配对", first["snippet"])
+        self.assertGreaterEqual(len(first["context_chunk_ids"]), 1)
+        with connect() as db:
+            fts_enabled = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_chunks_fts'"
+            ).fetchone() is not None
+        self.assertEqual(result["metadata"]["mode"], "fts5_bm25" if fts_enabled else "keyword")
+
+    def test_legacy_document_can_be_reprocessed_by_owner(self) -> None:
+        base = create_base(self.user_id, KnowledgeBaseCreate(name="重处理产品库", kind="product"))
+        created = create_document(
+            self.user_id,
+            DocumentCreate(base_id=base["id"], title="旧文档", content="# 参数\n\n支持三模连接。"),
+        )
+        with connect() as db:
+            db.execute(
+                "UPDATE documents SET chunk_strategy_version = 'legacy-v1' WHERE id = ?",
+                (created["id"],),
+            )
+            db.execute(
+                "UPDATE document_chunks SET strategy_version = 'legacy-v1' WHERE document_id = ?",
+                (created["id"],),
+            )
+        updated = reprocess_document(self.user_id, created["id"])
+        self.assertEqual(updated["chunk_strategy_version"], CHUNK_STRATEGY_VERSION)
+        chunks = list_document_chunks(self.user_id, created["id"])["items"]
+        self.assertTrue(chunks)
+        self.assertTrue(all(item["strategy_version"] == CHUNK_STRATEGY_VERSION for item in chunks))
+
+        with self.assertRaises(HTTPException) as raised:
+            reprocess_document("another-user", created["id"])
+        self.assertEqual(raised.exception.status_code, 404)
 
 
 if __name__ == "__main__":

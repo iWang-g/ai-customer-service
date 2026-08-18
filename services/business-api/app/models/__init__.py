@@ -1,6 +1,7 @@
 from app.models.base import Base, TimestampMixin, generate_id, utcnow
 from app.models.entities import (
     AiProviderConfig,
+    AiModelCatalog,
     AiModelCall,
     AutomationReplyRun,
     Conversation,
@@ -34,6 +35,7 @@ __all__ = [
     "User",
     "UserSettings",
     "AiProviderConfig",
+    "AiModelCatalog",
     "AiModelCall",
     "AutomationReplyRun",
     "Robot",

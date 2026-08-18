@@ -25,7 +25,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 provider_config={
                     "provider": "deepseek",
                     "base_url": "https://api.deepseek.com",
-                    "model": "deepseek-chat",
+                    "model": "deepseek-v4-flash",
                     "api_key": "test-key",
                     "enabled": True,
                     "temperature": 0.8,
@@ -62,7 +62,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                     provider_config={
                         "provider": "deepseek",
                         "base_url": "https://api.deepseek.com",
-                        "model": "deepseek-chat",
+                        "model": "deepseek-v4-flash",
                         "api_key": "test-key",
                         "enabled": True,
                     },
@@ -75,7 +75,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0]["stage"], "intent")
-        self.assertEqual(observations[0]["model"], "deepseek-chat")
+        self.assertEqual(observations[0]["model"], "deepseek-v4-flash")
         self.assertEqual(observations[0]["input_tokens"], 20)
         self.assertEqual(observations[0]["output_tokens"], 8)
 

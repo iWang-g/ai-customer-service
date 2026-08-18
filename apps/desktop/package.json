@@ -3,19 +3,27 @@
   "version": "1.0.0",
   "private": true,
   "description": "AI customer service desktop application",
+  "author": "OmniAI",
   "type": "module",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1 --port 9527\" \"wait-on http://127.0.0.1:9527 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:9527 electron .\"",
     "build": "vite build",
+    "build:icon": "node scripts/build-icon.mjs",
+    "build:rpa": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-rpa.ps1",
+    "validate:release": "node scripts/validate-release-config.mjs",
+    "validate:package": "node scripts/validate-package.mjs",
+    "test:runtime-config": "node scripts/test-runtime-config.mjs",
+    "test:rpa-executable": "node scripts/test-rpa-executable.mjs",
     "lint": "tsc --noEmit",
     "smoke:pdd-workspace": "electron scripts/smoke-pdd-workspace.mjs",
     "smoke:pdd-adapter": "electron scripts/smoke-pdd-adapter.mjs",
     "test:pdd-collector": "node scripts/test-pdd-collector.mjs",
     "test:store-actor": "node scripts/test-store-actor.mjs",
+    "test:pdd-session-health": "electron scripts/test-pdd-session-health.mjs",
     "test:wechat-process-manager": "node scripts/test-wechat-process-manager.mjs",
     "start": "electron .",
-    "dist": "pnpm build && electron-builder"
+    "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -29,6 +37,7 @@
     "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "2.6.2",
     "@tailwindcss/vite": "^4.1.14",
     "@types/node": "^22.14.0",
     "@types/react": "^19.0.0",
@@ -45,9 +54,12 @@
   },
   "build": {
     "appId": "com.omniai.customer-service",
-    "productName": "AI智能客服",
+    "productName": "AI智能客服-拼多多试用版",
+    "artifactName": "${productName}-${version}-Setup.${ext}",
+    "copyright": "Copyright © 2026 OmniAI",
+    "electronDist": "node_modules/electron/dist",
     "directories": {
-      "output": "release"
+      "output": "release-windows"
     },
     "files": [
       "dist/**/*",
@@ -56,13 +68,35 @@
     ],
     "extraResources": [
       {
-        "from": "../../agents/rpa",
+        "from": "../../agents/rpa/dist",
         "to": "rpa",
-        "filter": ["agent.py", "README.md"]
+        "filter": [
+          "rpa-agent.exe"
+        ]
+      },
+      {
+        "from": "config/release.json",
+        "to": "runtime-config.json"
       }
     ],
     "win": {
-      "target": "nsis"
-    }
+      "target": "nsis",
+      "icon": "build/app-icon.ico",
+      "executableName": "AI智能客服-拼多多试用版",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "installerIcon": "build/app-icon.ico",
+      "uninstallerIcon": "build/app-icon.ico",
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AI智能客服-拼多多试用版",
+      "uninstallDisplayName": "AI智能客服-拼多多试用版 ${version}",
+      "deleteAppDataOnUninstall": false
+    },
+    "forceCodeSigning": false
   }
 }

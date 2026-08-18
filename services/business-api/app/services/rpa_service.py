@@ -254,8 +254,13 @@ def select_inbound_reply_source(
     if request.event_type != "message_snapshot":
         return None
 
-    tail = messages[-1]
-    if tail.sender_role != "customer":
+    tail = None
+    for message in reversed(messages):
+        if (message.raw_payload or {}).get("automation_mode", "trigger") != "trigger":
+            continue
+        tail = message
+        break
+    if tail is None or tail.sender_role != "customer":
         return None
     if tail.collection_kind == "incremental":
         return tail if tail.automation_eligible else None
@@ -330,8 +335,21 @@ def _upsert_conversation_from_event(
 
     conversation.customer_name = payload.get("customer_name") or conversation.customer_name
     conversation.title = payload.get("title") or conversation.title
-    conversation.latest_message_text = payload.get("content") or conversation.latest_message_text
-    conversation.latest_message_at = request.received_at or utcnow()
+    history_is_cleared = (
+        conversation.messages_cleared_sequence >= conversation.last_message_sequence
+        and request.event_type == "conversation_snapshot"
+    )
+    if not history_is_cleared:
+        conversation.latest_message_text = payload.get("content") or conversation.latest_message_text
+        conversation.latest_message_at = request.received_at or utcnow()
+    if (
+        request.event_type in {"customer_message", "message_received"}
+        and (
+            conversation.deleted_at is None
+            or _as_utc_naive(request.received_at or utcnow()) > _as_utc_naive(conversation.deleted_at)
+        )
+    ):
+        conversation.deleted_at = None
     if request.event_type == "conversation_snapshot" and payload_unread_count is not None:
         conversation.unread_count = payload_unread_count
     elif request.event_type in {"customer_message", "message_received"} and payload_unread_count is not None:
@@ -369,6 +387,27 @@ def _refresh_awaiting_reply(db: Session, conversation: Conversation) -> None:
     )
     conversation.awaiting_reply = latest_sender == "customer"
     db.add(conversation)
+
+
+def _refresh_conversation_summary(db: Session, conversation: Conversation) -> None:
+    latest = db.scalar(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation.id,
+            Message.message_status != "failed",
+        )
+        .order_by(desc(Message.conversation_sequence))
+        .limit(1)
+    )
+    conversation.latest_message_text = latest.content if latest else None
+    conversation.latest_message_at = latest.collected_at if latest else None
+    db.add(conversation)
+
+
+def _as_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _payload_datetime(payload: dict[str, Any], key: str) -> datetime | None:
@@ -779,6 +818,17 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
     task.result_json = request.result_json
     task.error_message = request.error_message
     task.completed_at = utcnow()
+    if task.idempotency_key and task.idempotency_key.startswith("auto-timeout:"):
+        _, robot_id, source_message_id = task.idempotency_key.split(":", 2)
+        deferred_reply = db.scalar(
+            select(RpaTask).where(
+                RpaTask.idempotency_key == f"auto-reply:{robot_id}:{source_message_id}:text",
+                RpaTask.status == "waiting_timeout",
+            )
+        )
+        if deferred_reply is not None:
+            deferred_reply.status = "queued"
+            db.add(deferred_reply)
     if task.task_type == "send_message" and task.idempotency_key and task.idempotency_key.startswith("customer-outreach:"):
         from app.models import CustomerOutreachRun
 
@@ -828,10 +878,15 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
             if request.result_json.get("platform_message_id"):
                 message.platform_message_id = request.result_json["platform_message_id"]
             db.add(message)
+            db.flush()
             if message.message_status == "sent":
                 conversation = db.get(Conversation, task.conversation_id)
                 if conversation:
                     _refresh_awaiting_reply(db, conversation)
+            else:
+                conversation = db.get(Conversation, task.conversation_id)
+                if conversation:
+                    _refresh_conversation_summary(db, conversation)
     image_confirmed = (
         request.status == "completed"
         and request.result_json.get("image_sent") is True

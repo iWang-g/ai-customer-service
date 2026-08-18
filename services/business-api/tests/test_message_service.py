@@ -11,6 +11,7 @@ from app.models import (
     AutomationReplyRun,
     Base,
     Conversation,
+    CustomerOrder,
     Message,
     MessageObservation,
     PlatformAccount,
@@ -20,7 +21,16 @@ from app.models import (
     Robot,
     User,
 )
-from app.services.message_service import list_messages, reset_pinduoduo_conversation_test_data
+from app.services.message_service import (
+    clear_conversation_history,
+    dismiss_conversation_message_sync_issue,
+    get_conversation_message_sync_issue,
+    list_conversations,
+    list_messages,
+    rebuild_conversation_message_queue,
+    reset_pinduoduo_conversation_test_data,
+    soft_delete_conversation,
+)
 
 
 class MessageServiceTests(unittest.TestCase):
@@ -169,6 +179,106 @@ class MessageServiceTests(unittest.TestCase):
         self.assertIn("sending now", [item.content for item in response.items])
         self.assertEqual(response.meta.total, len(response.items))
 
+    def test_record_sent_message_preserves_client_message_id(self) -> None:
+        from app.schemas.message import RecordSentMessageRequest
+        from app.services.message_service import record_sent_message
+
+        response = record_sent_message(
+            self.db,
+            self.user,
+            RecordSentMessageRequest(
+                conversation_id=self.conversation.id,
+                content="optimistic message",
+                client_message_id="optimistic:client-1",
+            ),
+        )
+
+        self.assertEqual(
+            response.message.raw_payload["client_message_id"],
+            "optimistic:client-1",
+        )
+
+    def test_record_sent_image_preserves_media_type(self) -> None:
+        from app.schemas.message import RecordSentMessageRequest
+        from app.services.message_service import record_sent_message
+
+        response = record_sent_message(
+            self.db,
+            self.user,
+            RecordSentMessageRequest(
+                conversation_id=self.conversation.id,
+                content="[图片]",
+                media_type="image",
+            ),
+        )
+
+        self.assertEqual(response.message.raw_payload["media_type"], "image")
+
+    def test_clear_history_resets_pinduoduo_pipeline_data(self) -> None:
+        old_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="old message",
+        )
+        self.db.add(old_message)
+        self.db.commit()
+
+        response = clear_conversation_history(self.db, self.user, self.conversation.id)
+
+        self.assertEqual(response.messages_cleared_sequence, 0)
+        self.db.refresh(self.conversation)
+        self.assertEqual(self.conversation.last_message_sequence, 0)
+        self.assertEqual(list_messages(self.db, self.user, self.conversation.id).items, [])
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), 0)
+        new_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="new message",
+        )
+        self.db.add(new_message)
+        self.db.commit()
+        self.assertEqual(
+            [item.content for item in list_messages(self.db, self.user, self.conversation.id).items],
+            ["new message"],
+        )
+
+    def test_clear_history_rejects_active_message_processing(self) -> None:
+        self.db.add(RpaTask(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            task_type="send_message",
+            platform_code="pinduoduo",
+            status="queued",
+        ))
+        self.db.commit()
+
+        with self.assertRaisesRegex(Exception, "消息正在处理"):
+            clear_conversation_history(self.db, self.user, self.conversation.id)
+
+    def test_soft_delete_resets_pinduoduo_pipeline_and_hides_conversation(self) -> None:
+        self.db.add(Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="deleted message",
+        ))
+        self.db.commit()
+
+        response = soft_delete_conversation(self.db, self.user, self.conversation.id)
+
+        self.assertIsNotNone(response.deleted_at)
+        self.assertEqual(response.messages_cleared_sequence, 0)
+        self.db.refresh(self.conversation)
+        self.assertEqual(self.conversation.last_message_sequence, 0)
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), 0)
+        self.assertEqual(list_conversations(self.db, self.user).items, [])
+        self.assertIsNotNone(self.db.get(Conversation, self.conversation.id))
+
     def test_reset_pinduoduo_conversation_removes_chat_pipeline_data(self) -> None:
         robot = Robot(user_id=self.user.id, name="Reset Robot")
         node = RpaNode(user_id=self.user.id, node_key="reset-node", hostname="localhost")
@@ -232,6 +342,13 @@ class MessageServiceTests(unittest.TestCase):
             collected_at=datetime(2026, 8, 6, tzinfo=timezone.utc),
             payload_hash="a" * 64,
         ))
+        self.db.add(CustomerOrder(
+            user_id=self.user.id,
+            platform_account_id=self.platform_account.id,
+            conversation_id=self.conversation.id,
+            customer_key="customer-1",
+            platform_order_id="order-reset-1",
+        ))
         self.conversation.latest_message_text = message.content
         self.conversation.latest_message_at = datetime(2026, 8, 6, tzinfo=timezone.utc)
         self.conversation.unread_count = 1
@@ -247,15 +364,19 @@ class MessageServiceTests(unittest.TestCase):
         self.assertEqual(deleted["messages"], 1)
         self.assertEqual(deleted["rpa_events"], 1)
         self.assertEqual(deleted["message_observations"], 1)
+        self.assertEqual(deleted["customer_orders"], 1)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), 0)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(RpaTask)), 0)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(AutomationReplyRun)), 0)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(AiModelCall)), 0)
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(CustomerOrder)), 0)
         self.assertIsNone(response.latest_message_text)
         self.assertEqual(response.unread_count, 0)
         self.assertFalse(response.awaiting_reply)
         self.db.refresh(self.conversation)
         self.assertEqual(self.conversation.last_message_sequence, 0)
+        self.assertEqual(self.conversation.messages_cleared_sequence, 0)
+        self.assertIsNone(self.conversation.deleted_at)
 
     def test_reset_rejects_active_rpa_tasks(self) -> None:
         self.db.add(RpaTask(
@@ -273,6 +394,96 @@ class MessageServiceTests(unittest.TestCase):
                 self.user,
                 self.conversation.id,
             )
+
+    def test_sync_issue_can_be_previewed_dismissed_and_rebuilt(self) -> None:
+        collected_at = datetime(2026, 8, 17, 10, 30, tzinfo=timezone.utc)
+        messages = [
+            {
+                "dom_sequence": 0,
+                "sender_role": "customer",
+                "message_type": "product",
+                "content": "测试商品",
+                "display_mode": "card",
+                "automation_mode": "trigger",
+                "structured_payload": {"title": "测试商品", "price": "19.90"},
+            },
+            {
+                "dom_sequence": 1,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "现在有货吗",
+                "automation_mode": "trigger",
+            },
+        ]
+        observation = MessageObservation(
+            observation_id="sync-issue-observation",
+            user_id=self.user.id,
+            platform_account_id=self.platform_account.id,
+            conversation_id=self.conversation.id,
+            platform_code="pinduoduo",
+            conversation_external_id=self.conversation.external_conversation_id,
+            collected_at=collected_at,
+            unread=True,
+            payload_hash="b" * 64,
+            message_count=len(messages),
+            batch_count=1,
+            received_batch_count=1,
+            alignment_status="unaligned",
+            raw_payload={
+                "source_snapshot_id": "sync-issue-snapshot",
+                "batches": {
+                    "0": {
+                        "message_offset": 0,
+                        "messages": messages,
+                    },
+                },
+            },
+        )
+        self.conversation.metadata_json = {
+            "message_sync_issue": {
+                "status": "active",
+                "observation_id": observation.observation_id,
+                "first_detected_at": collected_at.isoformat(),
+                "latest_detected_at": collected_at.isoformat(),
+                "unread": True,
+                "message_count": len(messages),
+                "consecutive_failure_count": 1,
+                "requires_attention": True,
+                "dismissed_at": None,
+            },
+        }
+        order = CustomerOrder(
+            user_id=self.user.id,
+            platform_account_id=self.platform_account.id,
+            conversation_id=self.conversation.id,
+            customer_key="customer-1",
+            platform_order_id="preserved-order",
+        )
+        self.db.add_all([observation, order])
+        self.db.commit()
+
+        detail = get_conversation_message_sync_issue(
+            self.db, self.user, self.conversation.id
+        )
+        self.assertEqual([item.content for item in detail.messages], ["测试商品", "现在有货吗"])
+
+        dismissed = dismiss_conversation_message_sync_issue(
+            self.db, self.user, self.conversation.id
+        )
+        self.assertIsNotNone(dismissed.message_sync_issue)
+        self.assertFalse(dismissed.message_sync_issue.requires_attention)
+
+        response, rebuilt, deleted = rebuild_conversation_message_queue(
+            self.db, self.user, self.conversation.id
+        )
+
+        self.assertEqual(deleted["message_observations"], 1)
+        self.assertEqual([item.content for item in rebuilt], ["测试商品", "现在有货吗"])
+        self.assertTrue(all(item.collection_kind == "recovery" for item in rebuilt))
+        self.assertTrue(all(not item.automation_eligible for item in rebuilt))
+        self.assertTrue(response.awaiting_reply)
+        self.assertIsNone(response.message_sync_issue)
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(CustomerOrder)), 1)
 
 
 if __name__ == "__main__":

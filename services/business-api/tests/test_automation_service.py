@@ -10,11 +10,13 @@ from app.services.automation_service import (
     _context_length,
     _history_with_latest,
     _message_history,
+    _platform_context,
     _fallback_marks_human_required,
     _is_fallback_reply,
     _matched_sensitive_word,
     _sensitive_words,
     _should_create_send_task,
+    _timeout_config,
 )
 
 
@@ -23,10 +25,17 @@ class AutomationConfigTests(unittest.TestCase):
         return SimpleNamespace(config_json=config)
 
     def test_context_length_uses_robot_config_and_bounds(self) -> None:
+        self.assertEqual(_context_length(self.robot()), 10)
         self.assertEqual(_context_length(self.robot(context_length=12)), 12)
         self.assertEqual(_context_length(self.robot(context_length=500)), MAX_CONTEXT_LENGTH)
         self.assertEqual(_context_length(self.robot(context_length=0)), 1)
         self.assertEqual(_context_length(self.robot(context_length="invalid")), DEFAULT_CONTEXT_LENGTH)
+
+    def test_timeout_notice_is_disabled_by_default(self) -> None:
+        enabled, seconds, text = _timeout_config(self.robot())
+        self.assertFalse(enabled)
+        self.assertEqual(seconds, 10)
+        self.assertTrue(text)
 
     def test_auto_send_requires_request_and_robot_switches(self) -> None:
         robot = self.robot(allow_auto_send=True)
@@ -77,6 +86,32 @@ class AutomationConfigTests(unittest.TestCase):
                 {"role": "assistant", "content": "第二条"},
             ],
         )
+
+    def test_triggering_customer_product_card_is_included_in_platform_context(self) -> None:
+        product = SimpleNamespace(
+            sender_role="customer",
+            content="商品ID：970947366369 水杯古风 ￥10",
+            raw_payload={
+                "message_type": "product",
+                "automation_mode": "trigger",
+                "structured_payload": {
+                    "product_id": "970947366369",
+                    "title": "水杯古风",
+                    "price": 10,
+                },
+            },
+        )
+        ordinary_message = SimpleNamespace(
+            sender_role="customer",
+            content="你好",
+            raw_payload={"message_type": "text", "automation_mode": "trigger"},
+        )
+
+        self.assertEqual(_platform_context([product, ordinary_message]), [{
+            "type": "product",
+            "content": product.content,
+            "data": product.raw_payload["structured_payload"],
+        }])
 
     def test_history_with_latest_keeps_configured_history_plus_latest(self) -> None:
         history = [

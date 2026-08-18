@@ -9,7 +9,6 @@ import {
   deleteUnusedKnowledgeBase,
   deleteKnowledgeDocument,
   deleteEmailTemplate,
-  getAiConfig,
   getEmailConfig,
   getKnowledgeBaseUsage,
   getUserSettings,
@@ -22,13 +21,13 @@ import {
   listQaEntries,
   listProductDocuments,
   listKnowledgeDocumentChunks,
+  reprocessKnowledgeDocument,
   listRobots,
   listEmailTemplates,
-  saveAiConfig,
   saveEmailConfig,
   saveUserSettings,
-  testAiConfig,
-  testSavedAiConfig,
+  listAiModels,
+  syncAiModels,
   testRobotReply,
   testEmailConfig,
   updateRobot,
@@ -38,7 +37,7 @@ import {
   uploadQaImage,
   createEmailTemplate,
   type ApiRobot,
-  type AiConfigInput,
+  type AiModel,
   type EmailConfigInput,
   type EmailTemplate,
   type EmailTemplateInput,
@@ -55,8 +54,8 @@ import {
   type TestReplyResult,
 } from '../../shared/api/client';
 
-type QABase = { id: string; name: string; count: number; date: string };
-type QABaseForm = { name: string };
+type QABase = { id: string; name: string; count: number; date: string; isPublic: boolean; isOwner: boolean; ownerName: string };
+type QABaseForm = { name: string; isPublic: boolean };
 type QAItem = {
   id: string;
   baseId: string;
@@ -74,7 +73,7 @@ type QAItem = {
 type QAItemForm = Omit<QAItem, 'id' | 'baseId' | 'calls'>;
 
 function mapQABase(base: KnowledgeBaseSummary): QABase {
-  return { id: base.id, name: base.name, count: base.item_count, date: base.updated_at.slice(0, 10) };
+  return { id: base.id, name: base.name, count: base.item_count, date: base.updated_at.slice(0, 10), isPublic: base.is_public, isOwner: base.is_owner, ownerName: base.owner_display_name };
 }
 
 function mapQAItem(entry: QaEntry): QAItem {
@@ -94,7 +93,7 @@ function mapQAItem(entry: QaEntry): QAItem {
   };
 }
 type RoutingCard = { id: number; start: string; end: string; ratio: number };
-type ProductKB = { id: string; name: string; count: number; status: string; date: string };
+type ProductKB = { id: string; name: string; count: number; status: string; date: string; isPublic: boolean; isOwner: boolean; ownerName: string };
 
 function mapProductBase(base: KnowledgeBaseSummary): ProductKB {
   return {
@@ -103,6 +102,9 @@ function mapProductBase(base: KnowledgeBaseSummary): ProductKB {
     count: base.item_count,
     status: base.enabled ? '已同步' : '已停用',
     date: base.updated_at.slice(0, 10),
+    isPublic: base.is_public,
+    isOwner: base.is_owner,
+    ownerName: base.owner_display_name,
   };
 }
 type ProductDocument = {
@@ -113,11 +115,12 @@ type ProductDocument = {
   status: string;
   date: string;
   chunkCount: number;
+  chunkStrategyVersion: string;
 };
-type ToneKB = { id: string; name: string; persona: string; date: string };
+type ToneKB = { id: string; name: string; persona: string; date: string; isPublic: boolean; isOwner: boolean; ownerName: string };
 
 function mapToneBase(base: KnowledgeBaseSummary): ToneKB {
-  return { id: base.id, name: base.name, persona: base.persona, date: base.updated_at.slice(0, 10) };
+  return { id: base.id, name: base.name, persona: base.persona, date: base.updated_at.slice(0, 10), isPublic: base.is_public, isOwner: base.is_owner, ownerName: base.owner_display_name };
 }
 export type AdminRobot = {
   id: string;
@@ -145,7 +148,7 @@ function mapRobot(
     return `${platform} · ${scope.all_accounts ? '全部店铺' : account || scope.platform_account_id || '未指定店铺'}`;
   });
   const config = robot.config_json || {};
-  const model = typeof config.model === 'string' && config.model ? config.model : 'deepseek-chat';
+  const model = typeof config.model === 'string' && config.model ? config.model : 'deepseek-v4-flash';
   return {
     id: robot.id,
     name: robot.name,
@@ -175,7 +178,7 @@ export function useAdminController() {
   const [robotNotice, setRobotNotice] = useState('');
   const [selectedQABase, setSelectedQABase] = useState<QABase | null>(null);
   const [isAddQABaseModalOpen, setIsAddQABaseModalOpen] = useState(false);
-  const [newQABaseForm, setNewQABaseForm] = useState<QABaseForm>({ name: '' });
+  const [newQABaseForm, setNewQABaseForm] = useState<QABaseForm>({ name: '', isPublic: false });
   const [isAddQAItemModalOpen, setIsAddQAItemModalOpen] = useState(false);
   const [editingQAItemId, setEditingQAItemId] = useState<string | null>(null);
   const [qaItemForm, setQaItemForm] = useState<QAItemForm>({
@@ -209,7 +212,7 @@ export function useAdminController() {
   const [routingCards, setRoutingCards] = useState<RoutingCard[]>([{ id: 1, start: '09:00', end: '18:00', ratio: 20 }]);
   const [productBases, setProductBases] = useState<ProductKB[]>([]);
   const [isAddProductKBModalOpen, setIsAddProductKBModalOpen] = useState(false);
-  const [newProductKBForm, setNewProductKBForm] = useState({ name: '' });
+  const [newProductKBForm, setNewProductKBForm] = useState({ name: '', isPublic: false });
   const [isLoadingProductKB, setIsLoadingProductKB] = useState(false);
   const [isSavingProductKB, setIsSavingProductKB] = useState(false);
   const [productKBNotice, setProductKBNotice] = useState('');
@@ -225,26 +228,18 @@ export function useAdminController() {
   const [productImportNotice, setProductImportNotice] = useState('');
   const [isLoadingProductDocuments, setIsLoadingProductDocuments] = useState(false);
   const [isLoadingProductDocumentDetail, setIsLoadingProductDocumentDetail] = useState(false);
+  const [isReprocessingProductDocument, setIsReprocessingProductDocument] = useState(false);
   const [productDocumentDetailNotice, setProductDocumentDetailNotice] = useState('');
   const [toneBases, setToneBases] = useState<ToneKB[]>([]);
   const [isAddToneKBModalOpen, setIsAddToneKBModalOpen] = useState(false);
   const [editingToneKBId, setEditingToneKBId] = useState<string | null>(null);
-  const [newToneKBForm, setNewToneKBForm] = useState({ name: '', persona: '' });
+  const [newToneKBForm, setNewToneKBForm] = useState({ name: '', persona: '', isPublic: false });
   const [isLoadingToneKB, setIsLoadingToneKB] = useState(false);
   const [isSavingToneKB, setIsSavingToneKB] = useState(false);
   const [toneKBNotice, setToneKBNotice] = useState('');
-  const [aiConfig, setAiConfig] = useState<AiConfigInput>({
-    provider: 'deepseek',
-    base_url: 'https://api.deepseek.com',
-    model: 'deepseek-chat',
-    api_key: '',
-    enabled: false,
-    temperature: 0.2,
-  });
-  const [aiConfigMaskedKey, setAiConfigMaskedKey] = useState('');
-  const [isLoadingAiConfig, setIsLoadingAiConfig] = useState(false);
-  const [isSavingAiConfig, setIsSavingAiConfig] = useState(false);
-  const [isTestingAiConfig, setIsTestingAiConfig] = useState(false);
+  const [aiModels, setAiModels] = useState<AiModel[]>([]);
+  const [isLoadingAiModels, setIsLoadingAiModels] = useState(false);
+  const [isSyncingAiModels, setIsSyncingAiModels] = useState(false);
   const [aiConfigNotice, setAiConfigNotice] = useState('');
   const [emailConfig, setEmailConfig] = useState<EmailConfigInput>({
     enabled: false,
@@ -283,13 +278,15 @@ export function useAdminController() {
     setIsLoadingRobots(true);
     setRobotNotice('');
     try {
-      const [items, accounts, knowledgeBases] = await Promise.all([
+      const [items, accounts, knowledgeBases, models] = await Promise.all([
         listRobots(),
         listPlatformAccounts(),
         listKnowledgeBases(),
+        listAiModels(),
       ]);
       setPlatformAccounts(accounts.items);
       setRobotKnowledgeBases(knowledgeBases);
+      setAiModels(models.items);
       setRobots(items.map((item) => mapRobot(item, accounts.items, knowledgeBases)));
     } catch (error) {
       setRobotNotice(error instanceof Error ? error.message : '无法加载机器人配置');
@@ -404,22 +401,14 @@ export function useAdminController() {
   useEffect(() => {
     if (activeTab !== 'api') return;
     let cancelled = false;
-    setIsLoadingAiConfig(true);
-    getAiConfig()
-      .then((config) => {
+    setIsLoadingAiModels(true);
+    listAiModels()
+      .then((result) => {
         if (cancelled) return;
-        setAiConfig({
-          provider: config.provider,
-          base_url: config.base_url,
-          model: config.model,
-          api_key: '',
-          enabled: config.enabled,
-          temperature: config.temperature,
-        });
-        setAiConfigMaskedKey(config.api_key_masked);
+        setAiModels(result.items);
       })
       .catch((error: Error) => !cancelled && setAiConfigNotice(error.message))
-      .finally(() => !cancelled && setIsLoadingAiConfig(false));
+      .finally(() => !cancelled && setIsLoadingAiModels(false));
     return () => { cancelled = true; };
   }, [activeTab]);
 
@@ -468,40 +457,17 @@ export function useAdminController() {
     return () => { cancelled = true; };
   }, [activeTab]);
 
-  const updateAiConfig = <K extends keyof AiConfigInput>(key: K, value: AiConfigInput[K]) => {
-    setAiConfig((prev) => ({ ...prev, [key]: value }));
-    setAiConfigNotice('');
-  };
-
-  const handleSaveAiConfig = async () => {
-    setIsSavingAiConfig(true);
+  const handleSyncAiModels = async () => {
+    setIsSyncingAiModels(true);
     setAiConfigNotice('');
     try {
-      const saved = await saveAiConfig(aiConfig);
-      setAiConfigMaskedKey(saved.api_key_masked);
-      setAiConfig((prev) => ({ ...prev, api_key: '' }));
-      setAiConfigNotice('配置已保存');
+      const result = await syncAiModels();
+      setAiModels(result.items);
+      setAiConfigNotice(`已获取 ${result.items.filter((item) => item.available).length} 个可用模型`);
     } catch (error) {
-      setAiConfigNotice(error instanceof Error ? error.message : '保存失败');
+      setAiConfigNotice(error instanceof Error ? error.message : '获取模型列表失败');
     } finally {
-      setIsSavingAiConfig(false);
-    }
-  };
-
-  const handleTestAiConfig = async () => {
-    setIsTestingAiConfig(true);
-    setAiConfigNotice('');
-    try {
-      if (aiConfig.api_key) {
-        await testAiConfig(aiConfig);
-      } else {
-        await testSavedAiConfig();
-      }
-      setAiConfigNotice('连接成功');
-    } catch (error) {
-      setAiConfigNotice(error instanceof Error ? error.message : '连接失败');
-    } finally {
-      setIsTestingAiConfig(false);
+      setIsSyncingAiModels(false);
     }
   };
 
@@ -602,12 +568,12 @@ export function useAdminController() {
     setIsSavingQA(true);
     setQaNotice('');
     try {
-      const created = await createKnowledgeBase(name, 'qa');
+      const created = await createKnowledgeBase(name, 'qa', '', newQABaseForm.isPublic);
       const newBase = mapQABase(created);
       setQaBases((prev) => [newBase, ...prev]);
       setIsAddQABaseModalOpen(false);
       setSelectedQABase(newBase);
-      setNewQABaseForm({ name: '' });
+      setNewQABaseForm({ name: '', isPublic: false });
     } catch (error) {
       setQaNotice(error instanceof Error ? error.message : '新增问答库失败');
     } finally {
@@ -703,6 +669,18 @@ export function useAdminController() {
     }
   };
 
+  const handleSetQABasePublic = async (id: string, isPublic: boolean) => {
+    try {
+      const saved = await updateKnowledgeBase(id, { is_public: isPublic });
+      const mapped = mapQABase(saved);
+      setQaBases((prev) => prev.map((base) => base.id === id ? mapped : base));
+      setSelectedQABase((current) => current?.id === id ? mapped : current);
+      setRobotKnowledgeBases((prev) => prev.map((base) => base.id === id ? saved : base));
+    } catch (error) {
+      setQaNotice(error instanceof Error ? error.message : '更新公开状态失败');
+    }
+  };
+
   const toggleQAItem = async (id: string) => {
     const item = qaItems.find((candidate) => candidate.id === id);
     if (!item) return;
@@ -756,13 +734,13 @@ export function useAdminController() {
     setIsSavingProductKB(true);
     setProductKBNotice('');
     try {
-      const created = await createKnowledgeBase(name, 'product');
+      const created = await createKnowledgeBase(name, 'product', '', newProductKBForm.isPublic);
       const mapped = mapProductBase(created);
       setProductBases((prev) => [mapped, ...prev]);
       setRobotKnowledgeBases((prev) => prev.some((base) => base.id === created.id)
         ? prev.map((base) => base.id === created.id ? created : base)
         : [created, ...prev]);
-      setNewProductKBForm({ name: '' });
+      setNewProductKBForm({ name: '', isPublic: false });
       setIsAddProductKBModalOpen(false);
       setProductKBNotice('产品知识库已创建');
     } catch (error) {
@@ -790,6 +768,18 @@ export function useAdminController() {
     }
   };
 
+  const handleSetProductKBPublic = async (id: string, isPublic: boolean) => {
+    try {
+      const saved = await updateKnowledgeBase(id, { is_public: isPublic });
+      const mapped = mapProductBase(saved);
+      setProductBases((prev) => prev.map((base) => base.id === id ? mapped : base));
+      setSelectedProductKB((current) => current?.id === id ? mapped : current);
+      setRobotKnowledgeBases((prev) => prev.map((base) => base.id === id ? saved : base));
+    } catch (error) {
+      setProductKBNotice(error instanceof Error ? error.message : '更新公开状态失败');
+    }
+  };
+
   const mapProductDocument = (document: KnowledgeDocument): ProductDocument => ({
     id: document.id,
     name: document.original_filename || document.title,
@@ -798,6 +788,7 @@ export function useAdminController() {
     status: document.status === 'ready' ? '已解析' : document.status === 'deleted' ? '已删除' : '待解析',
     date: document.updated_at.slice(0, 10),
     chunkCount: document.chunk_count,
+    chunkStrategyVersion: document.chunk_strategy_version,
   });
 
   const openProductDocumentDetail = async (document: ProductDocument) => {
@@ -831,6 +822,30 @@ export function useAdminController() {
     setProductDocumentChunks([]);
     setProductDocumentDetailNotice('');
     setIsLoadingProductDocumentDetail(false);
+    setIsReprocessingProductDocument(false);
+  };
+
+  const handleReprocessProductDocument = async () => {
+    if (!selectedProductDocument || !selectedProductKB?.isOwner || isReprocessingProductDocument) return;
+    setIsReprocessingProductDocument(true);
+    setProductDocumentDetailNotice('');
+    try {
+      const updated = await reprocessKnowledgeDocument(selectedProductDocument.id);
+      const mapped = mapProductDocument(updated);
+      setProductDocuments((prev) => ({
+        ...prev,
+        [selectedProductKB.id]: (prev[selectedProductKB.id] ?? []).map((document) => (
+          document.id === mapped.id ? mapped : document
+        )),
+      }));
+      setSelectedProductDocument(mapped);
+      await openProductDocumentDetail(mapped);
+      setProductImportNotice('文档已按最新结构化切片策略重新处理');
+    } catch (error) {
+      setProductDocumentDetailNotice(error instanceof Error ? error.message : '文档重新处理失败');
+    } finally {
+      setIsReprocessingProductDocument(false);
+    }
   };
 
   const openProductKBConfig = async (id: string) => {
@@ -966,7 +981,7 @@ export function useAdminController() {
 
   const openAddToneKB = () => {
     setEditingToneKBId(null);
-    setNewToneKBForm({ name: '', persona: '' });
+    setNewToneKBForm({ name: '', persona: '', isPublic: false });
     setToneKBNotice('');
     setIsAddToneKBModalOpen(true);
   };
@@ -975,9 +990,20 @@ export function useAdminController() {
     const base = toneBases.find((candidate) => candidate.id === id);
     if (!base) return;
     setEditingToneKBId(id);
-    setNewToneKBForm({ name: base.name, persona: base.persona });
+    setNewToneKBForm({ name: base.name, persona: base.persona, isPublic: base.isPublic });
     setToneKBNotice('');
     setIsAddToneKBModalOpen(true);
+  };
+
+  const handleSetToneKBPublic = async (id: string, isPublic: boolean) => {
+    try {
+      const saved = await updateKnowledgeBase(id, { is_public: isPublic });
+      const mapped = mapToneBase(saved);
+      setToneBases((prev) => prev.map((base) => base.id === id ? mapped : base));
+      setRobotKnowledgeBases((prev) => prev.map((base) => base.id === id ? saved : base));
+    } catch (error) {
+      setToneKBNotice(error instanceof Error ? error.message : '更新公开状态失败');
+    }
   };
 
   const handleSaveToneKB = async () => {
@@ -989,8 +1015,9 @@ export function useAdminController() {
         ? await updateKnowledgeBase(editingToneKBId, {
           name: newToneKBForm.name.trim(),
           persona: newToneKBForm.persona.trim(),
+          is_public: newToneKBForm.isPublic,
         })
-        : await createKnowledgeBase(newToneKBForm.name.trim(), 'tone', newToneKBForm.persona.trim());
+        : await createKnowledgeBase(newToneKBForm.name.trim(), 'tone', newToneKBForm.persona.trim(), newToneKBForm.isPublic);
       const mapped = mapToneBase(saved);
       setToneBases((prev) => editingToneKBId
         ? prev.map((base) => base.id === mapped.id ? mapped : base)
@@ -1000,7 +1027,7 @@ export function useAdminController() {
         : [saved, ...prev]);
       setIsAddToneKBModalOpen(false);
       setEditingToneKBId(null);
-      setNewToneKBForm({ name: '', persona: '' });
+      setNewToneKBForm({ name: '', persona: '', isPublic: false });
       setToneKBNotice('语气知识库已保存');
     } catch (error) {
       setToneKBNotice(error instanceof Error ? error.message : '保存语气知识库失败');
@@ -1163,6 +1190,7 @@ export function useAdminController() {
     productImportNotice,
     isLoadingProductDocuments,
     isLoadingProductDocumentDetail,
+    isReprocessingProductDocument,
     productDocumentDetailNotice,
     toneBases,
     isLoadingToneKB,
@@ -1183,9 +1211,11 @@ export function useAdminController() {
     openEditQAItem,
     handleDeleteQAItem,
     handleDeleteQABase,
+    handleSetQABasePublic,
     toggleQAItem,
     handleAddProductKB,
     handleDeleteProductKB,
+    handleSetProductKBPublic,
     openProductKBConfig,
     closeProductKBConfig,
     handleUpdateProductKB,
@@ -1195,8 +1225,10 @@ export function useAdminController() {
     refreshProductDocuments,
     openProductDocumentDetail,
     closeProductDocumentDetail,
+    handleReprocessProductDocument,
     openAddToneKB,
     openEditToneKB,
+    handleSetToneKBPublic,
     handleSaveToneKB,
     handleDeleteToneKB,
     toggleMenu,
@@ -1205,15 +1237,11 @@ export function useAdminController() {
     saveRobot,
     toggleRobotStatus: persistRobotStatus,
     handleDeleteRobot: persistDeleteRobot,
-    aiConfig,
-    aiConfigMaskedKey,
-    isLoadingAiConfig,
-    isSavingAiConfig,
-    isTestingAiConfig,
+    aiModels,
+    isLoadingAiModels,
+    isSyncingAiModels,
     aiConfigNotice,
-    updateAiConfig,
-    handleSaveAiConfig,
-    handleTestAiConfig,
+    handleSyncAiModels,
     emailConfig,
     emailAuthCodeSaved,
     emailTemplates,

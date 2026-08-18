@@ -8,13 +8,29 @@ function userDirectoryKey(userId) {
   return createHash('sha256').update(userId).digest('hex').slice(0, 16);
 }
 
+export function serializeRpaCommand(payload) {
+  // Keep the pipe protocol ASCII-only so Windows console code pages cannot corrupt Unicode.
+  return JSON.stringify(payload).replace(/[\u007f-\uffff]/g, (character) => (
+    `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`
+  ));
+}
+
 export class RpaProcessManager extends EventEmitter {
-  constructor({ userDataPath, agentPath, apiBaseUrl, pythonExecutable = 'python' }) {
+  constructor({
+    userDataPath,
+    executablePath,
+    executableArgs = [],
+    requiredFilePath = null,
+    apiBaseUrl,
+    appVersion = '0.1.0',
+  }) {
     super();
     this.userDataPath = userDataPath;
-    this.agentPath = agentPath;
+    this.executablePath = executablePath;
+    this.executableArgs = [...executableArgs];
+    this.requiredFilePath = requiredFilePath;
     this.apiBaseUrl = apiBaseUrl.replace(/\/$/, '');
-    this.pythonExecutable = pythonExecutable;
+    this.appVersion = appVersion;
     this.process = null;
     this.secret = null;
     this.userId = null;
@@ -126,17 +142,17 @@ export class RpaProcessManager extends EventEmitter {
 
   #spawn() {
     if (!this.userId || !this.accessToken) return;
-    if (!fs.existsSync(this.agentPath)) {
-      this.#setState({ status: 'error', detail: `RPA 程序不存在: ${this.agentPath}` });
+    if (this.requiredFilePath && !fs.existsSync(this.requiredFilePath)) {
+      this.#setState({ status: 'error', detail: `RPA 程序不存在: ${this.requiredFilePath}` });
       return;
     }
     this.secret = randomBytes(32).toString('hex');
     this.buffer = '';
     this.#setState({ status: 'starting', detail: null });
-    const child = spawn(this.pythonExecutable, ['-u', this.agentPath], {
+    const child = spawn(this.executablePath, this.executableArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
     });
     this.process = child;
     child.stdout.setEncoding('utf8');
@@ -159,6 +175,7 @@ export class RpaProcessManager extends EventEmitter {
       access_token: this.accessToken,
       user_id: this.userId,
       data_dir: dataDir,
+      app_version: this.appVersion,
     });
   }
 
@@ -276,7 +293,7 @@ export class RpaProcessManager extends EventEmitter {
   }
 
   #write(child, payload) {
-    child.stdin.write(`${JSON.stringify(payload)}\n`);
+    child.stdin.write(`${serializeRpaCommand(payload)}\n`, 'ascii');
   }
 
   #setState(changes) {

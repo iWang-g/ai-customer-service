@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   ChevronRight, 
@@ -33,14 +33,12 @@ import {
   ChevronUp,
   Plus,
   GripVertical,
-  Pencil,
   Trash2,
   Headset,
   Code2,
   Key,
   Copy,
   RefreshCw,
-  GitMerge,
   ShieldAlert,
   LifeBuoy,
   X,
@@ -73,7 +71,12 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const DEFAULT_SENSITIVE_WORD_REPLY_TEXT = '已收到您的消息，正在为您转接人工客服，请稍等～';
+const DEFAULT_CONTEXT_LENGTH = 10;
+const LEGACY_DEFAULT_ADVANCED_INSTRUCTION = '善用颜文字';
+const DEFAULT_SENSITIVE_WORD_REPLY_TEXT = '亲亲，已收到您的消息，正在为您核实，请稍等~';
+const DEFAULT_ORDER_FOLLOW_UP_TEXT = '亲亲，现在下单可以享受九五折优惠哦~';
+const DEFAULT_POST_RECEIPT_CARE_TEXT = '亲亲，商品还满意吗？欢迎反馈真实体验，可参与平台评价领奖励活动哦~';
+const PRODUCT_DOCUMENT_EXTENSIONS = new Set(['txt', 'md', 'csv', 'json', 'html', 'pdf', 'docx', 'xlsx', 'xlsm']);
 
 const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat('sv-SE', {
   timeZone: 'Asia/Shanghai',
@@ -103,12 +106,6 @@ interface AdminWorkspaceProps {
   onBack: () => void;
   controller: AdminController;
 }
-
-type OutboundBlockRule = {
-  word: string;
-  replacement: string;
-  enabled: boolean;
-};
 
 export default function AdminWorkspace({ onBack, controller }: AdminWorkspaceProps) {
   const {
@@ -162,8 +159,6 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setExpandedMenus,
     robotSubTab,
     setRobotSubTab,
-    routingCards,
-    setRoutingCards,
     productBases,
     isAddProductKBModalOpen,
     setIsAddProductKBModalOpen,
@@ -185,6 +180,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     productImportNotice,
     isLoadingProductDocuments,
     isLoadingProductDocumentDetail,
+    isReprocessingProductDocument,
     productDocumentDetailNotice,
     toneBases,
     isLoadingToneKB,
@@ -196,17 +192,16 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setEditingToneKBId,
     newToneKBForm,
     setNewToneKBForm,
-    handleAddRoutingCard,
-    handleDeleteRoutingCard,
-    handleUpdateRoutingRatio,
     handleAddQABase,
     handleAddQAItem,
     openAddQAItem,
     openEditQAItem,
     handleDeleteQAItem,
     handleDeleteQABase,
+    handleSetQABasePublic,
     handleAddProductKB,
     handleDeleteProductKB,
+    handleSetProductKBPublic,
     openProductKBConfig,
     closeProductKBConfig,
     handleUpdateProductKB,
@@ -216,8 +211,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     refreshProductDocuments,
     openProductDocumentDetail,
     closeProductDocumentDetail,
+    handleReprocessProductDocument,
     openAddToneKB,
     openEditToneKB,
+    handleSetToneKBPublic,
     handleSaveToneKB,
     handleDeleteToneKB,
     toggleMenu,
@@ -226,15 +223,11 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     saveRobot,
     toggleRobotStatus,
     handleDeleteRobot,
-    aiConfig,
-    aiConfigMaskedKey,
-    isLoadingAiConfig,
-    isSavingAiConfig,
-    isTestingAiConfig,
+    aiModels,
+    isLoadingAiModels,
+    isSyncingAiModels,
     aiConfigNotice,
-    updateAiConfig,
-    handleSaveAiConfig,
-    handleTestAiConfig,
+    handleSyncAiModels,
     emailConfig,
     emailAuthCodeSaved,
     emailTemplates,
@@ -273,10 +266,33 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [showQaCategoryCreator, setShowQaCategoryCreator] = useState(false);
   const [productDocumentTab, setProductDocumentTab] = useState<'chunks' | 'content'>('chunks');
   const [productDocumentSearch, setProductDocumentSearch] = useState('');
+  const [isDraggingProductFile, setIsDraggingProductFile] = useState(false);
+  const [productDropNotice, setProductDropNotice] = useState('');
+  useEffect(() => {
+    setIsDraggingProductFile(false);
+    setProductDropNotice('');
+  }, [selectedProductKB?.id]);
   const normalizedProductDocumentSearch = productDocumentSearch.trim().toLocaleLowerCase();
   const visibleProductDocumentChunks = normalizedProductDocumentSearch
     ? productDocumentChunks.filter((chunk) => `${chunk.title_path}\n${chunk.content}`.toLocaleLowerCase().includes(normalizedProductDocumentSearch))
     : productDocumentChunks;
+  const selectDroppedProductFile = (files: FileList) => {
+    setIsDraggingProductFile(false);
+    if (files.length !== 1) {
+      selectProductFile(null);
+      setProductDropNotice('当前一次只能导入一个文档');
+      return;
+    }
+    const file = files[0];
+    const extension = file.name.split('.').pop()?.toLocaleLowerCase() || '';
+    if (!PRODUCT_DOCUMENT_EXTENSIONS.has(extension)) {
+      selectProductFile(null);
+      setProductDropNotice('不支持该文件类型，请选择 TXT、MD、CSV、JSON、HTML、PDF、DOCX、XLSX 或 XLSM 文件');
+      return;
+    }
+    selectProductFile(file);
+    setProductDropNotice('');
+  };
   const closeProductDocumentModal = () => {
     closeProductDocumentDetail();
     setProductDocumentTab('chunks');
@@ -290,43 +306,40 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   };
   const [emailTemplateForm, setEmailTemplateForm] = useState<EmailTemplateInput>(emptyEmailTemplate);
   const [robotName, setRobotName] = useState('');
-  const [robotModel, setRobotModel] = useState('deepseek-chat');
+  const [robotModel, setRobotModel] = useState('');
+  const [isRobotModelMenuOpen, setIsRobotModelMenuOpen] = useState(false);
+  const robotModelMenuRef = useRef<HTMLDivElement>(null);
   const [robotTemperature, setRobotTemperature] = useState(0.2);
   const [allowRobotAutoReply, setAllowRobotAutoReply] = useState(false);
   const [selectedQaKBIds, setSelectedQaKBIds] = useState<string[]>([]);
   const [selectedProductKBIds, setSelectedProductKBIds] = useState<string[]>([]);
   const [baseStyle, setBaseStyle] = useState('专业');
   const [answerLength, setAnswerLength] = useState('适中');
-  const [contextLength, setContextLength] = useState(20);
+  const [contextLength, setContextLength] = useState(DEFAULT_CONTEXT_LENGTH);
   const [customerAddress, setCustomerAddress] = useState('亲亲');
   const [selfAddress, setSelfAddress] = useState('在下');
   const [isCustomCustomerAddress, setIsCustomCustomerAddress] = useState(false);
   const [isCustomSelfAddress, setIsCustomSelfAddress] = useState(false);
-  const [advancedInstruction, setAdvancedInstruction] = useState('善用 emoji 表情符号和分点，直观呈现重点信息，提升亲和力。');
+  const [advancedInstruction, setAdvancedInstruction] = useState('');
   const [inboundSensitiveWords, setInboundSensitiveWords] = useState<string[]>([]);
   const [sensitiveWordDraft, setSensitiveWordDraft] = useState('');
   const [sensitiveWordReplyText, setSensitiveWordReplyText] = useState(DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
-  const [outboundBlockRules, setOutboundBlockRules] = useState<OutboundBlockRule[]>([]);
-  const [outboundBlockWordDraft, setOutboundBlockWordDraft] = useState('');
-  const [outboundReplacementDraft, setOutboundReplacementDraft] = useState('');
+  const [prohibitedContentInstruction, setProhibitedContentInstruction] = useState('');
   const [fallbackReplyText, setFallbackReplyText] = useState('您的问题我将为您接入专业产品客服，请稍后');
   const [fallbackMarkHumanRequired, setFallbackMarkHumanRequired] = useState(false);
-  const [timeoutEnabled, setTimeoutEnabled] = useState(true);
+  const [timeoutEnabled, setTimeoutEnabled] = useState(false);
   const [timeoutSeconds, setTimeoutSeconds] = useState(10);
   const [timeoutReplyText, setTimeoutReplyText] = useState('专项客服正在赶来的路上请稍等~~');
   const [orderFollowUpEnabled, setOrderFollowUpEnabled] = useState(false);
-  const [orderFollowUpText, setOrderFollowUpText] = useState('');
-  const [orderFollowUpDelayMinutes, setOrderFollowUpDelayMinutes] = useState(60);
+  const [orderFollowUpText, setOrderFollowUpText] = useState(DEFAULT_ORDER_FOLLOW_UP_TEXT);
   const [orderFollowUpMarkHumanRequired, setOrderFollowUpMarkHumanRequired] = useState(false);
   const [postReceiptCareEnabled, setPostReceiptCareEnabled] = useState(false);
-  const [postReceiptCareText, setPostReceiptCareText] = useState('');
-  const [postReceiptCareDelayDays, setPostReceiptCareDelayDays] = useState(2);
+  const [postReceiptCareText, setPostReceiptCareText] = useState(DEFAULT_POST_RECEIPT_CARE_TEXT);
   const [postReceiptCareMarkHumanRequired, setPostReceiptCareMarkHumanRequired] = useState(false);
   const [selectedToneKB, setSelectedToneKB] = useState('');
-  const platformOptions = ['全部平台', '千牛', '拼多多', '个人微信', 'QQ', '抖音', '快手', '小红书'];
+  const platformOptions = ['拼多多'];
   const platformCodeByLabel: Record<string, string> = {
-    全部平台: 'all', 千牛: 'qianniu', 拼多多: 'pinduoduo', 个人微信: 'wechat',
-    QQ: 'qq', 抖音: 'douyin', 快手: 'kuaishou', 小红书: 'xiaohongshu',
+    拼多多: 'pinduoduo',
   };
   const platformLabelByCode = Object.fromEntries(
     Object.entries(platformCodeByLabel).map(([label, code]) => [code, label]),
@@ -335,13 +348,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     .filter((account) => account.platform_code === 'pinduoduo' && account.is_active)
     .map((account) => account.account_alias || account.account_name);
   const platformShopOptions: Record<string, string[]> = {
-    千牛: ['全部店铺'],
     拼多多: [...pddAccountNames, '全部店铺'],
-    个人微信: ['全部店铺'],
-    QQ: ['QQ客服号', '全部店铺'],
-    抖音: ['全部店铺'],
-    快手: ['全部店铺'],
-    小红书: ['全部店铺'],
   };
   const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([]);
   const [selectedShops, setSelectedShops] = useState<Record<string, string[]>>({});
@@ -389,35 +396,31 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   useEffect(() => {
     if (!selectedRobot) {
       setRobotName('');
-      setRobotModel('deepseek-chat');
+      setRobotModel('');
       setRobotTemperature(0.2);
       setAllowRobotAutoReply(false);
       setBaseStyle('专业');
       setAnswerLength('适中');
-      setContextLength(20);
+      setContextLength(DEFAULT_CONTEXT_LENGTH);
       setCustomerAddress('亲亲');
       setSelfAddress('在下');
       setIsCustomCustomerAddress(false);
       setIsCustomSelfAddress(false);
-      setAdvancedInstruction('善用 emoji 表情符号和分点，直观呈现重点信息，提升亲和力。');
+      setAdvancedInstruction('');
       setInboundSensitiveWords([]);
       setSensitiveWordDraft('');
       setSensitiveWordReplyText(DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
-      setOutboundBlockRules([]);
-      setOutboundBlockWordDraft('');
-      setOutboundReplacementDraft('');
+      setProhibitedContentInstruction('');
       setFallbackReplyText('您的问题我将为您接入专业产品客服，请稍后');
       setFallbackMarkHumanRequired(false);
-      setTimeoutEnabled(true);
+      setTimeoutEnabled(false);
       setTimeoutSeconds(10);
       setTimeoutReplyText('专项客服正在赶来的路上请稍等~~');
       setOrderFollowUpEnabled(false);
-      setOrderFollowUpText('');
-      setOrderFollowUpDelayMinutes(60);
+      setOrderFollowUpText(DEFAULT_ORDER_FOLLOW_UP_TEXT);
       setOrderFollowUpMarkHumanRequired(false);
       setPostReceiptCareEnabled(false);
-      setPostReceiptCareText('');
-      setPostReceiptCareDelayDays(2);
+      setPostReceiptCareText(DEFAULT_POST_RECEIPT_CARE_TEXT);
       setPostReceiptCareMarkHumanRequired(false);
       setSelectedQaKBIds([]);
       setSelectedProductKBIds([]);
@@ -428,12 +431,12 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     }
     const config = selectedRobot.api.config_json;
     setRobotName(selectedRobot.name);
-    setRobotModel(typeof config.model === 'string' ? config.model : 'deepseek-chat');
+    setRobotModel(typeof config.model === 'string' ? config.model : 'deepseek-v4-flash');
     setRobotTemperature(typeof config.temperature === 'number' ? config.temperature : 0.2);
     setAllowRobotAutoReply(config.allow_auto_send === true);
     setBaseStyle(typeof config.base_style === 'string' ? config.base_style : '专业');
     setAnswerLength(typeof config.answer_length === 'string' ? config.answer_length : '适中');
-    setContextLength(typeof config.context_length === 'number' ? Math.max(1, Math.min(50, Math.round(config.context_length))) : 20);
+    setContextLength(typeof config.context_length === 'number' ? Math.max(1, Math.min(50, Math.round(config.context_length))) : DEFAULT_CONTEXT_LENGTH);
     const configuredCustomerAddress = typeof config.customer_address === 'string' ? config.customer_address : '亲亲';
     const configuredSelfAddress = typeof config.self_address === 'string' ? config.self_address : '在下';
     const savedCustomerAddress = configuredCustomerAddress === '自定义' ? '' : configuredCustomerAddress;
@@ -442,7 +445,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setSelfAddress(savedSelfAddress);
     setIsCustomCustomerAddress(configuredCustomerAddress === '自定义' || !['亲亲', '宝宝'].includes(savedCustomerAddress));
     setIsCustomSelfAddress(configuredSelfAddress === '自定义' || !['在下', '鄙人'].includes(savedSelfAddress));
-    setAdvancedInstruction(typeof config.advanced_instruction === 'string' ? config.advanced_instruction : '');
+    const savedAdvancedInstruction = typeof config.advanced_instruction === 'string'
+      ? config.advanced_instruction.trim()
+      : '';
+    setAdvancedInstruction(savedAdvancedInstruction === LEGACY_DEFAULT_ADVANCED_INSTRUCTION ? '' : savedAdvancedInstruction);
     setInboundSensitiveWords(Array.isArray(config.inbound_sensitive_words)
       ? config.inbound_sensitive_words.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
       : []);
@@ -450,27 +456,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setSensitiveWordReplyText(typeof config.sensitive_word_reply_text === 'string' && config.sensitive_word_reply_text.trim()
       ? config.sensitive_word_reply_text
       : DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
-    const configuredBlockRules: OutboundBlockRule[] = Array.isArray(config.outbound_block_rules)
-      ? config.outbound_block_rules.flatMap((item) => {
-        if (!item || typeof item !== 'object') return [];
-        const rule = item as Record<string, unknown>;
-        const word = typeof rule.word === 'string' ? rule.word.trim() : '';
-        const replacement = typeof rule.replacement === 'string' ? rule.replacement.trim() : '';
-        return word ? [{ word, replacement, enabled: rule.enabled !== false }] : [];
-      })
-      : [];
-    const configuredRuleWords = new Set(configuredBlockRules.map((rule) => rule.word.toLocaleLowerCase()));
-    const legacyBlockRules: OutboundBlockRule[] = Array.isArray(config.outbound_block_words)
-      ? config.outbound_block_words.flatMap((item) => {
-        const word = typeof item === 'string' ? item.trim() : '';
-        return word && !configuredRuleWords.has(word.toLocaleLowerCase())
-          ? [{ word, replacement: '', enabled: true }]
-          : [];
-      })
-      : [];
-    setOutboundBlockRules([...configuredBlockRules, ...legacyBlockRules]);
-    setOutboundBlockWordDraft('');
-    setOutboundReplacementDraft('');
+    setProhibitedContentInstruction(typeof config.prohibited_content_instruction === 'string'
+      ? config.prohibited_content_instruction
+      : '');
     setFallbackReplyText(typeof config.fallback_reply_text === 'string' && config.fallback_reply_text.trim()
       ? config.fallback_reply_text
       : '您的问题我将为您接入专业产品客服，请稍后');
@@ -479,22 +467,20 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         ? config.fallback_mark_human_required
         : config.fallback_transfer_to_human === true,
     );
-    setTimeoutEnabled(config.timeout_enabled !== false);
+    setTimeoutEnabled(config.timeout_enabled === true);
     setTimeoutSeconds(typeof config.timeout_seconds === 'number' ? Math.max(1, Math.min(60, Math.round(config.timeout_seconds))) : 10);
     setTimeoutReplyText(typeof config.timeout_reply_text === 'string' && config.timeout_reply_text.trim()
       ? config.timeout_reply_text
       : '专项客服正在赶来的路上请稍等~~');
     setOrderFollowUpEnabled(config.order_follow_up_enabled === true);
-    setOrderFollowUpText(typeof config.order_follow_up_text === 'string' ? config.order_follow_up_text : '');
-    setOrderFollowUpDelayMinutes(typeof config.order_follow_up_delay_minutes === 'number'
-      ? Math.max(1, Math.min(4320, Math.round(config.order_follow_up_delay_minutes)))
-      : 60);
+    setOrderFollowUpText(typeof config.order_follow_up_text === 'string' && config.order_follow_up_text.trim()
+      ? config.order_follow_up_text
+      : DEFAULT_ORDER_FOLLOW_UP_TEXT);
     setOrderFollowUpMarkHumanRequired(config.order_follow_up_mark_human_required === true);
     setPostReceiptCareEnabled(config.post_receipt_care_enabled === true);
-    setPostReceiptCareText(typeof config.post_receipt_care_text === 'string' ? config.post_receipt_care_text : '');
-    setPostReceiptCareDelayDays(typeof config.post_receipt_care_delay_days === 'number'
-      ? Math.max(0, Math.min(30, Math.round(config.post_receipt_care_delay_days)))
-      : 2);
+    setPostReceiptCareText(typeof config.post_receipt_care_text === 'string' && config.post_receipt_care_text.trim()
+      ? config.post_receipt_care_text
+      : DEFAULT_POST_RECEIPT_CARE_TEXT);
     setPostReceiptCareMarkHumanRequired(config.post_receipt_care_mark_human_required === true);
     setSelectedQaKBIds(selectedRobot.api.qa_knowledge_base_ids);
     setSelectedProductKBIds(selectedRobot.api.product_knowledge_base_ids);
@@ -514,6 +500,30 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setSelectedPlatforms(platforms);
     setSelectedShops(shops);
   }, [selectedRobot?.id, selectedRobot?.api.updated_at, platformAccounts]);
+
+  const availableRobotModels = useMemo(() => aiModels.filter((item) => item.available), [aiModels]);
+  const robotModelIsAvailable = availableRobotModels.some((item) => item.model_id === robotModel);
+
+  useEffect(() => {
+    if (selectedRobot || robotModel || availableRobotModels.length === 0) return;
+    setRobotModel(availableRobotModels[0].model_id);
+  }, [availableRobotModels, robotModel, selectedRobot]);
+
+  useEffect(() => {
+    if (!isRobotModelMenuOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!robotModelMenuRef.current?.contains(event.target as Node)) setIsRobotModelMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsRobotModelMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isRobotModelMenuOpen]);
 
   const togglePlatform = (platform: string) => {
     if (platform === '全部平台') {
@@ -545,6 +555,12 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     if (!robotName.trim()) return;
     const existingRobotConfig = { ...(selectedRobot?.api.config_json || {}) };
     delete existingRobotConfig.fallback_transfer_to_human;
+    delete existingRobotConfig.outbound_block_rules;
+    delete existingRobotConfig.outbound_block_words;
+    delete existingRobotConfig.outbound_block_action;
+    delete existingRobotConfig.order_follow_up_delay_minutes;
+    delete existingRobotConfig.order_follow_up_confidence;
+    delete existingRobotConfig.post_receipt_care_delay_days;
     const platformScopes: Array<{ platform_code: string; platform_account_id: string | null; all_accounts: boolean }> = [];
     selectedPlatforms.forEach((label) => {
       const platformCode = platformCodeByLabel[label] || label;
@@ -577,32 +593,22 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         customer_address: customerAddress,
         self_address: selfAddress,
         advanced_instruction: advancedInstruction.trim(),
+        prohibited_content_instruction: prohibitedContentInstruction.trim(),
         inbound_sensitive_words: inboundSensitiveWords,
         sensitive_word_action: 'mark_human',
         sensitive_word_reply_text: sensitiveWordReplyText.trim() || DEFAULT_SENSITIVE_WORD_REPLY_TEXT,
-        outbound_block_rules: outboundBlockRules
-          .filter((rule) => rule.word.trim() && rule.replacement.trim())
-          .map((rule) => ({ word: rule.word.trim(), replacement: rule.replacement.trim(), enabled: rule.enabled })),
-        outbound_block_words: outboundBlockRules
-          .filter((rule) => rule.enabled && rule.word.trim() && !rule.replacement.trim())
-          .map((rule) => rule.word.trim()),
-        outbound_block_action: outboundBlockRules.some((rule) => rule.enabled && rule.word.trim() && rule.replacement.trim()) ? 'replace' : 'fallback',
         fallback_reply_text: fallbackReplyText.trim(),
         fallback_mark_human_required: fallbackMarkHumanRequired,
         timeout_enabled: timeoutEnabled,
         timeout_seconds: timeoutSeconds,
         timeout_reply_text: timeoutReplyText.trim(),
         order_follow_up_enabled: orderFollowUpEnabled,
-        order_follow_up_text: orderFollowUpText.trim(),
-        order_follow_up_delay_minutes: orderFollowUpDelayMinutes,
-        order_follow_up_confidence: 0.8,
+        order_follow_up_text: orderFollowUpText.trim() || DEFAULT_ORDER_FOLLOW_UP_TEXT,
         order_follow_up_mark_human_required: orderFollowUpMarkHumanRequired,
         post_receipt_care_enabled: postReceiptCareEnabled,
-        post_receipt_care_text: postReceiptCareText.trim(),
-        post_receipt_care_delay_days: postReceiptCareDelayDays,
+        post_receipt_care_text: postReceiptCareText.trim() || DEFAULT_POST_RECEIPT_CARE_TEXT,
         post_receipt_care_max_order_age_days: 30,
         post_receipt_care_mark_human_required: postReceiptCareMarkHumanRequired,
-        routing_cards: routingCards,
       },
       qa_knowledge_base_ids: selectedQaKBIds,
       product_knowledge_base_ids: selectedProductKBIds,
@@ -616,14 +622,6 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     if (!word || inboundSensitiveWords.some((item) => item.toLocaleLowerCase() === word.toLocaleLowerCase())) return;
     setInboundSensitiveWords((current) => [...current, word]);
     setSensitiveWordDraft('');
-  };
-  const addOutboundBlockWord = () => {
-    const word = outboundBlockWordDraft.trim();
-    const replacement = outboundReplacementDraft.trim();
-    if (!word || !replacement || outboundBlockRules.length >= 200 || outboundBlockRules.some((item) => item.word.toLocaleLowerCase() === word.toLocaleLowerCase())) return;
-    setOutboundBlockRules((current) => [...current, { word, replacement, enabled: true }]);
-    setOutboundBlockWordDraft('');
-    setOutboundReplacementDraft('');
   };
   const handleTestReply = async () => {
     const message = testReplyText.trim();
@@ -983,7 +981,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
 
                 {/* Stats Grid - Updated Style from Screenshot */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                  {dashboardStats.map((stat, idx) => (
+                  {dashboardStats.filter((stat) => stat.ready).map((stat, idx) => (
                     <motion.div
                       key={stat.title}
                       initial={{ opacity: 0, y: 20 }}
@@ -1106,9 +1104,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           </div>
                         )}
                       </div>
-                      <button onClick={() => setIsFullReportModalOpen(true)} className="mt-8 py-3 w-full border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 transition-colors">
+                      {false && <button onClick={() => setIsFullReportModalOpen(true)} className="mt-8 py-3 w-full border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 transition-colors">
                         查看完整报告
-                      </button>
+                      </button>}
                     </div>
                   </div>
                 </div>
@@ -1244,7 +1242,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                     <button onClick={() => setActiveTab('robot-list')} className="px-6 py-2 border border-slate-200 rounded-xl text-sm font-bold text-slate-600 hover:bg-slate-50 transition-colors">取消</button>
                     <button
                       onClick={() => void handleSaveRobotConfiguration()}
-                      disabled={isSavingRobot || !robotName.trim() || (isCustomCustomerAddress && !customerAddress.trim()) || (isCustomSelfAddress && !selfAddress.trim())}
+                      disabled={isSavingRobot || !robotName.trim() || !robotModelIsAvailable || (isCustomCustomerAddress && !customerAddress.trim()) || (isCustomSelfAddress && !selfAddress.trim())}
                       className="px-6 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >{isSavingRobot ? '保存中...' : '保存配置'}</button>
                   </div>
@@ -1297,13 +1295,50 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           </div>
                           <div className="space-y-3">
                             <label className="text-sm font-bold text-slate-700">选择底座模型</label>
-                            <div className="relative">
-                              <select value={robotModel} onChange={(event) => setRobotModel(event.target.value)} className="w-full appearance-none pl-4 pr-10 py-3 bg-slate-50 border border-slate-100 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
-                                <option value="deepseek-chat">DeepSeek Chat</option>
-                                <option value="deepseek-reasoner">DeepSeek Reasoner</option>
-                              </select>
-                              <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+                            <div className="relative" ref={robotModelMenuRef}>
+                              <button
+                                type="button"
+                                onClick={() => setIsRobotModelMenuOpen((value) => !value)}
+                                disabled={isLoadingAiModels || availableRobotModels.length === 0}
+                                className={cn(
+                                  'flex w-full items-center justify-between rounded-xl border bg-slate-50 px-4 py-3 text-left text-sm outline-none transition-all focus:ring-2 focus:ring-indigo-500',
+                                  robotModel && !robotModelIsAvailable ? 'border-rose-200 text-rose-600' : 'border-slate-100 text-slate-700',
+                                  'disabled:cursor-not-allowed disabled:opacity-60',
+                                )}
+                                aria-haspopup="listbox"
+                                aria-expanded={isRobotModelMenuOpen}
+                              >
+                                <span>{isLoadingAiModels ? '正在加载模型列表...' : robotModel || '请先在 AI 模型配置中获取模型列表'}</span>
+                                <ChevronDown className={cn('h-4 w-4 text-slate-400 transition-transform', isRobotModelMenuOpen && 'rotate-180')} />
+                              </button>
+                              {isRobotModelMenuOpen && (
+                                <div className="absolute z-30 mt-2 w-full overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-xl" role="listbox">
+                                  {robotModel && !robotModelIsAvailable && (
+                                    <div className="px-4 py-3 text-sm font-semibold text-rose-600">{robotModel}（当前不可用，请重新选择）</div>
+                                  )}
+                                  {availableRobotModels.map((item) => (
+                                    <button
+                                      type="button"
+                                      key={`${item.provider}:${item.model_id}`}
+                                      onClick={() => {
+                                        setRobotModel(item.model_id);
+                                        setIsRobotModelMenuOpen(false);
+                                      }}
+                                      className={cn(
+                                        'w-full px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-slate-50',
+                                        item.model_id === robotModel ? 'bg-indigo-50 text-indigo-600' : 'text-slate-600',
+                                      )}
+                                      role="option"
+                                      aria-selected={item.model_id === robotModel}
+                                    >
+                                      {item.display_name}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
                             </div>
+                            {robotModel && !robotModelIsAvailable && <p className="text-xs font-medium text-rose-500">当前模型已从服务端目录移除，请重新选择后保存。</p>}
+                            {!isLoadingAiModels && availableRobotModels.length === 0 && <p className="text-xs text-slate-400">请先前往“AI 模型配置”获取模型列表。</p>}
                           </div>
                           <label className="space-y-3">
                             <span className="text-sm font-bold text-slate-700">模型发散度（Temperature）</span>
@@ -1518,7 +1553,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             {robotKnowledgeBases.filter((item) => item.kind === 'qa').map(item => (
                               <label key={item.id} className="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-slate-50 cursor-pointer transition-colors group border border-transparent hover:border-slate-100">
                                 <input type="checkbox" className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" checked={selectedQaKBIds.includes(item.id)} onChange={() => toggleKnowledgeBase(setSelectedQaKBIds, item.id)} />
-                                <span className="text-sm text-slate-600 group-hover:text-slate-900 flex-1">{item.name}</span>
+                                <span className="text-sm text-slate-600 group-hover:text-slate-900 flex-1" title={item.is_owner ? '' : `来自用户：${item.owner_display_name}`}>{item.name}{item.is_owner ? '' : ' · 公开'}</span>
                               </label>
                             ))}
                             {robotKnowledgeBases.every((item) => item.kind !== 'qa') && <p className="px-4 py-3 text-xs text-slate-400">暂无可用 QA 问答知识库</p>}
@@ -1532,7 +1567,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             {robotKnowledgeBases.filter((item) => item.kind === 'product').map(item => (
                               <label key={item.id} className="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-slate-50 cursor-pointer transition-colors group border border-transparent hover:border-slate-100">
                                 <input type="checkbox" className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" checked={selectedProductKBIds.includes(item.id)} onChange={() => toggleKnowledgeBase(setSelectedProductKBIds, item.id)} />
-                                <span className="text-sm text-slate-600 group-hover:text-slate-900 flex-1">{item.name}</span>
+                                <span className="text-sm text-slate-600 group-hover:text-slate-900 flex-1" title={item.is_owner ? '' : `来自用户：${item.owner_display_name}`}>{item.name}{item.is_owner ? '' : ' · 公开'}</span>
                               </label>
                             ))}
                             {robotKnowledgeBases.every((item) => item.kind !== 'product') && <p className="px-4 py-3 text-xs text-slate-400">暂无可用产品知识库</p>}
@@ -1552,7 +1587,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                   onChange={() => setSelectedToneKB(item.id)}
                                   className="w-4 h-4 border-slate-300 text-indigo-600 focus:ring-indigo-500"
                                 />
-                                <span className="text-sm text-slate-600 group-hover:text-slate-900 flex-1">{item.name}</span>
+                                <span className="text-sm text-slate-600 group-hover:text-slate-900 flex-1" title={item.is_owner ? '' : `来自用户：${item.owner_display_name}`}>{item.name}{item.is_owner ? '' : ' · 公开'}</span>
                               </label>
                             ))}
                             {robotKnowledgeBases.every((item) => item.kind !== 'tone') && <p className="px-4 py-3 text-xs text-slate-400">暂无可用语气知识库</p>}
@@ -1562,81 +1597,6 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
 
                       {/* Configurations for selected strategies */}
                       <div className="pt-8 border-t border-slate-100 space-y-10">
-                        {/* 转分流策略 */}
-                        <div className="space-y-6">
-                          <div className="flex items-center justify-between mb-2">
-                            <div className="flex items-center gap-2">
-                              <GitMerge className="w-5 h-5 text-indigo-500" />
-                              <h3 className="text-lg font-bold text-slate-900">转分流策略</h3>
-                              <span className="px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-bold">开发中...</span>
-                            </div>
-                            <button onClick={handleAddRoutingCard} className="flex items-center gap-2 px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded-lg text-sm font-bold hover:bg-indigo-100 transition-colors">
-                              <Plus className="w-4 h-4" />
-                              新增时间段
-                            </button>
-                          </div>
-
-                          <div className="p-4 rounded-xl border border-amber-200 bg-amber-50 text-sm text-amber-800">
-                            当前时间段、分流比例和平台会话转移仅为界面预览，尚未接入 business-api 和平台 RPA，请勿作为已生效策略使用。
-                          </div>
-                          
-                          <div className="space-y-4">
-                            {routingCards.map((card) => (
-                              <div key={card.id} className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-8 relative group">
-                                <div className="space-y-4">
-                                  <div className="flex items-center justify-between">
-                                    <div>
-                                      <h3 className="text-base font-bold text-slate-900">启用人机结合时间段</h3>
-                                      <p className="text-sm text-slate-500 mt-1">在设定时间内，机器人将优先引导转人，若人工全忙则由机器人接待。</p>
-                                    </div>
-                                    <div className="flex items-center gap-4">
-                                      <div className="w-12 h-6 shrink-0 bg-indigo-500 rounded-full relative cursor-pointer shadow-inner">
-                                        <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
-                                      </div>
-                                      <div className="opacity-0 group-hover:opacity-100 transition-opacity -mr-2">
-                                        <button onClick={() => handleDeleteRoutingCard(card.id)} className="p-2 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors" title="删除当前时间段卡片">
-                                          <Trash2 className="w-4 h-4" />
-                                        </button>
-                                      </div>
-                                    </div>
-                                  </div>
-                                  <div className="grid grid-cols-2 gap-4 pt-4 border-t border-slate-200/60">
-                                    <div className="space-y-2">
-                                      <label className="text-sm font-bold text-slate-700">开始时间</label>
-                                      <input type="time" defaultValue={card.start} className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
-                                    </div>
-                                    <div className="space-y-2">
-                                      <label className="text-sm font-bold text-slate-700">结束时间</label>
-                                      <input type="time" defaultValue={card.end} className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none transition-all" />
-                                    </div>
-                                  </div>
-                                </div>
-
-                                <div className="space-y-4 pt-6 border-t border-slate-200/60">
-                                  <div>
-                                    <h3 className="text-base font-bold text-slate-900">转分流比例</h3>
-                                    <p className="text-sm text-slate-500 mt-1">控制机器人会话进入人工队列的比例（0%为全量机器人，100%为全量转人工）。</p>
-                                  </div>
-                                  <div className="flex items-center gap-4 py-4">
-                                    <span className="text-sm font-bold text-slate-400">0%</span>
-                                    <input 
-                                      type="range" 
-                                      className="flex-1 accent-indigo-600" 
-                                      min="0" max="100" step="1" 
-                                      value={card.ratio} 
-                                      onChange={e => handleUpdateRoutingRatio(card.id, parseInt(e.target.value))} 
-                                    />
-                                    <span className="text-sm font-bold text-slate-600">100%</span>
-                                  </div>
-                                  <div className="text-center">
-                                    <span className="inline-block px-4 py-1.5 bg-indigo-100 text-indigo-700 font-mono font-bold text-lg rounded-xl">{card.ratio}%</span>转人工
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-
                         {/* 机器人安全策略 */}
                         <div className="space-y-6">
                           <div className="flex items-center justify-between mb-2">
@@ -1647,94 +1607,17 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <span className="text-xs font-medium text-slate-400">跟随当前机器人绑定的平台与店铺生效</span>
                           </div>
                           
-                          <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
-                            <div className="flex items-center gap-2 pb-4 border-b border-slate-200/70">
-                              <ShieldAlert className="w-5 h-5 text-rose-500" />
-                              <h4 className="text-base font-bold text-slate-900">违禁词处理策略</h4>
-                            </div>
-                            <div className="p-4 bg-orange-50/80 rounded-xl border border-orange-100/50 flex items-start gap-3">
-                              <Info className="w-5 h-5 text-orange-500 shrink-0 mt-0.5" />
-                              <div>
-                                <p className="text-sm text-orange-800">QA 或 AI 回复命中违禁词时，将违禁词替换为预设词后再发送；未配置替换词的旧规则仍使用常规兜底话术。</p>
-                              </div>
-                            </div>
-                            
-                            <div className="space-y-4">
-                              <label className="text-sm font-bold text-slate-700">添加违禁词替换规则</label>
-                              <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-3">
-                                <input
-                                  type="text"
-                                  placeholder="违禁词，例如：你好"
-                                  value={outboundBlockWordDraft}
-                                  maxLength={64}
-                                  onChange={(event) => setOutboundBlockWordDraft(event.target.value)}
-                                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
-                                />
-                                <input
-                                  type="text"
-                                  placeholder="替换为，例如：您好"
-                                  value={outboundReplacementDraft}
-                                  maxLength={128}
-                                  onChange={(event) => setOutboundReplacementDraft(event.target.value)}
-                                  onKeyDown={(event) => {
-                                    if (event.key !== 'Enter') return;
-                                    event.preventDefault();
-                                    addOutboundBlockWord();
-                                  }}
-                                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={addOutboundBlockWord}
-                                  disabled={!outboundBlockWordDraft.trim() || !outboundReplacementDraft.trim() || outboundBlockRules.length >= 200}
-                                  className="px-5 py-3 rounded-xl bg-indigo-600 text-white text-sm font-bold hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
-                                >
-                                  添加
-                                </button>
-                              </div>
-                              {outboundBlockRules.some((rule) => rule.word.toLocaleLowerCase() === outboundBlockWordDraft.trim().toLocaleLowerCase()) && outboundBlockWordDraft.trim() && (
-                                <p className="text-xs text-rose-500">该违禁词已经存在，请先删除原规则再添加。</p>
-                              )}
-                            </div>
-
-                            <div className="space-y-3">
-                              <label className="text-sm font-bold text-slate-700">已配置替换规则 ({outboundBlockRules.length})</label>
-                              <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
-                                <div className="grid grid-cols-[1fr_1fr_80px_80px] gap-3 px-4 py-2.5 bg-slate-50 text-xs font-bold text-slate-500">
-                                  <span>违禁词</span><span>替换为</span><span>状态</span><span>操作</span>
-                                </div>
-                                {outboundBlockRules.map((rule) => (
-                                  <div key={rule.word.toLocaleLowerCase()} className="grid grid-cols-[1fr_1fr_80px_80px] gap-3 items-center px-4 py-3 border-t border-slate-100 text-sm">
-                                    <span className="font-medium text-rose-600 break-all">{rule.word}</span>
-                                    <span className={cn("break-all", rule.replacement ? "text-slate-700" : "text-orange-500")}>{rule.replacement || '待补充（旧规则）'}</span>
-                                    <button
-                                      type="button"
-                                      onClick={() => setOutboundBlockRules((current) => current.map((item) => item.word === rule.word ? { ...item, enabled: !item.enabled } : item))}
-                                      className={cn("text-xs font-bold", rule.enabled ? "text-emerald-600" : "text-slate-400")}
-                                    >
-                                      {rule.enabled ? '已启用' : '已停用'}
-                                    </button>
-                                    <div className="flex items-center gap-1">
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          setOutboundBlockWordDraft(rule.word);
-                                          setOutboundReplacementDraft(rule.replacement);
-                                          setOutboundBlockRules((current) => current.filter((item) => item.word !== rule.word));
-                                        }}
-                                        className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
-                                        title="编辑规则"
-                                      ><Pencil className="w-4 h-4" /></button>
-                                      <button type="button" onClick={() => setOutboundBlockRules((current) => current.filter((item) => item.word !== rule.word))} className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors" title="删除规则"><Trash2 className="w-4 h-4" /></button>
-                                    </div>
-                                  </div>
-                                ))}
-                                {outboundBlockRules.length === 0 && <div className="px-4 py-6 border-t border-slate-100 text-center text-xs text-slate-400">暂无违禁词替换规则</div>}
-                              </div>
+                          <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+                            <label htmlFor="prohibited-content-instruction" className="text-base font-bold text-slate-900">违禁内容设置</label>
+                            <textarea
+                              id="prohibited-content-instruction"
+                              value={prohibitedContentInstruction}
+                              onChange={(event) => setProhibitedContentInstruction(event.target.value)}
+                              maxLength={4000}
+                              placeholder="输入不希望 AI 回复涉及的内容，例如：不要承诺最低价、不要评价其他品牌……"
+                              className="min-h-28 w-full resize-y rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition-all focus:ring-2 focus:ring-indigo-500"
+                            />
                           </div>
-
-                        </div>
-                      </div>
 
                           <div className="space-y-3">
                             <div className="flex items-center gap-2">
@@ -1797,6 +1680,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 </div>
                               </div>
                             </div>
+                            </div>
                           </div>
                         </div>
 
@@ -1829,7 +1713,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                     <span className="block mt-1 text-xs text-slate-400">仅标记消息中心会话，不调用平台的“转移会话”功能。</span>
                                   </div>
                                   <button type="button" onClick={() => setFallbackMarkHumanRequired((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", fallbackMarkHumanRequired ? "bg-indigo-500" : "bg-slate-300")} title="发送任务入队后立即标记待人工处理">
-                                    <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
+                                    <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm", fallbackMarkHumanRequired ? "right-1" : "left-1")}></div>
                                   </button>
                                 </div>
                               </div>
@@ -1857,7 +1741,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
                                   <span className="text-sm font-bold text-slate-700">启用超时安抚（只发送一次，不打断正式回复）</span>
                                   <button type="button" onClick={() => setTimeoutEnabled((value) => !value)} className={cn("w-12 h-6 rounded-full relative shadow-inner transition-colors", timeoutEnabled ? "bg-indigo-500" : "bg-slate-300")}>
-                                    <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
+                                    <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm", timeoutEnabled ? "right-1" : "left-1")}></div>
                                   </button>
                                 </div>
                               </div>
@@ -1866,14 +1750,14 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <div className="space-y-4 pt-2">
                               <div>
                                 <h3 className="text-base font-bold text-slate-900">其他话术策略</h3>
-                                <p className="mt-1 text-sm text-slate-500">基于客户订单状态延迟触发，同一客户每类话术最多成功发送一次。</p>
+                                <p className="mt-1 text-sm text-slate-500">基于客户最新订单状态触发，同一客户每类话术最多成功发送一次。</p>
                               </div>
 
                               <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-5">
                                 <div className="flex items-center justify-between">
                                   <div>
                                     <h4 className="text-sm font-bold text-slate-800">未下单追单话术</h4>
-                                    <p className="mt-1 text-xs text-slate-400">仅在 AI 判断购买意向强、订单明确为空，且延迟复查后仍未下单时发送。</p>
+                                    <p className="mt-1 text-xs text-slate-400">客户订单明确为空时，在本轮正常回复完成后复查订单状态，仍未下单则立即发送。</p>
                                   </div>
                                   <button type="button" onClick={() => setOrderFollowUpEnabled((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", orderFollowUpEnabled ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", orderFollowUpEnabled ? "right-1" : "left-1")}></div>
@@ -1881,11 +1765,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 </div>
                                 <div className="space-y-2">
                                   <label className="text-sm font-bold text-slate-700">输入追单话术</label>
-                                  <textarea value={orderFollowUpText} onChange={(event) => setOrderFollowUpText(event.target.value)} maxLength={2000} className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none" placeholder="例如：亲亲，刚才咨询的商品还需要我帮您确认吗？" />
-                                </div>
-                                <div className="space-y-2">
-                                  <label className="text-sm font-bold text-slate-700">正常回复后延迟发送（分钟）</label>
-                                  <input type="number" min="1" max="4320" value={orderFollowUpDelayMinutes} onChange={(event) => setOrderFollowUpDelayMinutes(Math.max(1, Math.min(4320, Number(event.target.value) || 1)))} className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                                  <textarea value={orderFollowUpText} onChange={(event) => setOrderFollowUpText(event.target.value)} maxLength={2000} className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none" placeholder={DEFAULT_ORDER_FOLLOW_UP_TEXT} />
                                 </div>
                                 <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-4 py-3">
                                   <div>
@@ -1902,7 +1782,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 <div className="flex items-center justify-between">
                                   <div>
                                     <h4 className="text-sm font-bold text-slate-800">签收后关怀话术</h4>
-                                    <p className="mt-1 text-xs text-slate-400">订单首次变为已签收后创建任务；退款、售后和待人工会话固定排除。</p>
+                                    <p className="mt-1 text-xs text-slate-400">订单首次识别为已签收或已完成后复查订单状态，无退款、售后或待人工情况时立即发送。</p>
                                   </div>
                                   <button type="button" onClick={() => setPostReceiptCareEnabled((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", postReceiptCareEnabled ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", postReceiptCareEnabled ? "right-1" : "left-1")}></div>
@@ -1910,11 +1790,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 </div>
                                 <div className="space-y-2">
                                   <label className="text-sm font-bold text-slate-700">输入签收后关怀话术</label>
-                                  <textarea value={postReceiptCareText} onChange={(event) => setPostReceiptCareText(event.target.value)} maxLength={2000} className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none" placeholder="例如：亲亲，商品使用得还满意吗？欢迎反馈真实体验。" />
-                                </div>
-                                <div className="space-y-2">
-                                  <label className="text-sm font-bold text-slate-700">签收后延迟发送（天）</label>
-                                  <input type="number" min="0" max="30" value={postReceiptCareDelayDays} onChange={(event) => setPostReceiptCareDelayDays(Math.max(0, Math.min(30, Number(event.target.value) || 0)))} className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                                  <textarea value={postReceiptCareText} onChange={(event) => setPostReceiptCareText(event.target.value)} maxLength={2000} className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none" placeholder={DEFAULT_POST_RECEIPT_CARE_TEXT} />
                                 </div>
                                 <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-4 py-3">
                                   <div>
@@ -2037,17 +1913,18 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             onChange={(event) => setProductKBName(event.target.value)}
                             maxLength={128}
                             className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white"
+                            disabled={!selectedProductKB.isOwner}
                           />
                         </label>
-                        <button
+                        {selectedProductKB.isOwner && <button
                           onClick={() => void handleUpdateProductKB()}
                           disabled={isSavingProductKB || !productKBName.trim() || productKBName.trim() === selectedProductKB.name}
                           className="px-5 py-3 rounded-xl bg-indigo-600 text-white text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed"
-                        >{isSavingProductKB ? '保存中...' : '保存名称'}</button>
+                        >{isSavingProductKB ? '保存中...' : '保存名称'}</button>}
                       </div>
                     </div>
 
-                    <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-5">
+                    {selectedProductKB.isOwner && <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-5">
                       <div className="flex items-center justify-between">
                         <div>
                           <h2 className="text-lg font-bold text-slate-900">导入文档</h2>
@@ -2055,15 +1932,40 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                         </div>
                         <FileText className="w-7 h-7 text-indigo-500" />
                       </div>
-                      <label className={cn(
+                      <label
+                        onDragEnter={(event) => {
+                          event.preventDefault();
+                          setIsDraggingProductFile(true);
+                        }}
+                        onDragOver={(event) => {
+                          event.preventDefault();
+                          event.dataTransfer.dropEffect = 'copy';
+                          setIsDraggingProductFile(true);
+                        }}
+                        onDragLeave={(event) => {
+                          const nextTarget = event.relatedTarget;
+                          if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+                            setIsDraggingProductFile(false);
+                          }
+                        }}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          selectDroppedProductFile(event.dataTransfer.files);
+                        }}
+                        className={cn(
                         "border-2 border-dashed rounded-2xl p-8 flex flex-col items-center justify-center text-center cursor-pointer transition-colors",
-                        selectedProductFile ? "border-indigo-300 bg-indigo-50/50" : "border-slate-200 hover:border-indigo-300 hover:bg-slate-50"
+                        isDraggingProductFile
+                          ? "border-indigo-500 bg-indigo-100/70"
+                          : selectedProductFile
+                            ? "border-indigo-300 bg-indigo-50/50"
+                            : "border-slate-200 hover:border-indigo-300 hover:bg-slate-50"
                       )}>
                         <UploadCloud className="w-8 h-8 text-indigo-500 mb-3" />
-                        <span className="text-sm font-bold text-slate-700">{selectedProductFile ? selectedProductFile.name : '点击选择文档'}</span>
+                        <span className="text-sm font-bold text-slate-700">{selectedProductFile ? selectedProductFile.name : isDraggingProductFile ? '松开以选择文档' : '点击选择或拖拽文档到此处'}</span>
                         <span className="text-xs text-slate-400 mt-2">文件会上传到本地知识库服务，解析结果不会暴露原始文件路径。</span>
-                        <input type="file" className="hidden" accept=".txt,.md,.csv,.json,.html,.pdf,.docx,.xlsx,.xlsm" onChange={(event) => selectProductFile(event.target.files?.[0] ?? null)} />
+                        <input type="file" className="hidden" accept=".txt,.md,.csv,.json,.html,.pdf,.docx,.xlsx,.xlsm" onChange={(event) => { selectProductFile(event.target.files?.[0] ?? null); setProductDropNotice(''); }} />
                       </label>
+                      {productDropNotice && <div className="rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-600">{productDropNotice}</div>}
                       {isImportingProductDocument && (
                         <div className="space-y-2">
                           <div className="flex justify-between text-xs font-bold text-slate-500"><span>导入进度</span><span>{productImportProgress}%</span></div>
@@ -2078,7 +1980,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           {isImportingProductDocument ? '导入中...' : '导入文档'}
                         </button>
                       </div>
-                    </div>
+                    </div>}
 
                     <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                       <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between">
@@ -2099,7 +2001,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                               <td className="px-6 py-4 text-sm text-slate-500">{document.chunkCount} 个</td>
                               <td className="px-6 py-4"><span className={cn("inline-flex items-center gap-1.5 text-xs font-bold", document.status === '已解析' ? "text-emerald-600" : "text-amber-600")}>{document.status === '已解析' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <RefreshCw className="w-3.5 h-3.5" />}{document.status}</span></td>
                               <td className="px-6 py-4 text-sm text-slate-500">{document.date}</td>
-                              <td className="px-6 py-4 text-right"><div className="flex items-center justify-end gap-4"><button type="button" onClick={() => { setProductDocumentTab('chunks'); setProductDocumentSearch(''); void openProductDocumentDetail(document); }} className="text-indigo-600 hover:text-indigo-700 font-bold text-xs">查看</button><button onClick={() => requestConfirm(`确定删除“${document.name}”吗？`, () => handleDeleteProductDocument(document.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs">删除</button></div></td>
+                              <td className="px-6 py-4 text-right"><div className="flex items-center justify-end gap-4"><button type="button" onClick={() => { setProductDocumentTab('chunks'); setProductDocumentSearch(''); void openProductDocumentDetail(document); }} className="text-indigo-600 hover:text-indigo-700 font-bold text-xs">查看</button>{selectedProductKB.isOwner && <button onClick={() => requestConfirm(`确定删除“${document.name}”吗？`, () => handleDeleteProductDocument(document.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs">删除</button>}</div></td>
                             </tr>
                           ))}</tbody>
                         </table>
@@ -2135,7 +2037,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                       {productBases.map((kb) => (
                         <tr key={kb.id} className="hover:bg-slate-50/50 transition-colors">
                           <td className="px-6 py-4">
-                            <span className="text-sm font-bold text-slate-900">{kb.name}</span>
+                            <span className="text-sm font-bold text-slate-900" title={kb.isOwner ? (kb.isPublic ? '我的公开知识库' : '我的私有知识库') : `来自用户：${kb.ownerName}`}>{kb.name}</span>
+                            <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">{kb.isOwner ? (kb.isPublic ? '公开' : '私有') : '公开 · 只读'}</span>
                           </td>
                           <td className="px-6 py-4 text-sm text-slate-500">{kb.count} 份</td>
                           <td className="px-6 py-4">
@@ -2153,8 +2056,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           <td className="px-6 py-4 text-right">
                             <div className="flex items-center justify-end gap-3">
                               <button onClick={() => openProductKBConfig(kb.id)} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors">查看</button>
-                              <button onClick={() => openProductKBConfig(kb.id)} className="text-slate-400 hover:text-slate-600 font-bold text-xs transition-colors">配置</button>
-                              <button onClick={() => requestConfirm(`确定删除“${kb.name}”吗？`, () => handleDeleteProductKB(kb.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>
+                              {kb.isOwner && <button onClick={() => void handleSetProductKBPublic(kb.id, !kb.isPublic)} className="text-slate-500 hover:text-slate-700 font-bold text-xs transition-colors">{kb.isPublic ? '设为私有' : '设为公开'}</button>}
+                              {kb.isOwner && <button onClick={() => openProductKBConfig(kb.id)} className="text-emerald-600 hover:text-emerald-700 font-bold text-xs transition-colors">配置</button>}
+                              {kb.isOwner && <button onClick={() => requestConfirm(`确定删除“${kb.name}”吗？`, () => handleDeleteProductKB(kb.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>}
                             </div>
                           </td>
                         </tr>
@@ -2200,10 +2104,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           <h3 className="text-lg font-bold text-slate-900">问答列表</h3>
                           <p className="mt-1 text-xs text-slate-400">共 {qaTotal} 条问答</p>
                         </div>
-                        <button onClick={() => { setShowQaCategoryCreator(false); openAddQAItem(); }} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all">
+                        {selectedQABase.isOwner && <button onClick={() => { setShowQaCategoryCreator(false); openAddQAItem(); }} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all">
                           <Plus className="w-4 h-4" />
                           添加问答
-                        </button>
+                        </button>}
                       </div>
 
                       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
@@ -2282,15 +2186,15 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 <td className="px-6 py-4 text-sm font-mono text-slate-600">{item.calls}</td>
                                 <td className="px-6 py-4">
                                   <div className="flex justify-end">
-                                    <div onClick={() => toggleQAItem(item.id)} className={`w-10 h-5 rounded-full relative cursor-pointer shadow-inner ${item.enabled ? 'bg-indigo-500' : 'bg-slate-300'}`}>
+                                    <div onClick={() => selectedQABase.isOwner && toggleQAItem(item.id)} className={`w-10 h-5 rounded-full relative shadow-inner ${selectedQABase.isOwner ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'} ${item.enabled ? 'bg-indigo-500' : 'bg-slate-300'}`}>
                                       <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all shadow-sm ${item.enabled ? 'right-0.5' : 'left-0.5'}`}></div>
                                     </div>
                                   </div>
                                 </td>
                                 <td className="px-6 py-4 text-right">
                                   <div className="flex items-center justify-end gap-3">
-                                    <button onClick={() => { setShowQaCategoryCreator(false); openEditQAItem(item.id); }} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors">编辑</button>
-                                    <button onClick={() => requestConfirm('确定删除这条问答吗？', () => handleDeleteQAItem(item.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>
+                                    {selectedQABase.isOwner && <button onClick={() => { setShowQaCategoryCreator(false); openEditQAItem(item.id); }} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors">编辑</button>}
+                                    {selectedQABase.isOwner && <button onClick={() => requestConfirm('确定删除这条问答吗？', () => handleDeleteQAItem(item.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>}
                                   </div>
                                 </td>
                               </tr>
@@ -2351,7 +2255,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <tr key={qa.id} className="hover:bg-slate-50/50 transition-colors">
                               <td className="px-6 py-4">
                                 <div className="flex items-center gap-3">
-                                  <span className="text-sm font-bold text-slate-900">{qa.name}</span>
+                                  <span className="text-sm font-bold text-slate-900" title={qa.isOwner ? (qa.isPublic ? '我的公开知识库' : '我的私有知识库') : `来自用户：${qa.ownerName}`}>{qa.name}</span>
+                                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">{qa.isOwner ? (qa.isPublic ? '公开' : '私有') : '公开 · 只读'}</span>
                                 </div>
                               </td>
                               <td className="px-6 py-4">
@@ -2360,10 +2265,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                               <td className="px-6 py-4 text-sm text-slate-500">{qa.date}</td>
                               <td className="px-6 py-4 text-right">
                                 <div className="flex items-center justify-end gap-3">
-                                  <button onClick={() => setSelectedQABase(qa)} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors">管理问答</button>
-                                  <button className="text-slate-400 hover:text-slate-600 font-bold text-xs transition-colors">导入</button>
-                                  <button className="text-slate-400 hover:text-slate-600 font-bold text-xs transition-colors">导出</button>
-                                  <button onClick={() => requestConfirm(`确定删除“${qa.name}”吗？删除后其中的问答也会一并移除。`, () => handleDeleteQABase(qa.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>
+                                  <button onClick={() => setSelectedQABase(qa)} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors">{qa.isOwner ? '管理问答' : '查看'}</button>
+                                  {qa.isOwner && <button onClick={() => void handleSetQABasePublic(qa.id, !qa.isPublic)} className="text-slate-500 hover:text-slate-700 font-bold text-xs transition-colors">{qa.isPublic ? '设为私有' : '设为公开'}</button>}
+                                  {qa.isOwner && <button onClick={() => requestConfirm(`确定删除“${qa.name}”吗？删除后其中的问答也会一并移除。`, () => handleDeleteQABase(qa.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>}
                                 </div>
                               </td>
                             </tr>
@@ -2414,8 +2318,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           <td className="px-6 py-4 text-sm text-slate-500">{base.date}</td>
                           <td className="px-6 py-4 text-right">
                             <div className="flex items-center justify-end gap-3">
-                              <button onClick={() => openEditToneKB(base.id)} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors">编辑</button>
-                              <button onClick={() => requestConfirm(`确定删除“${base.name}”吗？`, () => handleDeleteToneKB(base.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>
+                              {base.isOwner ? <button onClick={() => openEditToneKB(base.id)} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors">编辑</button> : <button onClick={() => openEditToneKB(base.id)} className="text-indigo-500 hover:text-indigo-600 font-bold text-xs transition-colors" title={`来自用户：${base.ownerName}`}>查看</button>}
+                              {base.isOwner && <button onClick={() => void handleSetToneKBPublic(base.id, !base.isPublic)} className="text-slate-500 hover:text-slate-700 font-bold text-xs transition-colors">{base.isPublic ? '设为私有' : '设为公开'}</button>}
+                              {base.isOwner && <button onClick={() => requestConfirm(`确定删除“${base.name}”吗？`, () => handleDeleteToneKB(base.id))} className="text-rose-500 hover:text-rose-600 font-bold text-xs transition-colors">删除</button>}
                             </div>
                           </td>
                         </tr>
@@ -2547,45 +2452,27 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                 <div className="flex items-start justify-between">
                   <div>
                     <h1 className="text-2xl font-bold text-slate-900 tracking-tight">AI 模型配置</h1>
-                    <p className="text-slate-500 mt-1 text-sm">配置 AI 服务商和模型，用于生成客服回复。</p>
+                    <p className="text-slate-500 mt-1 text-sm">从服务端同步机器人可选择的模型，密钥和服务地址不会显示在客户端。</p>
                   </div>
+                  <button onClick={() => void handleSyncAiModels()} disabled={isSyncingAiModels} className="flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50">
+                    <RefreshCw className={cn('h-4 w-4', isSyncingAiModels && 'animate-spin')} />
+                    {isSyncingAiModels ? '获取中...' : '获取模型列表'}
+                  </button>
                 </div>
-                <div className="bg-white p-8 rounded-2xl border border-slate-200 shadow-sm max-w-3xl">
-                  {isLoadingAiConfig ? (
-                    <div className="py-12 text-center text-sm text-slate-500">正在加载配置...</div>
+                <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                  {isLoadingAiModels ? (
+                    <div className="py-12 text-center text-sm text-slate-500">正在加载模型列表...</div>
                   ) : (
-                    <div className="space-y-6">
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                        <label className="space-y-2">
-                          <span className="text-sm font-bold text-slate-700">AI 服务商</span>
-                          <select value={aiConfig.provider} onChange={(event) => updateAiConfig('provider', event.target.value as 'deepseek')} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-slate-50" disabled>
-                            <option value="deepseek">DeepSeek</option>
-                          </select>
-                        </label>
-                        <label className="space-y-2">
-                          <span className="text-sm font-bold text-slate-700">模型</span>
-                          <select value={aiConfig.model} onChange={(event) => updateAiConfig('model', event.target.value as 'deepseek-chat' | 'deepseek-reasoner')} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white">
-                            <option value="deepseek-chat">deepseek-chat</option>
-                            <option value="deepseek-reasoner">deepseek-reasoner</option>
-                          </select>
-                        </label>
-                      </div>
-                      <label className="space-y-2 block">
-                        <span className="text-sm font-bold text-slate-700">API Key</span>
-                        <input type="password" value={aiConfig.api_key} onChange={(event) => updateAiConfig('api_key', event.target.value)} placeholder={aiConfigMaskedKey ? `已配置：${aiConfigMaskedKey}，留空保持不变` : '请输入 DeepSeek API Key'} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" autoComplete="off" />
-                      </label>
-                      <label className="space-y-2 block">
-                        <span className="text-sm font-bold text-slate-700">Base URL</span>
-                        <input value={aiConfig.base_url} onChange={(event) => updateAiConfig('base_url', event.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" />
-                      </label>
-                      {aiConfigNotice && <div className="rounded-xl bg-indigo-50 px-4 py-3 text-sm text-indigo-700">{aiConfigNotice}</div>}
-                      <div className="flex items-center justify-end gap-3 pt-2">
-                        <button onClick={handleTestAiConfig} disabled={isTestingAiConfig || (!aiConfig.api_key && !aiConfigMaskedKey)} className="px-4 py-2.5 rounded-xl border border-slate-200 text-sm font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50">{isTestingAiConfig ? '测试中...' : '测试连接'}</button>
-                        <button onClick={handleSaveAiConfig} disabled={isSavingAiConfig} className="px-5 py-2.5 rounded-xl bg-indigo-600 text-white text-sm font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 disabled:opacity-50">{isSavingAiConfig ? '保存中...' : '保存配置'}</button>
-                      </div>
-                    </div>
+                    <table className="w-full text-left">
+                      <thead><tr className="border-b border-slate-100 bg-slate-50 text-xs text-slate-500"><th className="px-6 py-4">AI 服务商</th><th className="px-6 py-4">模型名称 / ID</th><th className="px-6 py-4">可用状态</th><th className="px-6 py-4">获取时间</th></tr></thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {aiModels.map((item) => <tr key={`${item.provider}:${item.model_id}`}><td className="px-6 py-4 text-sm font-bold text-slate-700">{item.provider}</td><td className="px-6 py-4 text-sm text-slate-700">{item.display_name}</td><td className="px-6 py-4"><span className={cn('rounded-full px-2 py-1 text-xs font-bold', item.available ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500')}>{item.available ? '可用' : '当前不可用'}</span></td><td className="px-6 py-4 text-sm text-slate-500">{new Date(item.fetched_at).toLocaleString('zh-CN')}</td></tr>)}
+                        {aiModels.length === 0 && <tr><td colSpan={4} className="px-6 py-12 text-center text-sm text-slate-400">暂无模型，请点击“获取模型列表”</td></tr>}
+                      </tbody>
+                    </table>
                   )}
                 </div>
+                {aiConfigNotice && <div className="rounded-xl bg-indigo-50 px-4 py-3 text-sm text-indigo-700">{aiConfigNotice}</div>}
               </motion.div>
             ) : (
               <motion.div
@@ -2617,7 +2504,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
 
       {/* Modal Overlay */}
       <AnimatePresence>
-        {isFullReportModalOpen && (
+        {false && isFullReportModalOpen && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -2676,6 +2563,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                       <span>{selectedProductDocument.format}</span>
                       <span>{selectedProductDocument.size}</span>
                       <span>{selectedProductDocument.chunkCount} 个切片</span>
+                      <span>{selectedProductDocument.chunkStrategyVersion === 'structured-v2' ? '结构化切片' : '旧版切片'}</span>
                       <span>更新于 {selectedProductDocument.date}</span>
                       <span className="inline-flex items-center gap-1 font-bold text-emerald-600"><CheckCircle2 className="w-3.5 h-3.5" />{selectedProductDocument.status}</span>
                     </div>
@@ -2695,6 +2583,12 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                     <input value={productDocumentSearch} onChange={(event) => setProductDocumentSearch(event.target.value)} placeholder="搜索处理后的内容" className="w-full rounded-xl border border-slate-200 bg-white pl-9 pr-9 py-2.5 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
                     {productDocumentSearch && <button type="button" onClick={() => setProductDocumentSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"><X className="w-4 h-4" /></button>}
                   </label>
+                  {selectedProductKB?.isOwner && (
+                    <button type="button" onClick={() => void handleReprocessProductDocument()} disabled={isLoadingProductDocumentDetail || isReprocessingProductDocument} className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-indigo-200 bg-white text-sm font-bold text-indigo-600 hover:bg-indigo-50 disabled:opacity-50">
+                      <RefreshCw className={cn("w-4 h-4", isReprocessingProductDocument && "animate-spin")} />
+                      {isReprocessingProductDocument ? '处理中...' : '重新处理'}
+                    </button>
+                  )}
                   <button type="button" onClick={() => void navigator.clipboard.writeText(productDocumentTab === 'content' ? (productDocumentDetail?.content ?? '') : visibleProductDocumentChunks.map((chunk) => chunk.content).join('\n\n'))} disabled={!productDocumentDetail} className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-600 hover:text-indigo-600 disabled:opacity-50"><Copy className="w-4 h-4" />复制</button>
                 </div>
               </div>
@@ -2769,7 +2663,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
               <div className="p-6 space-y-4">
                 <div className="space-y-2">
                   <label className="text-sm font-bold text-slate-700">问答库名称</label>
-                  <input 
+                  <input
                     type="text" 
                     placeholder="例如：官方旗舰店专属问答库" 
                     className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
@@ -2777,6 +2671,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                     onChange={(e) => setNewQABaseForm({ ...newQABaseForm, name: e.target.value })}
                   />
                 </div>
+                <label className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                  <input type="checkbox" checked={newQABaseForm.isPublic} onChange={(event) => setNewQABaseForm({ ...newQABaseForm, isPublic: event.target.checked })} className="h-4 w-4 accent-indigo-600" />
+                  <span className="text-sm font-bold text-slate-700">公开给其他用户查看和绑定</span>
+                </label>
               </div>
               <div className="flex items-center gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100">
                 <button onClick={() => setIsAddQABaseModalOpen(false)} className="flex-1 py-2 lg:py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-sm font-bold hover:bg-slate-50 transition-colors">取消</button>
@@ -2959,6 +2857,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                     className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
                     value={newToneKBForm.name}
                     onChange={(event) => setNewToneKBForm({ ...newToneKBForm, name: event.target.value })}
+                    disabled={Boolean(editingToneKBId && !toneBases.find((base) => base.id === editingToneKBId)?.isOwner)}
                   />
                 </div>
                 <div className="space-y-2 mt-4">
@@ -2968,13 +2867,18 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                     className="w-full h-24 p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500 outline-none transition-all resize-none"
                     value={newToneKBForm.persona}
                     onChange={(event) => setNewToneKBForm({ ...newToneKBForm, persona: event.target.value })}
+                    disabled={Boolean(editingToneKBId && !toneBases.find((base) => base.id === editingToneKBId)?.isOwner)}
                   />
                 </div>
+                {(!editingToneKBId || toneBases.find((base) => base.id === editingToneKBId)?.isOwner) && <label className="mt-4 flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                  <input type="checkbox" checked={newToneKBForm.isPublic} onChange={(event) => setNewToneKBForm({ ...newToneKBForm, isPublic: event.target.checked })} className="h-4 w-4 accent-indigo-600" />
+                  <span className="text-sm font-bold text-slate-700">公开给其他用户查看和绑定</span>
+                </label>}
                 {toneKBNotice && <p className="mt-4 text-sm text-rose-500">{toneKBNotice}</p>}
               </div>
               <div className="flex items-center gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100">
                 <button onClick={() => { setIsAddToneKBModalOpen(false); setEditingToneKBId(null); }} className="flex-1 py-2 lg:py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-sm font-bold hover:bg-slate-50 transition-colors">取消</button>
-                <button onClick={handleSaveToneKB} disabled={isSavingToneKB || !newToneKBForm.name.trim() || !newToneKBForm.persona.trim()} className="flex-1 py-2 lg:py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">{isSavingToneKB ? '保存中...' : '保存'}</button>
+                {(!editingToneKBId || toneBases.find((base) => base.id === editingToneKBId)?.isOwner) && <button onClick={handleSaveToneKB} disabled={isSavingToneKB || !newToneKBForm.name.trim() || !newToneKBForm.persona.trim()} className="flex-1 py-2 lg:py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">{isSavingToneKB ? '保存中...' : '保存'}</button>}
               </div>
             </motion.div>
           </motion.div>
@@ -3010,6 +2914,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                     onChange={(e) => setNewProductKBForm({ ...newProductKBForm, name: e.target.value })}
                   />
                 </div>
+                <label className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                  <input type="checkbox" checked={newProductKBForm.isPublic} onChange={(event) => setNewProductKBForm({ ...newProductKBForm, isPublic: event.target.checked })} className="h-4 w-4 accent-indigo-600" />
+                  <span className="text-sm font-bold text-slate-700">公开给其他用户查看和绑定</span>
+                </label>
                 {productKBNotice && <p className="text-sm text-rose-500">{productKBNotice}</p>}
               </div>
               <div className="flex items-center gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100">

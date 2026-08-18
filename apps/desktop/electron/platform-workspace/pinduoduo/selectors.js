@@ -100,6 +100,6 @@ export const PDD_SELECTORS = Object.freeze({
   ],
 });
 
-export function serializedSelectorArgument() {
-  return `--pdd-adapter-config=${encodeURIComponent(JSON.stringify(PDD_SELECTORS))}`;
+export function serializedSelectorArgument(rules = null) {
+  return `--pdd-adapter-config=${encodeURIComponent(JSON.stringify({ selectors: PDD_SELECTORS, rules }))}`;
 }

@@ -7,6 +7,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session, aliased
 
 from app.models import (
+    AiModelCatalog,
     AiModelCall,
     AiProviderConfig,
     AutomationReplyRun,
@@ -26,6 +27,7 @@ from app.schemas.monitoring import (
     MonitoringLogList,
     MonitoringOverview,
 )
+from app.services.ai_model_catalog_service import DEFAULT_AI_MODEL, SUPPORTED_AI_MODEL_SET
 
 
 def _today_start() -> datetime:
@@ -34,19 +36,17 @@ def _today_start() -> datetime:
 
 
 def _available_models(db: Session, user: User) -> tuple[list[str], str]:
-    values: set[str] = set(
-        db.scalars(select(AiModelCall.model).where(AiModelCall.user_id == user.id)).all()
-    )
+    values = set(db.scalars(select(AiModelCatalog.model_id).where(
+        AiModelCatalog.available.is_(True),
+        AiModelCatalog.model_id.in_(SUPPORTED_AI_MODEL_SET),
+    )).all())
     config = db.scalar(select(AiProviderConfig).where(AiProviderConfig.user_id == user.id))
     preferred = ""
-    if config and config.model:
+    if config and config.model in values:
         values.add(config.model)
         preferred = config.model
-    for robot_config in db.scalars(select(Robot.config_json).where(Robot.user_id == user.id)).all():
-        if isinstance(robot_config, dict) and robot_config.get("model"):
-            values.add(str(robot_config["model"]))
     if not values:
-        values.add("deepseek-chat")
+        values.add(DEFAULT_AI_MODEL)
     models = sorted(values, key=lambda value: (value != preferred, value))
     return models, preferred or models[0]
 

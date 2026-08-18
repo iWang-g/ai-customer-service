@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,11 +39,30 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     heartbeat_timeout_seconds: int = Field(default=120, alias="HEARTBEAT_TIMEOUT_SECONDS")
     ai_reply_base_url: str = Field(default="http://127.0.0.1:8020", alias="AI_REPLY_BASE_URL")
+    ai_provider: str = Field(default="deepseek", alias="AI_PROVIDER")
+    ai_provider_base_url: str = Field(default="https://api.deepseek.com", alias="AI_PROVIDER_BASE_URL")
+    ai_provider_api_key: str = Field(default="", alias="AI_PROVIDER_API_KEY")
     knowledge_base_url: str = Field(default="http://127.0.0.1:8010", alias="KNOWLEDGE_BASE_URL")
     pdd_message_snapshot_write_enabled: bool = Field(
         default=False,
         alias="PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED",
     )
+    pdd_collector_rules_json: str = Field(default="", alias="PDD_COLLECTOR_RULES_JSON")
+
+    @model_validator(mode="after")
+    def validate_production_settings(self) -> "Settings":
+        if self.environment.casefold() != "production":
+            return self
+        if self.jwt_secret_key in {
+            "development-only-secret-change-in-production",
+            "replace-with-a-random-secret-of-at-least-32-bytes",
+        } or len(self.jwt_secret_key) < 32:
+            raise ValueError("JWT_SECRET_KEY must be a non-default value of at least 32 characters")
+        if self.default_admin_password == "admin123" or len(self.default_admin_password) < 12:
+            raise ValueError("DEFAULT_ADMIN_PASSWORD must be changed and contain at least 12 characters")
+        if self.seed_demo_data:
+            raise ValueError("SEED_DEMO_DATA must be false in production")
+        return self
 
     @property
     def cors_origins(self) -> list[str]:

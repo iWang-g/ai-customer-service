@@ -54,7 +54,7 @@ class SendMessageResponse(BaseModel):
     message: MessageRead
     task_id: str
     task_status: Literal[
-        "queued", "dispatched", "acknowledged", "completed", "failed", "confirmation_pending"
+        "waiting_timeout", "queued", "dispatched", "acknowledged", "completed", "failed", "confirmation_pending"
     ]
 
 
@@ -62,8 +62,10 @@ class RecordSentMessageRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     content: str = Field(min_length=1)
     platform_message_id: str | None = Field(default=None, max_length=128)
+    client_message_id: str | None = Field(default=None, max_length=128)
     platform_code: str | None = None
     sender_name: str | None = None
+    media_type: Literal["text", "image"] = "text"
 
 
 class RecordSentMessageResponse(BaseModel):

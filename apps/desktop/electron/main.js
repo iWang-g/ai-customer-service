@@ -1,10 +1,11 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, session, shell } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PddAccountRegistry } from './platform-workspace/account-registry.js';
 import { PddWorkspaceManager } from './platform-workspace/workspace-manager.js';
 import { PddDiagnosticLogger } from './platform-workspace/pinduoduo/diagnostic-logger.js';
 import { RpaProcessManager } from './rpa/process-manager.js';
+import { loadRuntimeConfig, rendererRuntimeArguments, serviceProxyBypassRules } from './runtime-config.js';
 import { WechatAccountRegistry } from './wechat/account-registry.js';
 import { WechatProcessManager } from './wechat/process-manager.js';
 
@@ -26,6 +27,17 @@ const pendingHumanRequiredNotifications = new Map();
 const shownHumanRequiredNotificationKeys = new Set();
 const activeHumanRequiredNotifications = new Set();
 let humanRequiredNotificationTimer = null;
+let runtimeConfig = null;
+
+function rendererWebPreferences() {
+  return {
+    preload: preloadPath,
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: true,
+    additionalArguments: runtimeConfig ? rendererRuntimeArguments(runtimeConfig) : [],
+  };
+}
 
 function focusMessageCenter(conversationId = null) {
   if (!mainWindow || mainWindow.isDestroyed()) createWindow();
@@ -204,7 +216,7 @@ function registerIpcHandlers() {
     if (!isValidUserId(payload?.userId) || !isValidAccessToken(payload?.accessToken)) {
       throw new Error('RPA 启动参数无效');
     }
-    await pddWorkspaceManager.bindUser(payload.userId);
+    await pddWorkspaceManager.bindUser(payload.userId, payload.accessToken);
     await rpaProcessManager.start({ userId: payload.userId, accessToken: payload.accessToken });
     rpaProcessManager.setPlatformAccounts('pinduoduo', [
       ...pddAccountRegistry.list(payload.userId),
@@ -387,6 +399,22 @@ function registerIpcHandlers() {
       imageUrl: payload.imageUrl,
     });
   });
+  ipcMain.handle('pdd-workspace:send-image-data', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (payload.externalConversationId !== null && payload.externalConversationId !== undefined
+      && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
+      throw new Error('目标会话参数无效');
+    }
+    if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
+      throw new Error('客户名称参数无效');
+    }
+    if (typeof payload?.imageDataUrl !== 'string' || payload.imageDataUrl.length > 14 * 1024 * 1024) {
+      throw new Error('图片内容无效或超过 10 MB');
+    }
+    return pddWorkspaceManager.sendImageData(payload);
+  });
 }
 
 function createWindow() {
@@ -397,12 +425,7 @@ function createWindow() {
     minHeight: 700,
     backgroundColor: '#f8fafc',
     autoHideMenuBar: true,
-    webPreferences: {
-      preload: preloadPath,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
+    webPreferences: rendererWebPreferences(),
   });
 
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -422,8 +445,25 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (process.platform === 'win32') app.setAppUserModelId('com.omniai.customer-service');
+  try {
+    runtimeConfig = loadRuntimeConfig({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+    });
+  } catch (error) {
+    dialog.showErrorBox(
+      '客户端配置错误',
+      error instanceof Error ? error.message : String(error),
+    );
+    app.quit();
+    return;
+  }
+  await session.defaultSession.setProxy({
+    mode: 'system',
+    proxyBypassRules: serviceProxyBypassRules(runtimeConfig),
+  });
   pddAccountRegistry = new PddAccountRegistry(app.getPath('userData'));
   wechatProcessManager = new WechatProcessManager({
     registry: new WechatAccountRegistry(app.getPath('userData')),
@@ -437,14 +477,22 @@ app.whenReady().then(() => {
     details: { packaged: app.isPackaged },
     observed_at: new Date().toISOString(),
   });
-  const agentPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'rpa', 'agent.py')
+  const rpaExecutablePath = app.isPackaged
+    ? path.join(process.resourcesPath, 'rpa', 'rpa-agent.exe')
+    : process.env.RPA_PYTHON_PATH || 'python';
+  const rpaAgentPath = app.isPackaged
+    ? rpaExecutablePath
     : path.join(currentDirectory, '..', '..', '..', 'agents', 'rpa', 'agent.py');
+  const rpaExecutableArgs = app.isPackaged
+    ? []
+    : ['-u', rpaAgentPath];
   rpaProcessManager = new RpaProcessManager({
     userDataPath: app.getPath('userData'),
-    agentPath,
-    apiBaseUrl: process.env.BUSINESS_API_URL || 'http://127.0.0.1:8001/api/v1',
-    pythonExecutable: process.env.RPA_PYTHON_PATH || 'python',
+    executablePath: rpaExecutablePath,
+    executableArgs: rpaExecutableArgs,
+    requiredFilePath: rpaAgentPath,
+    apiBaseUrl: runtimeConfig.businessApiUrl,
+    appVersion: app.getVersion(),
   });
   rpaProcessManager.on('bindings', (bindings) => {
     for (const binding of bindings) {
@@ -464,6 +512,10 @@ app.whenReady().then(() => {
     pddPreloadPath,
     rpaManager: rpaProcessManager,
     diagnosticLogger: pddDiagnosticLogger,
+    knowledgeBaseUrl: runtimeConfig.knowledgeBaseUrl,
+    businessApiUrl: runtimeConfig.businessApiUrl,
+    collectorRulesCachePath: path.join(app.getPath('userData'), 'collector-rules', 'pinduoduo.json'),
+    rendererAdditionalArguments: rendererRuntimeArguments(runtimeConfig),
   });
   registerIpcHandlers();
   createWindow();

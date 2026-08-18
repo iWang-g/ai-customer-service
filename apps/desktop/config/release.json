@@ -1,0 +1,5 @@
+{
+  "businessApiUrl": "http://43.139.142.142/api/v1",
+  "knowledgeBaseUrl": "http://43.139.142.142/kb-api/api/v1",
+  "websocketUrl": "ws://43.139.142.142"
+}

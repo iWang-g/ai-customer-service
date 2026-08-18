@@ -5,6 +5,8 @@ dist/
 apps/*/dist/
 release/
 apps/*/release/
+apps/*/release-windows/
+apps/*/release-stage*/
 coverage/
 *.log
 logs/*
@@ -13,10 +15,14 @@ logs/*
 !.env.example
 .venv/
 __pycache__/
+.pytest_cache/
+pytest-cache-files-*/
 *.egg-info/
 services/*/data/
 services/*/.deps/
 services/*/.tmp/
+agents/rpa/dist/
+services/release-server-*.tar.gz
 *.pyc
 *.db
 ~$*

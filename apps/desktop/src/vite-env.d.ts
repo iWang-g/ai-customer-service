@@ -69,6 +69,11 @@ interface WechatAccount {
 }
 
 interface Window {
+  desktopConfig?: {
+    businessApiUrl: string;
+    knowledgeBaseUrl: string;
+    websocketUrl: string;
+  };
   desktopBridge?: {
     notifyHumanRequired(payload: {
       items: Array<{
@@ -142,6 +147,12 @@ interface Window {
       externalConversationId: string | null;
       customerName: string;
       imageUrl: string;
+    }): Promise<{ status: 'sent'; conversation_key: string; customer_name: string | null }>;
+    sendPddImageData(payload: {
+      platformAccountId: string;
+      externalConversationId: string | null;
+      customerName: string;
+      imageDataUrl: string;
     }): Promise<{ status: 'sent'; conversation_key: string; customer_name: string | null }>;
   };
   pddWorkspace: {

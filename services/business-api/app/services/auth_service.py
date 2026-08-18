@@ -37,14 +37,14 @@ def _issue_token_pair(user: User, settings: Settings) -> TokenPairResponse:
         subject=user.id,
         token_type="access",
         expires_delta=timedelta(minutes=settings.access_token_expire_minutes),
-        extra_claims={"username": user.username, "role": user.role},
+        extra_claims={"username": user.username, "display_name": user.display_name, "role": user.role},
     )
     refresh_token = create_token(
         settings.jwt_secret_key,
         subject=user.id,
         token_type="refresh",
         expires_delta=timedelta(days=settings.refresh_token_expire_days),
-        extra_claims={"username": user.username, "role": user.role},
+        extra_claims={"username": user.username, "display_name": user.display_name, "role": user.role},
     )
     return TokenPairResponse(
         access_token=access_token,

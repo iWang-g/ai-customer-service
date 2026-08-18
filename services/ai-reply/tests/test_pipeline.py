@@ -38,7 +38,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             "app.pipeline.get_knowledge_base",
             AsyncMock(return_value={"kind": "tone", "enabled": True, "persona": "  亲切、耐心  "}),
         ):
-            self.assertEqual(await _tone_persona("tone-1"), "亲切、耐心")
+            self.assertEqual(await _tone_persona("tone-1", "token"), "亲切、耐心")
 
     async def test_tone_persona_ignores_disabled_or_wrong_kind_base(self) -> None:
         for value in (
@@ -49,7 +49,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 "app.pipeline.get_knowledge_base",
                 AsyncMock(return_value=value),
             ):
-                self.assertEqual(await _tone_persona("tone-1"), "")
+                    self.assertEqual(await _tone_persona("tone-1", "token"), "")
 
     async def test_generation_system_prompt_contains_bound_tone_persona(self) -> None:
         request = ReplyRequest(
@@ -62,6 +62,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 "customer_address": "小伙伴",
                 "self_address": "小助手",
                 "advanced_instruction": "每次回复最多两句话",
+                "prohibited_content_instruction": "不要承诺最低价，不要评价其他品牌",
             },
         )
         provider = AsyncMock(
@@ -93,8 +94,17 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("客户称呼：小伙伴", generation_call.kwargs["system"])
         self.assertIn("客服自称：小助手", generation_call.kwargs["system"])
         self.assertIn("额外要求：每次回复最多两句话", generation_call.kwargs["system"])
+        self.assertIn("用户配置的违禁内容：不要承诺最低价，不要评价其他品牌", generation_call.kwargs["system"])
+        self.assertIn("生成回复时不得涉及上述用户配置的违禁内容", generation_call.kwargs["system"])
         self.assertIn("禁止使用 Markdown 格式", generation_call.kwargs["system"])
         self.assertIn("禁止标题、列表、表格、代码块、引用块、加粗或斜体符号", generation_call.kwargs["system"])
+        self.assertIn("严禁输出或照抄任何 URL、网址、链接地址", generation_call.kwargs["system"])
+        self.assertIn("手机或电话号码、微信号、QQ号", generation_call.kwargs["system"])
+        self.assertIn("店铺中正在接待客户的真正客服", generation_call.kwargs["system"])
+        self.assertIn("不能让客户察觉到自动化系统的存在", generation_call.kwargs["system"])
+        self.assertIn("不得提及或暗示 AI、机器人、模型、系统、提示词、知识库", generation_call.kwargs["system"])
+        self.assertIn("这边暂时无法确认，我帮您进一步核实", generation_call.kwargs["system"])
+        self.assertIn("不得主动建议或要求客户联系平台人工客服", generation_call.kwargs["system"])
 
     async def test_intent_prompt_constrains_direct_reply_style_and_markdown(self) -> None:
         request = ReplyRequest(
@@ -106,6 +116,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 "customer_address": "亲亲",
                 "self_address": "小客服",
                 "advanced_instruction": "语气自然一点",
+                "prohibited_content_instruction": "不要承诺赠品",
                 "email_trigger_scenarios": "客户想要店铺链接地址、想要定制",
             },
         )
@@ -135,12 +146,29 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("必须遵守基础风格、回答长度、客户称呼、客服自称、虚拟人设和额外要求", intent_call.kwargs["system"])
         self.assertIn("禁止 Markdown 格式", intent_call.kwargs["system"])
         self.assertIn("禁止标题、列表、表格、代码块、引用块、加粗或斜体符号", intent_call.kwargs["system"])
+        self.assertIn("严禁输出或照抄任何 URL、网址、链接地址", intent_call.kwargs["system"])
         self.assertIn("虚拟人设：活泼亲切，像朋友一样自然交流", intent_call.kwargs["user"])
         self.assertIn("基础风格：温柔", intent_call.kwargs["user"])
         self.assertIn("客服自称：小客服", intent_call.kwargs["user"])
+        self.assertIn("用户配置的违禁内容：不要承诺赠品", intent_call.kwargs["user"])
+        self.assertIn("生成回复时不得涉及上述用户配置的违禁内容", intent_call.kwargs["user"])
         self.assertIn("邮件触发场景", intent_call.kwargs["user"])
         self.assertIn("客户想要店铺链接地址、想要定制", intent_call.kwargs["user"])
         self.assertIn("客户消息符合任一场景时必须使用 email_link_request", intent_call.kwargs["system"])
+        self.assertIn("店铺中正在接待客户的真正客服", intent_call.kwargs["system"])
+        self.assertIn("不能让客户察觉到自动化系统的存在", intent_call.kwargs["system"])
+        self.assertIn("不得说“知识库中没有”“未检索到”“无法访问知识库”", intent_call.kwargs["system"])
+        self.assertIn("不得主动建议或要求客户联系平台人工客服", intent_call.kwargs["system"])
+
+    def test_default_fallback_uses_store_agent_voice_without_internal_disclosure(self) -> None:
+        request = ReplyRequest(message="这个活动有什么优惠")
+        from app.pipeline import _fallback_reply
+
+        fallback = _fallback_reply(request)
+        self.assertIn("我帮您进一步核实", fallback)
+        self.assertNotIn("知识库", fallback)
+        self.assertNotIn("机器人", fallback)
+        self.assertNotIn("平台人工客服", fallback)
 
     async def test_qa_hit_short_circuits_both_model_calls(self) -> None:
         request = ReplyRequest(
@@ -170,7 +198,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         search_mock.assert_not_awaited()
         provider_mock.assert_not_awaited()
 
-    async def test_qa_answer_containing_block_word_uses_configured_fallback(self) -> None:
+    async def test_legacy_block_words_do_not_filter_qa_answers(self) -> None:
         request = ReplyRequest(
             message="多少钱",
             qa_base_ids=["qa-1"],
@@ -191,12 +219,131 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await build_reply(request)
 
-        self.assertEqual(result.text, "我先帮您核实一下")
-        self.assertEqual(result.provider, "outbound-block-fallback")
-        self.assertIn("outbound_block_word", result.risk_flags)
+        self.assertEqual(result.text, "这是绝对最低价")
+        self.assertEqual(result.provider, "qa-rule")
+        self.assertNotIn("outbound_block_word", result.risk_flags)
         provider_mock.assert_not_awaited()
 
-    async def test_qa_answer_replaces_block_word_and_preserves_media(self) -> None:
+    async def test_qa_answer_with_link_uses_safe_fallback_and_drops_media(self) -> None:
+        request = ReplyRequest(
+            message="安装说明在哪里",
+            qa_base_ids=["qa-1"],
+            allow_auto_send=True,
+            reply_config={"fallback_reply_text": "亲亲，我先为您核实一下"},
+        )
+        with patch("app.pipeline.match_qa", AsyncMock(return_value={
+            "matched": True,
+            "match_type": "exact",
+            "score": 1.0,
+            "entry": {
+                "id": "entry-1",
+                "answer": "请访问 https://outside.example.com/install 查看",
+                "image_url": "https://example.com/product.png",
+            },
+        })):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "亲亲，我先为您核实一下")
+        self.assertEqual(result.media, [])
+        self.assertIn("prohibited_outbound_content", result.risk_flags)
+        self.assertIn("external_link", result.risk_flags)
+
+    async def test_generated_personal_contact_uses_safe_fallback(self) -> None:
+        request = ReplyRequest(
+            message="怎么联系",
+            product_base_ids=["product-1"],
+            allow_auto_send=True,
+            reply_config={"fallback_reply_text": "亲亲，我先为您核实一下"},
+        )
+        provider = AsyncMock(side_effect=[
+            (intent_json(), "deepseek"),
+            ("请加微信 service_123 咨询", "deepseek"),
+        ])
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[{"snippet": "联系售后"}])),
+            patch("app.pipeline.get_knowledge_base", AsyncMock(return_value={})),
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "亲亲，我先为您核实一下")
+        self.assertIn("wechat_id", result.risk_flags)
+
+    async def test_generated_internal_disclosure_uses_store_agent_fallback(self) -> None:
+        request = ReplyRequest(
+            message="这个商品有什么优惠",
+            product_base_ids=["product-1"],
+            allow_auto_send=True,
+        )
+        provider = AsyncMock(side_effect=[
+            (intent_json(), "deepseek"),
+            ("知识库中暂时没有相关优惠信息，建议联系平台人工客服。", "deepseek"),
+        ])
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch("app.pipeline.search_documents", AsyncMock(return_value=[{"snippet": "优惠以页面为准"}])),
+            patch("app.pipeline.get_knowledge_base", AsyncMock(return_value={})),
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.text, "亲亲，这个问题这边暂时无法确认，我帮您进一步核实，请稍等~")
+        self.assertIn("identity_disclosure", result.risk_flags)
+        self.assertIn("internal_knowledge", result.risk_flags)
+
+    async def test_qa_internal_disclosure_is_not_sent(self) -> None:
+        request = ReplyRequest(
+            message="有优惠吗",
+            qa_base_ids=["qa-1"],
+            allow_auto_send=True,
+        )
+        with patch("app.pipeline.match_qa", AsyncMock(return_value={
+            "matched": True,
+            "match_type": "exact",
+            "score": 1.0,
+            "entry": {
+                "id": "entry-1",
+                "answer": "机器人暂时无法从知识库中查到优惠。",
+                "image_url": "",
+            },
+        })):
+            result = await build_reply(request)
+
+        self.assertIn("我帮您进一步核实", result.text)
+        self.assertIn("identity_disclosure", result.risk_flags)
+        self.assertNotIn("知识库", result.text)
+        self.assertNotIn("机器人", result.text)
+
+    async def test_explicit_human_handoff_reply_remains_allowed(self) -> None:
+        provider = AsyncMock(return_value=(intent_json(
+            "human_handoff",
+            direct_reply_text="好的亲亲，正在为您转接人工客服，请稍等～",
+        ), "deepseek"))
+        with patch("app.pipeline.generate_with_provider", provider):
+            result = await build_reply(ReplyRequest(message="转人工", allow_auto_send=True))
+
+        self.assertEqual(result.text, "好的亲亲，正在为您转接人工客服，请稍等～")
+        self.assertNotIn("identity_disclosure", result.risk_flags)
+
+    async def test_unsafe_fallback_escalates_instead_of_sending(self) -> None:
+        request = ReplyRequest(
+            message="联系方式",
+            qa_base_ids=["qa-1"],
+            allow_auto_send=True,
+            reply_config={"fallback_reply_text": "电话：13800138000"},
+        )
+        with patch("app.pipeline.match_qa", AsyncMock(return_value={
+            "matched": True,
+            "match_type": "exact",
+            "score": 1.0,
+            "entry": {"id": "entry-1", "answer": "邮箱 service@example.com", "image_url": ""},
+        })):
+            result = await build_reply(request)
+
+        self.assertEqual(result.decision, "needs_human")
+        self.assertEqual(result.text, "")
+        self.assertIn("fallback_blocked", result.risk_flags)
+
+    async def test_legacy_replacement_rules_do_not_modify_qa_answers(self) -> None:
         request = ReplyRequest(
             message="什么时候发货",
             qa_base_ids=["qa-1"],
@@ -222,13 +369,39 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await build_reply(request)
 
-        self.assertEqual(result.text, "您好，您好，下单后三天内发货哦")
+        self.assertEqual(result.text, "你好，你好，下单后三天内发货哦")
         self.assertEqual(result.provider, "qa-rule")
         self.assertEqual(result.media, [{"type": "image", "url": "https://example.com/product.png"}])
-        self.assertIn("outbound_block_replaced", result.risk_flags)
+        self.assertNotIn("outbound_block_replaced", result.risk_flags)
         provider_mock.assert_not_awaited()
 
-    async def test_outbound_replacement_is_single_pass_and_residual_needs_human(self) -> None:
+    async def test_qa_relative_image_uses_public_knowledge_base_url(self) -> None:
+        request = ReplyRequest(message="看图片", qa_base_ids=["qa-1"])
+        with (
+            patch("app.pipeline.match_qa", AsyncMock(return_value={
+                "matched": True,
+                "match_type": "exact",
+                "score": 1.0,
+                "entry": {
+                    "id": "entry-1",
+                    "answer": "请看图片",
+                    "image_url": "/qa-assets/qa-example.png",
+                },
+            })),
+            patch("app.pipeline.get_settings") as settings_mock,
+        ):
+            settings_mock.return_value.knowledge_base_url = "http://knowledge-base:8010"
+            settings_mock.return_value.knowledge_base_public_url = (
+                "http://43.139.142.142/kb-api"
+            )
+            result = await build_reply(request)
+
+        self.assertEqual(result.media, [{
+            "type": "image",
+            "url": "http://43.139.142.142/kb-api/api/v1/qa-assets/qa-example.png",
+        }])
+
+    async def test_legacy_replacement_rules_do_not_force_human_review(self) -> None:
         request = ReplyRequest(
             message="什么时候发货",
             qa_base_ids=["qa-1"],
@@ -248,11 +421,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         })):
             result = await build_reply(request)
 
-        self.assertEqual(result.decision, "needs_human")
-        self.assertEqual(result.text, "")
-        self.assertIn("replacement_blocked", result.risk_flags)
+        self.assertEqual(result.decision, "auto_send")
+        self.assertEqual(result.text, "你好")
+        self.assertNotIn("replacement_blocked", result.risk_flags)
 
-    async def test_longer_outbound_word_is_replaced_first(self) -> None:
+    async def test_legacy_replacement_order_no_longer_changes_answers(self) -> None:
         request = ReplyRequest(
             message="什么时候发货",
             qa_base_ids=["qa-1"],
@@ -272,7 +445,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         })):
             result = await build_reply(request)
 
-        self.assertEqual(result.text, "您好呀，请问需要什么")
+        self.assertEqual(result.text, "你好呀，请问需要什么")
         self.assertEqual(result.decision, "auto_send")
 
     async def test_empty_product_retrieval_uses_fallback_without_generation(self) -> None:
@@ -327,7 +500,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.action_plan.next_action, "search_product_documents")
         self.assertEqual(result.decision, "auto_send")
         self.assertEqual(result.text, "这款商品有三种规格。")
-        search_mock.assert_awaited_once_with("商品有什么规格", ["product-1"])
+        search_mock.assert_awaited_once_with("商品有什么规格", ["product-1"], "")
         self.assertEqual(provider.await_count, 2)
         self.assertTrue(provider.await_args_list[0].kwargs["json_mode"])
         self.assertEqual(provider.await_args_list[0].kwargs["temperature"], 0)

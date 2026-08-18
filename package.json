@@ -14,6 +14,8 @@
     "smoke:phase-b": "python scripts/smoke_phase_b.py",
     "smoke:phase-c": "python scripts/smoke_phase_c.py",
     "start": "pnpm --dir apps/desktop start",
-    "dist": "pnpm --dir apps/desktop dist"
+    "dist": "pnpm --dir apps/desktop dist",
+    "validate:release": "pnpm --dir apps/desktop validate:release",
+    "build:rpa": "pnpm --dir apps/desktop build:rpa"
   }
 }

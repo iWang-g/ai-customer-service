@@ -11,6 +11,7 @@ import {
   ChevronDown,
   X,
   Trash2,
+  AlertTriangle,
 } from 'lucide-react';
 import type { Conversation, Shop } from '../types';
 import CustomerAvatar from './CustomerAvatar';
@@ -31,7 +32,8 @@ interface SidebarProps {
   onSearchTermChange: (value: string) => void;
   onOpenImportModal: () => void;
   onClearHumanRequired: (conversationId: string) => Promise<void>;
-  onResetConversationTestData: (conversationId: string) => Promise<void>;
+  onClearConversationHistory: (conversationId: string) => Promise<void>;
+  onDeleteConversation: (conversationId: string) => Promise<void>;
   lang: 'zh' | 'en';
 }
 
@@ -50,13 +52,15 @@ export default function Sidebar({
   onSearchTermChange,
   onOpenImportModal,
   onClearHumanRequired,
-  onResetConversationTestData,
+  onClearConversationHistory,
+  onDeleteConversation,
   lang
 }: SidebarProps) {
   const [isShopDropdownOpen, setIsShopDropdownOpen] = useState(false);
   const [shopFilterText, setShopFilterText] = useState('');
   const [contextMenu, setContextMenu] = useState<{ conversationId: string; x: number; y: number } | null>(null);
   const [resetConversation, setResetConversation] = useState<Conversation | null>(null);
+  const [conversationAction, setConversationAction] = useState<'clear' | 'delete'>('clear');
 
   const filteredShops = shops.filter(s =>
     s.name.toLowerCase().includes(shopFilterText.toLowerCase())
@@ -72,21 +76,21 @@ export default function Sidebar({
   const t = {
     zh: {
       title: '消息中心',
-      emptyTitle: '请导入对应窗口',
-      emptySub: '点击下方或右上角加号，导入并开始接管桌面端客服会话消息',
+      emptyTitle: '请导入最近会话消息',
+      emptySub: '点击下方或右上角加号，从已登录的拼多多店铺读取最近会话消息',
       searchPlaceholder: '搜索回复、用户...',
       allMsg: '全部消息',
-      pendingMsg: '待处理',
+      pendingMsg: '待回复',
       searchEmptyTitle: '未找到匹配的会话',
       searchEmptySub: '请尝试搜索其他客户、消息、门店或平台',
     },
     en: {
       title: 'Messages',
-      emptyTitle: 'Please Import Windows',
-      emptySub: 'Click below or top-right plus icon to import active desktop customer service sessions',
+      emptyTitle: 'Import Recent Messages',
+      emptySub: 'Click below or the top-right plus icon to read recent messages from a logged-in Pinduoduo shop',
       searchPlaceholder: 'Search replies, users...',
       allMsg: 'All Messages',
-      pendingMsg: 'Pending',
+      pendingMsg: 'Awaiting Reply',
       searchEmptyTitle: 'No matching conversations',
       searchEmptySub: 'Try another customer, message, shop, or platform',
     }
@@ -206,7 +210,7 @@ export default function Sidebar({
 
       {/* Conversation List */}
       <div className="flex-1 overflow-y-auto px-2 space-y-1 pt-2" id="conversation-list">
-        {isLoading ? (
+        {isLoading && conversations.length === 0 ? (
           <div className="py-16 text-center text-xs font-semibold text-slate-400">正在从服务端加载会话...</div>
         ) : error && conversations.length === 0 ? (
           <div className="m-3 p-4 rounded-xl bg-rose-50 border border-rose-100 text-xs font-semibold text-rose-600 leading-relaxed">{error}</div>
@@ -251,8 +255,21 @@ export default function Sidebar({
                 </span>
               )}
             </div>
+            {conv.syncIssue?.requiresAttention && (
+              <span
+                className="mt-2 shrink-0 text-amber-500"
+                title="消息序列同步异常"
+                aria-label="消息序列同步异常"
+              >
+                <AlertTriangle size={15} />
+              </span>
+            )}
             {conv.awaitingReply && (
-              <div className="w-2 h-2 rounded-full bg-brand-active mt-3 flex-shrink-0 shadow-[0_0_8px_rgba(14,165,233,0.5)]" />
+              <div
+                className="w-2 h-2 rounded-full bg-brand-active mt-3 flex-shrink-0 shadow-[0_0_8px_rgba(14,165,233,0.5)]"
+                title={lang === 'zh' ? '客户消息待回复' : 'Customer message awaiting reply'}
+                aria-label={lang === 'zh' ? '客户消息待回复' : 'Customer message awaiting reply'}
+              />
             )}
           </motion.button>
         )) : searchTerm.trim() ? (
@@ -310,6 +327,7 @@ export default function Sidebar({
                     (item) => item.id === contextMenu.conversationId,
                   ) || null;
                   setContextMenu(null);
+                  setConversationAction('clear');
                   setResetConversation(conversation);
                 }}
                 className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-bold text-rose-600 hover:bg-rose-50"
@@ -318,13 +336,29 @@ export default function Sidebar({
                 清空聊天记录…
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                const conversation = conversations.find(
+                  (item) => item.id === contextMenu.conversationId,
+                ) || null;
+                setContextMenu(null);
+                setConversationAction('delete');
+                setResetConversation(conversation);
+              }}
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-bold text-rose-700 hover:bg-rose-50"
+            >
+              <Trash2 size={14} />
+              删除会话…
+            </button>
           </div>
         </>
       )}
       <ConversationResetModal
         conversation={resetConversation}
+        mode={conversationAction}
         onClose={() => setResetConversation(null)}
-        onConfirm={onResetConversationTestData}
+        onConfirm={conversationAction === 'delete' ? onDeleteConversation : onClearConversationHistory}
       />
     </div>
   );

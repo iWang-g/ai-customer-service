@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+from app.models import Message
+
 from app.services.message_sequence_service import (
     align_message_sequences,
     longest_tail_overlap,
@@ -42,6 +44,32 @@ def image(
 
 
 class MessageSequenceServiceTests(unittest.TestCase):
+    def test_structured_message_fingerprint_reads_orm_raw_payload(self) -> None:
+        structured_payload = {
+            "title": "食品级保温杯",
+            "price": "29.90",
+            "image_url": "https://img.invalid/product.png",
+        }
+        stored = Message(
+            conversation_id="conversation",
+            user_id="user",
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="食品级保温杯",
+            raw_payload={
+                "message_type": "product",
+                "structured_payload": structured_payload,
+            },
+        )
+        snapshot = {
+            "sender_role": "customer",
+            "message_type": "product",
+            "content": "食品级保温杯",
+            "structured_payload": structured_payload,
+        }
+
+        self.assertEqual(message_fingerprint(stored), message_fingerprint(snapshot))
+
     def test_normalization_is_minimal_and_direction_is_part_of_fingerprint(self) -> None:
         self.assertEqual(normalize_text("  你好\n  世界  "), "你好 世界")
         self.assertNotEqual(

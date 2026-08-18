@@ -110,10 +110,13 @@ def _snapshot_metrics(messages: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "message_count": len(messages),
         "direction_counts": {
-            key: direction_counts[key] for key in ("customer", "agent")
+            key: direction_counts[key] for key in ("customer", "agent", "platform")
+            if direction_counts[key] > 0 or key in {"customer", "agent"}
         },
         "type_counts": {
-            key: type_counts[key] for key in ("text", "image", "product", "order")
+            key: type_counts[key] for key in (
+                "text", "image", "product", "order", "system", "context", "time", "unknown"
+            )
         },
         "sequence_hash": _sequence_evidence_hash(messages),
         "platform_id_missing_count": len(messages) - len(platform_ids),
@@ -148,11 +151,86 @@ def _assemble_batches(observation: MessageObservation) -> list[dict[str, Any]] |
     return assembled
 
 
+def snapshot_messages_from_observation(
+    observation: MessageObservation,
+) -> list[dict[str, Any]]:
+    messages = _assemble_batches(observation)
+    if messages is None:
+        raise SnapshotProtocolError("snapshot is incomplete")
+    return messages
+
+
+def build_snapshot_messages(
+    user: User,
+    conversation: Conversation,
+    observation: MessageObservation,
+    messages: list[dict[str, Any]],
+    *,
+    collection_kind: str,
+) -> list[Message]:
+    return [
+        _snapshot_message(
+            user,
+            conversation,
+            observation,
+            item,
+            collection_kind=collection_kind,
+        )
+        for item in messages
+    ]
+
+
+def _record_message_sync_issue(
+    conversation: Conversation,
+    observation: MessageObservation,
+) -> None:
+    metadata = dict(conversation.metadata_json or {})
+    previous = metadata.get("message_sync_issue")
+    previous_issue = previous if isinstance(previous, dict) else {}
+    is_consecutive = previous_issue.get("status") == "active"
+    failure_count = int(previous_issue.get("consecutive_failure_count") or 0) + 1 if is_consecutive else 1
+    detected_at = observation.processed_at or utcnow()
+    metadata["message_sync_issue"] = {
+        "status": "active",
+        "observation_id": observation.observation_id,
+        "first_detected_at": (
+            previous_issue.get("first_detected_at")
+            if is_consecutive
+            else detected_at.isoformat()
+        ),
+        "latest_detected_at": detected_at.isoformat(),
+        "unread": bool(observation.unread),
+        "message_count": observation.message_count,
+        "consecutive_failure_count": failure_count,
+        "requires_attention": bool(observation.unread or failure_count >= 2),
+        "dismissed_at": None,
+    }
+    conversation.metadata_json = metadata
+
+
+def _resolve_message_sync_issue(conversation: Conversation, resolved_at: datetime) -> None:
+    metadata = dict(conversation.metadata_json or {})
+    current = metadata.get("message_sync_issue")
+    if not isinstance(current, dict) or current.get("status") != "active":
+        return
+    metadata["message_sync_issue"] = {
+        **current,
+        "status": "resolved",
+        "requires_attention": False,
+        "resolved_at": resolved_at.isoformat(),
+        "resolution": "snapshot_aligned",
+    }
+    conversation.metadata_json = metadata
+
+
 def _history_tail(db: Session, conversation_id: str, limit: int = 200) -> list[Message]:
     newest = list(
         db.scalars(
             select(Message)
-            .where(Message.conversation_id == conversation_id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.message_status != "failed",
+            )
             .order_by(Message.conversation_sequence.desc())
             .limit(limit)
         ).all()
@@ -187,11 +265,17 @@ def _snapshot_message(
         sent_at=observation.collected_at,
         observed_at=observation.collected_at,
         snapshot_id=(observation.raw_payload or {}).get("source_snapshot_id"),
+        time_label=item.get("time_label") or None,
+        has_explicit_time=bool(item.get("has_explicit_time")),
         collected_at=observation.collected_at,
         first_observation_id=observation.observation_id,
         first_dom_sequence=item.get("dom_sequence"),
         collection_kind=collection_kind,
-        automation_eligible=collection_kind == "incremental" and sender_role == "customer",
+        automation_eligible=(
+            collection_kind == "incremental"
+            and sender_role == "customer"
+            and item.get("automation_mode", "trigger") == "trigger"
+        ),
     )
 
 
@@ -234,6 +318,14 @@ def _attach_snapshot_echo_evidence(
         existing.message_status = "sent"
         existing.raw_payload = {
             **previous_payload,
+            **({
+                key: item[key]
+                for key in (
+                    "message_type", "media_type", "image_url", "image_sha256",
+                    "media_resource_id", "structured_payload",
+                )
+                if item.get(key) is not None
+            }),
             "platform_echo": {
                 "observation_id": observation.observation_id,
                 "platform_message_id": platform_message_id,
@@ -284,10 +376,32 @@ def _apply_formal_snapshot(
     )
     if new_messages:
         tail = new_messages[-1]
-        conversation.latest_message_text = tail.content
+        conversational_tail = next((
+            item for item in reversed(new_messages)
+            if (item.raw_payload or {}).get("automation_mode") in {"trigger", "context"}
+        ), None)
+        if conversational_tail is not None:
+            conversation.latest_message_text = conversational_tail.content
         conversation.latest_message_at = observation.collected_at
         conversation.unread_count = 1 if observation.unread else 0
-        conversation.awaiting_reply = tail.sender_role == "customer"
+        trigger_tail = next((
+            item for item in reversed(new_messages)
+            if (item.raw_payload or {}).get("automation_mode", "trigger") == "trigger"
+        ), None)
+        conversation.awaiting_reply = bool(
+            trigger_tail is not None and trigger_tail.sender_role == "customer"
+        )
+        if (
+            collection_kind == "incremental"
+            and trigger_tail is not None
+            and trigger_tail.sender_role == "customer"
+            and observation.collected_at
+            and (
+                conversation.deleted_at is None
+                or _as_utc_naive(observation.collected_at) > _as_utc_naive(conversation.deleted_at)
+            )
+        ):
+            conversation.deleted_at = None
         conversation.status = "active"
         db.add(conversation)
     return new_messages
@@ -406,8 +520,20 @@ def _process_message_snapshot_locked(
         messages = _assemble_batches(observation)
         if messages is None:
             return SnapshotProcessResult(observation, [], conversation)
-        actual_hash = snapshot_payload_hash(messages)
-        if actual_hash != observation.payload_hash:
+        current_hash = snapshot_payload_hash(messages)
+        structured_hash = snapshot_payload_hash(messages, include_timeline_fields=False)
+        legacy_hash = snapshot_payload_hash(
+            messages,
+            include_structured_fields=False,
+            include_timeline_fields=False,
+        )
+        accepted_contracts = {
+            current_hash: "timeline_v2",
+            structured_hash: "timeline_v1",
+            legacy_hash: "legacy_v1",
+        }
+        hash_contract = accepted_contracts.get(observation.payload_hash)
+        if hash_contract is None:
             raise SnapshotProtocolError("assembled snapshot payload_hash does not match")
         history = _history_tail(db, conversation.id)
         result = align_message_sequences(history, messages)
@@ -439,6 +565,7 @@ def _process_message_snapshot_locked(
         observation.appended_count = len(appended_messages)
         observation.diagnostics_json = {
             **result.diagnostics,
+            "payload_hash_contract": hash_contract,
             "append_from": result.append_from,
             "first_new_dom_sequence": (
                 appended_messages[0].first_dom_sequence if appended_messages else None
@@ -450,6 +577,12 @@ def _process_message_snapshot_locked(
         }
         observation.processed_at = utcnow()
         observation.error_message = None
+        if result.status == "unaligned":
+            _record_message_sync_issue(conversation, observation)
+            db.add(conversation)
+        elif result.status in {"bootstrap", "aligned", "duplicate"}:
+            _resolve_message_sync_issue(conversation, observation.processed_at)
+            db.add(conversation)
     except SnapshotProtocolError as exc:
         appended_messages = []
         observation.alignment_status = "failed"

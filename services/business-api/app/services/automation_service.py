@@ -26,7 +26,7 @@ from app.models import (
     utcnow,
 )
 from app.schemas.automation import ReplyRunRequest, TestReplyRequest
-from app.schemas.message import SendMessageRequest
+from app.schemas.message import MessageRead, SendMessageRequest
 from app.services.email_workflow_service import (
     active_workflow,
     enabled_templates,
@@ -39,11 +39,12 @@ from app.services.message_service import create_send_task
 from app.services.order_service import order_prompt_context
 from app.services.order_service import maybe_create_order_follow_up
 from app.services.model_call_service import persist_model_calls
-from app.services.robot_service import serialize_robot
+from app.services.outbound_safety import prohibited_outbound_reason
+from app.services.robot_service import _knowledge_access_token, serialize_robot
 
 
 logger = logging.getLogger(__name__)
-DEFAULT_CONTEXT_LENGTH = 20
+DEFAULT_CONTEXT_LENGTH = 10
 MIN_CONTEXT_LENGTH = 1
 MAX_CONTEXT_LENGTH = 50
 DEFAULT_TIMEOUT_SECONDS = 10
@@ -51,7 +52,7 @@ MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 60
 MAX_SENSITIVE_WORDS = 200
 MAX_SENSITIVE_WORD_LENGTH = 64
-DEFAULT_SENSITIVE_WORD_REPLY_TEXT = "已收到您的消息，正在为您转接人工客服，请稍等～"
+DEFAULT_SENSITIVE_WORD_REPLY_TEXT = "亲亲，已收到您的消息，正在为您核实，请稍等~"
 
 
 def _active_robot(db: Session, user: User, conversation: Conversation) -> Robot | None:
@@ -98,7 +99,7 @@ def _auto_send_allowed(robot: Robot | None, *, requested: bool) -> bool:
 
 def _timeout_config(robot: Robot | None) -> tuple[bool, int, str]:
     config = _robot_config(robot)
-    enabled = config.get("timeout_enabled", True) is True
+    enabled = config.get("timeout_enabled", False) is True
     try:
         seconds = int(config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
     except (TypeError, ValueError):
@@ -245,13 +246,50 @@ def _queue_reply_task(
     result: dict[str, Any],
     *,
     auto_send_allowed: bool,
+    defer_for_timeout: bool = False,
 ) -> str | None:
     if not _should_create_send_task(result, auto_send_allowed=auto_send_allowed):
+        return None
+    prohibited_reason = prohibited_outbound_reason(str(result.get("text") or ""))
+    if prohibited_reason:
+        result["decision"] = "needs_human"
+        result["text"] = ""
+        result["media"] = []
+        result["provider"] = "business-outbound-safety"
+        result["risk_flags"] = list(dict.fromkeys([
+            *(result.get("risk_flags") if isinstance(result.get("risk_flags"), list) else []),
+            "prohibited_outbound_content",
+            prohibited_reason,
+        ]))
+        result["action_plan"] = {
+            "workflow": "human_review",
+            "next_action": "mark_needs_human",
+            "required_actions": ["mark_needs_human"],
+            "blocked_actions": ["send_platform_text", "send_platform_image"],
+        }
+        _mark_human_required(conversation, reason="prohibited_outbound_content")
+        _mark_reply_run_human_required(result, reason="prohibited_outbound_content")
+        db.add(conversation)
+        db.commit()
+        logger.warning(
+            "automatic reply blocked by final outbound safety conversation_id=%s reason=%s",
+            conversation.id,
+            prohibited_reason,
+        )
         return None
     media = result.get("media") if isinstance(result.get("media"), list) else []
     image_media = next(
         (item for item in media if isinstance(item, dict) and item.get("type") == "image" and item.get("url")),
         None,
+    )
+    timeout_task = db.scalar(
+        select(RpaTask).where(
+            RpaTask.idempotency_key == f"auto-timeout:{robot.id}:{source_message.id}"
+        )
+    ) if defer_for_timeout else None
+    should_wait_for_timeout = defer_for_timeout and (
+        timeout_task is None
+        or timeout_task.status in {"queued", "dispatched", "acknowledged"}
     )
     response = create_send_task(
         db,
@@ -267,6 +305,8 @@ def _queue_reply_task(
             else None
         ),
         idempotency_key=f"auto-reply:{robot.id}:{source_message.id}:text",
+        source="automation",
+        task_status="waiting_timeout" if should_wait_for_timeout else "queued",
     )
     task = db.get(RpaTask, response.task_id)
     if task is not None:
@@ -280,6 +320,41 @@ def _queue_reply_task(
     return response.task_id
 
 
+async def _queue_reply_task_ordered(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    result: dict[str, Any],
+    *,
+    auto_send_allowed: bool,
+    timeout_deadline: asyncio.Event | None = None,
+    ordering_lock: asyncio.Lock | None = None,
+) -> str | None:
+    if ordering_lock is None:
+        return _queue_reply_task(
+            db,
+            user,
+            conversation,
+            robot,
+            source_message,
+            result,
+            auto_send_allowed=auto_send_allowed,
+        )
+    async with ordering_lock:
+        return _queue_reply_task(
+            db,
+            user,
+            conversation,
+            robot,
+            source_message,
+            result,
+            auto_send_allowed=auto_send_allowed,
+            defer_for_timeout=bool(timeout_deadline and timeout_deadline.is_set()),
+        )
+
+
 async def _send_timeout_notice_later(
     user_id: str,
     conversation_id: str,
@@ -288,8 +363,36 @@ async def _send_timeout_notice_later(
     seconds: int,
     text: str,
     db_override: Session | None = None,
-) -> None:
+    *,
+    deadline_reached: asyncio.Event | None = None,
+    ordering_lock: asyncio.Lock | None = None,
+) -> str | None:
     await asyncio.sleep(seconds)
+    if ordering_lock is not None:
+        async with ordering_lock:
+            if deadline_reached is not None:
+                deadline_reached.set()
+            task_id = _queue_timeout_notice(
+                user_id, conversation_id, source_message_id, robot_id, text, db_override
+            )
+            if task_id is None and deadline_reached is not None:
+                deadline_reached.clear()
+            return task_id
+    if deadline_reached is not None:
+        deadline_reached.set()
+    return _queue_timeout_notice(
+        user_id, conversation_id, source_message_id, robot_id, text, db_override
+    )
+
+
+def _queue_timeout_notice(
+    user_id: str,
+    conversation_id: str,
+    source_message_id: str,
+    robot_id: str,
+    text: str,
+    db_override: Session | None = None,
+) -> str | None:
     if not text:
         return
     from app.db.session import SessionLocal
@@ -301,23 +404,28 @@ async def _send_timeout_notice_later(
         conversation = db.get(Conversation, conversation_id)
         robot = db.get(Robot, robot_id)
         if not user or not conversation or not robot or conversation.user_id != user.id:
-            return
+            return None
         if conversation.human_required:
-            return
+            return None
         reply_run = db.scalar(
             select(AutomationReplyRun).where(
                 AutomationReplyRun.robot_id == robot.id,
                 AutomationReplyRun.source_message_id == source_message_id,
             )
         )
-        if reply_run and reply_run.send_task_id:
+        formal_task = db.scalar(
+            select(RpaTask).where(
+                RpaTask.idempotency_key == f"auto-reply:{robot.id}:{source_message_id}:text"
+            )
+        )
+        if formal_task is None and reply_run and reply_run.send_task_id:
             formal_task = db.get(RpaTask, reply_run.send_task_id)
-            if formal_task and formal_task.status == "completed":
-                return
+        if formal_task is not None and formal_task.status != "waiting_timeout":
+            return None
         if reply_run and reply_run.decision == "needs_human":
-            return
+            return None
         if reply_run is None:
-            return
+            return None
         try:
             response = create_send_task(
                 db,
@@ -337,6 +445,7 @@ async def _send_timeout_notice_later(
                 source_message_id,
                 response.task_id,
             )
+            return response.task_id
         except Exception:  # noqa: BLE001
             logger.exception(
                 "timeout notice queue failed conversation_id=%s robot_id=%s source_message_id=%s",
@@ -344,9 +453,26 @@ async def _send_timeout_notice_later(
                 robot.id,
                 source_message_id,
             )
+            _release_timeout_gated_reply(db, robot.id, source_message_id)
+            return None
     finally:
         if db_context is not None:
             db_context.close()
+
+
+def _release_timeout_gated_reply(db: Session, robot_id: str, source_message_id: str) -> RpaTask | None:
+    formal_task = db.scalar(
+        select(RpaTask).where(
+            RpaTask.idempotency_key == f"auto-reply:{robot_id}:{source_message_id}:text",
+            RpaTask.status == "waiting_timeout",
+        )
+    )
+    if formal_task is None:
+        return None
+    formal_task.status = "queued"
+    db.add(formal_task)
+    db.commit()
+    return formal_task
 
 
 def _message_history(rows: list[Message]) -> list[dict[str, str]]:
@@ -356,7 +482,12 @@ def _message_history(rows: list[Message]) -> list[dict[str, str]]:
             "content": item.content,
         }
         for item in reversed(rows)
-        if item.content.strip()
+        if (
+            getattr(item, "message_status", "sent") != "failed"
+            and item.sender_role in {"customer", "agent", "assistant", "bot"}
+            and (getattr(item, "raw_payload", {}) or {}).get("automation_mode", "trigger") == "trigger"
+            and item.content.strip()
+        )
     ]
 
 
@@ -368,10 +499,14 @@ def _snapshot_customer_batch_size(db: Session, source_message: Message) -> int:
             Message.conversation_id == source_message.conversation_id,
             Message.first_observation_id == source_message.first_observation_id,
             Message.conversation_sequence <= source_message.conversation_sequence,
+            Message.message_status != "failed",
         ).order_by(desc(Message.conversation_sequence))
     ).all()
     count = 0
     for item in batch_tail:
+        automation_mode = (item.raw_payload or {}).get("automation_mode", "trigger")
+        if automation_mode != "trigger":
+            continue
         if item.sender_role != "customer":
             break
         count += 1
@@ -394,9 +529,31 @@ def _history_with_latest(
     return [*normalized[-limit:], latest]
 
 
+def _platform_context(rows: list[Message], limit: int = 10) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in reversed(rows):
+        raw_payload = item.raw_payload if isinstance(item.raw_payload, dict) else {}
+        automation_mode = raw_payload.get("automation_mode")
+        message_type = raw_payload.get("message_type") or "context"
+        is_triggering_customer_card = (
+            automation_mode == "trigger"
+            and item.sender_role == "customer"
+            and message_type in {"product", "order"}
+        )
+        if automation_mode != "context" and not is_triggering_customer_card:
+            continue
+        items.append({
+            "type": message_type,
+            "content": item.content,
+            "data": raw_payload.get("structured_payload") or {},
+        })
+    return items[-limit:]
+
+
 async def _decide_reply(
     *,
     settings: Any,
+    user: User,
     message: str,
     history: list[dict[str, Any]],
     platform: str,
@@ -409,15 +566,18 @@ async def _decide_reply(
     email_templates: list[dict[str, Any]] | None = None,
     email_config: Any | None = None,
     customer_orders: dict[str, Any] | None = None,
+    platform_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     config = _robot_config(robot)
     payload = {
+        "knowledge_access_token": _knowledge_access_token(user),
         "message": message,
         "conversation": history,
         "platform": platform,
         "shop_name": shop_name,
         "customer_name": customer_name,
         "customer_orders": customer_orders or {"collection_status": "not_collected"},
+        "platform_context": platform_context or [],
         "qa_base_ids": robot_read.qa_knowledge_base_ids,
         "product_base_ids": robot_read.product_knowledge_base_ids,
         "tone_base_id": robot_read.tone_knowledge_base_id or "",
@@ -429,22 +589,20 @@ async def _decide_reply(
             "customer_address": str(config.get("customer_address") or "亲亲"),
             "self_address": str(config.get("self_address") or "客服"),
             "advanced_instruction": str(config.get("advanced_instruction") or ""),
-            "outbound_block_words": config.get("outbound_block_words", []),
-            "outbound_block_rules": config.get("outbound_block_rules", []),
-            "outbound_block_action": str(config.get("outbound_block_action") or "fallback"),
+            "prohibited_content_instruction": str(config.get("prohibited_content_instruction") or ""),
             "fallback_reply_text": str(config.get("fallback_reply_text") or ""),
             "email_trigger_scenarios": str(getattr(email_config, "trigger_scenarios", "") or ""),
         },
         "provider_config": {
-            "provider": ai_config.provider,
-            "base_url": ai_config.base_url,
-            "model": str(config.get("model") or ai_config.model),
-            "api_key": ai_config.api_key,
+            "provider": settings.ai_provider if settings.ai_provider_api_key else ai_config.provider,
+            "base_url": settings.ai_provider_base_url if settings.ai_provider_api_key else ai_config.base_url,
+            "model": str(config.get("model") or getattr(ai_config, "model", "deepseek-v4-flash")),
+            "api_key": settings.ai_provider_api_key or ai_config.api_key,
             # The auto-reply switch now belongs to the robot. A configured
             # provider key is sufficient to enable model calls.
-            "enabled": bool(ai_config.api_key),
-            "temperature": float(config.get("temperature", ai_config.temperature)),
-        } if ai_config else None,
+            "enabled": bool(settings.ai_provider_api_key or ai_config.api_key),
+            "temperature": float(config.get("temperature", getattr(ai_config, "temperature", 0.2))),
+        } if ai_config or settings.ai_provider_api_key else None,
     }
     try:
         async with httpx.AsyncClient(
@@ -466,6 +624,9 @@ async def _execute_bound_reply(
     conversation: Conversation,
     robot: Robot,
     source_message: Message,
+    *,
+    timeout_deadline: asyncio.Event | None = None,
+    timeout_ordering_lock: asyncio.Lock | None = None,
 ) -> dict[str, Any]:
     robot_read = serialize_robot(db, robot)
     message = source_message.content
@@ -479,7 +640,7 @@ async def _execute_bound_reply(
             matched_sensitive_word,
             _sensitive_word_reply_text(robot),
         )
-        task_id = _queue_reply_task(
+        task_id = await _queue_reply_task_ordered(
             db,
             user,
             conversation,
@@ -487,6 +648,8 @@ async def _execute_bound_reply(
             source_message,
             result,
             auto_send_allowed=_auto_send_allowed(robot, requested=request.allow_auto_send),
+            timeout_deadline=timeout_deadline,
+            ordering_lock=timeout_ordering_lock,
         )
         _mark_human_required(
             conversation,
@@ -515,11 +678,12 @@ async def _execute_bound_reply(
             .where(
                 Message.conversation_id == conversation.id,
                 Message.conversation_sequence <= source_message.conversation_sequence,
+                Message.message_status != "failed",
             )
             .order_by(desc(Message.conversation_sequence))
             # The source message is part of the query, while context_length
             # represents prior messages. Fetch one extra row for the source.
-            .limit(context_length + 1)
+            .limit(max(context_length * 3 + 10, context_length + 1))
         ).all()
     )
     history = _history_with_latest(_message_history(history_rows), message, context_length)
@@ -532,6 +696,7 @@ async def _execute_bound_reply(
     email_template_rows = enabled_templates(db, user)
     email_config = get_config(db, user)
     customer_orders = order_prompt_context(db, conversation)
+    platform_context = _platform_context(history_rows)
     email_workflow_config = {
         "ask_email_text": email_config.ask_email_text,
         "success_text": email_config.success_text,
@@ -570,7 +735,7 @@ async def _execute_bound_reply(
     else:
         generation_started = monotonic()
         result = await _decide_reply(
-            settings=settings, message=message, history=history,
+            settings=settings, user=user, message=message, history=history,
             platform=conversation.platform_code,
             shop_name=str(conversation.metadata_json.get("shop_name") or ""),
             customer_name=conversation.customer_name or "", robot=robot,
@@ -579,6 +744,7 @@ async def _execute_bound_reply(
             email_templates=template_metadata(email_template_rows),
             email_config=email_config,
             customer_orders=customer_orders,
+            platform_context=platform_context,
         )
         result["reply_generation_duration_ms"] = max(
             0, round((monotonic() - generation_started) * 1000)
@@ -609,7 +775,7 @@ async def _execute_bound_reply(
                 )
 
     task_ids: list[str] = []
-    task_id = _queue_reply_task(
+    task_id = await _queue_reply_task_ordered(
         db,
         user,
         conversation,
@@ -617,6 +783,8 @@ async def _execute_bound_reply(
         source_message,
         result,
         auto_send_allowed=auto_send_allowed,
+        timeout_deadline=timeout_deadline,
+        ordering_lock=timeout_ordering_lock,
     )
     if task_id:
         task_ids.append(task_id)
@@ -640,11 +808,11 @@ async def _execute_bound_reply(
                 robot.id,
                 task_id,
             )
-        outreach = maybe_create_order_follow_up(db, conversation, robot, source_message, result)
-        if outreach is not None:
-            db.add(outreach)
-            db.commit()
-            result["outreach_run_id"] = outreach.id
+    outreach = maybe_create_order_follow_up(db, conversation, robot, source_message, result)
+    if outreach is not None:
+        db.add(outreach)
+        db.commit()
+        result["outreach_run_id"] = outreach.id
     result["task_ids"] = task_ids
     qa_match = result.get("qa_match") if isinstance(result.get("qa_match"), dict) else {}
     logger.info(
@@ -664,7 +832,14 @@ async def _execute_bound_reply(
     return result
 
 
-async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[str, Any]:
+async def run_reply(
+    db: Session,
+    user: User,
+    request: ReplyRunRequest,
+    *,
+    timeout_deadline: asyncio.Event | None = None,
+    timeout_ordering_lock: asyncio.Lock | None = None,
+) -> dict[str, Any]:
     conversation = db.scalar(
         select(Conversation).where(
             Conversation.id == request.conversation_id,
@@ -713,7 +888,7 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
             source_message.id,
             reply_text=_sensitive_word_reply_text(robot),
         )
-        task_id = _queue_reply_task(
+        task_id = await _queue_reply_task_ordered(
             db,
             user,
             conversation,
@@ -721,6 +896,8 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
             source_message,
             result,
             auto_send_allowed=_auto_send_allowed(robot, requested=request.allow_auto_send),
+            timeout_deadline=timeout_deadline,
+            ordering_lock=timeout_ordering_lock,
         )
         result["task_ids"] = [task_id] if task_id else []
         return result
@@ -745,6 +922,17 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
         )
     db.refresh(reply_run)
 
+    from app.services.realtime import realtime_manager
+    await realtime_manager.broadcast(
+        user.id,
+        {
+            "type": "automation.reply.started",
+            "reply_run_id": reply_run.id,
+            "conversation_id": conversation.id,
+            "source_message_id": source_message.id,
+        },
+    )
+
     try:
         result = await _execute_bound_reply(
             db,
@@ -753,6 +941,8 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
             conversation,
             robot,
             source_message,
+            timeout_deadline=timeout_deadline,
+            timeout_ordering_lock=timeout_ordering_lock,
         )
     except Exception as exc:
         db.rollback()
@@ -762,6 +952,15 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
             persisted_run.error_message = str(exc)[:2000]
             persisted_run.completed_at = utcnow()
             db.commit()
+        await realtime_manager.broadcast(
+            user.id,
+            {
+                "type": "automation.reply.failed",
+                "reply_run_id": reply_run.id,
+                "conversation_id": conversation.id,
+                "error": str(exc)[:500],
+            },
+        )
         raise
 
     task_id = next(iter(result.get("task_ids") or []), None)
@@ -799,7 +998,11 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
             persisted_run.reply_message_id = send_task.message_id if send_task else None
         persisted_run.completed_at = utcnow()
         db.commit()
-        from app.services.realtime import realtime_manager
+        reply_message = (
+            db.get(Message, persisted_run.reply_message_id)
+            if persisted_run.reply_message_id
+            else None
+        )
 
         await realtime_manager.broadcast(
             user.id,
@@ -807,6 +1010,10 @@ async def run_reply(db: Session, user: User, request: ReplyRunRequest) -> dict[s
                 "type": "automation.reply.completed",
                 "reply_run_id": persisted_run.id,
                 "conversation_id": conversation.id,
+                "message": MessageRead.model_validate(reply_message).model_dump(mode="json")
+                if reply_message
+                else None,
+                "task_id": task_id,
                 "model": next(
                     (
                         str(item.get("model"))
@@ -837,7 +1044,7 @@ async def run_test_reply(db: Session, user: User, request: TestReplyRequest) -> 
     context_length = _context_length(robot)
     history = _history_with_latest(request.conversation, request.message, context_length)
     result = await _decide_reply(
-        settings=get_settings(), message=request.message, history=history,
+        settings=get_settings(), user=user, message=request.message, history=history,
         platform=request.platform_code, shop_name=request.shop_name,
         customer_name=request.customer_name, robot=robot,
         robot_read=robot_read, ai_config=ai_config, auto_send_allowed=False,
@@ -885,9 +1092,13 @@ async def process_inbound_reply(
         robot = _active_robot(db, user, conversation)
         if not robot:
             return None
-        timeout_task: asyncio.Task[None] | None = None
+        timeout_task: asyncio.Task[str | None] | None = None
+        timeout_deadline: asyncio.Event | None = None
+        timeout_ordering_lock: asyncio.Lock | None = None
         timeout_enabled, timeout_seconds, timeout_text = _timeout_config(robot)
         if _auto_send_allowed(robot, requested=True) and timeout_enabled and timeout_text:
+            timeout_deadline = asyncio.Event()
+            timeout_ordering_lock = asyncio.Lock()
             timeout_task = asyncio.create_task(
                 _send_timeout_notice_later(
                     user.id,
@@ -896,19 +1107,36 @@ async def process_inbound_reply(
                     robot.id,
                     timeout_seconds,
                     timeout_text,
+                    deadline_reached=timeout_deadline,
+                    ordering_lock=timeout_ordering_lock,
                 )
             )
         try:
+            request = ReplyRunRequest(
+                conversation_id=conversation_id,
+                source_message_id=source_message_id,
+                source_event_id=source_event_id,
+                allow_auto_send=True,
+            )
             result = await run_reply(
                 db,
                 user,
-                ReplyRunRequest(
-                    conversation_id=conversation_id,
-                    source_message_id=source_message_id,
-                    source_event_id=source_event_id,
-                    allow_auto_send=True,
-                ),
+                request,
+                timeout_deadline=timeout_deadline,
+                timeout_ordering_lock=timeout_ordering_lock,
             )
+            if timeout_task is not None:
+                timeout_notice_task_id: str | None = None
+                if not timeout_task.done():
+                    timeout_task.cancel()
+                    try:
+                        await timeout_task
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    timeout_notice_task_id = timeout_task.result()
+                if timeout_notice_task_id is None:
+                    _release_timeout_gated_reply(db, robot.id, source_message_id)
             if conversation.human_required:
                 from app.services.realtime import realtime_manager
 
