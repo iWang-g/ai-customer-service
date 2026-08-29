@@ -2,18 +2,32 @@ import {
   Activity,
   AlertCircle,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Cpu,
+  Edit3,
+  Image as ImageIcon,
+  MessageSquareText,
   PackageSearch,
   RefreshCw,
+  Save,
   ShieldCheck,
+  Sparkles,
+  Store,
   Terminal,
   Zap,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { parseApiDateTime } from '../../shared/dateTime';
-import type { BotStatus, StatusEvent } from '../types';
-import type { CustomerOrdersResponse } from '../../shared/api/client';
+import type { BotStatus, Conversation, StatusEvent } from '../types';
+import type {
+  CustomerProduct,
+  CustomerProductsResponse,
+  CustomerOrdersResponse,
+  PlatformQuickReply,
+  ShopProductSummary,
+} from '../../shared/api/client';
 
 interface StatusPanelProps {
   bot: BotStatus;
@@ -26,6 +40,27 @@ interface StatusPanelProps {
   customerOrders: CustomerOrdersResponse | null;
   isLoadingCustomerOrders: boolean;
   onRefreshCustomerOrders: () => Promise<void>;
+  customerProducts: CustomerProductsResponse | null;
+  isLoadingCustomerProducts: boolean;
+  onRefreshCustomerProducts: () => Promise<CustomerProductsResponse | null>;
+  onSendCustomerProduct: (product: CustomerProduct) => Promise<void>;
+  shopSummary: ShopProductSummary;
+  isLoadingShopSummary: boolean;
+  isGeneratingShopSummary: boolean;
+  isSavingShopSummary: boolean;
+  onGenerateShopSummary: () => Promise<ShopProductSummary>;
+  onSaveShopSummary: (summary: { shop_intro: string; on_sale_products: string }) => Promise<ShopProductSummary>;
+  quickReplies: {
+    personal: PlatformQuickReply[];
+    team: PlatformQuickReply[];
+  };
+  quickReplyStatus: {
+    personal: { isLoading: boolean; error: string; unavailable: boolean };
+    team: { isLoading: boolean; error: string; unavailable: boolean };
+  };
+  onRefreshQuickReplies: (source: 'personal' | 'team') => Promise<void>;
+  onSelectQuickReply: (item: PlatformQuickReply) => void;
+  conversation?: Conversation;
 }
 
 function formatDuration(value: number | null): string {
@@ -93,6 +128,111 @@ async function copyText(value: string): Promise<void> {
   if (!copied) throw new Error('Failed to copy order ID');
 }
 
+function groupQuickReplies(items: PlatformQuickReply[]): Array<{ name: string; items: PlatformQuickReply[] }> {
+  const groups = new Map<string, PlatformQuickReply[]>();
+  for (const item of items) {
+    const name = item.category.trim() || '未分类';
+    const group = groups.get(name) || [];
+    group.push(item);
+    groups.set(name, group);
+  }
+  return [...groups.entries()].map(([name, groupItems]) => ({ name, items: groupItems }));
+}
+
+function QuickReplySection({
+  title,
+  items,
+  status,
+  isOpen,
+  onToggle,
+  onRefresh,
+  onSelect,
+}: {
+  title: string;
+  items: PlatformQuickReply[];
+  status: { isLoading: boolean; error: string; unavailable: boolean };
+  isOpen: boolean;
+  onToggle: () => void;
+  onRefresh: () => Promise<void>;
+  onSelect: (item: PlatformQuickReply) => void;
+}) {
+  const groups = groupQuickReplies(items);
+  return (
+    <section className="border-b border-slate-200 last:border-b-0">
+      <div className="flex items-center gap-2 bg-white px-1 py-2">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 items-center gap-2 py-1 text-left"
+          aria-expanded={isOpen}
+        >
+          <MessageSquareText size={14} className="shrink-0 text-sky-500" />
+          <span className="truncate text-xs font-bold text-slate-700">{title}</span>
+          <span className="shrink-0 text-[10px] font-medium text-slate-400">{items.length}</span>
+          <ChevronDown size={14} className={`ml-auto shrink-0 text-slate-300 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        </button>
+        <button
+          type="button"
+          onClick={() => void onRefresh()}
+          disabled={status.isLoading}
+          className="shrink-0 rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-indigo-600 disabled:cursor-not-allowed disabled:opacity-50"
+          title={`刷新${title}`}
+          aria-label={`刷新${title}`}
+        >
+          <RefreshCw size={13} className={status.isLoading ? 'animate-spin' : ''} />
+        </button>
+      </div>
+      {isOpen ? (
+        <div className="space-y-3 pb-4">
+          {status.unavailable ? (
+            <p className="rounded-lg bg-slate-50 px-3 py-2 text-[10px] leading-4 text-slate-500">
+              当前店铺未启用{title}
+            </p>
+          ) : null}
+          {status.error ? (
+            <p className="rounded-lg border border-rose-100 bg-rose-50 px-3 py-2 text-[10px] leading-4 text-rose-600">
+              {status.error}
+            </p>
+          ) : null}
+          {status.isLoading && items.length === 0 ? (
+            <p className="px-1 py-5 text-center text-xs text-slate-400">正在读取{title}...</p>
+          ) : null}
+          {groups.map((group) => (
+            <div key={group.name} className="space-y-1.5">
+              <div className="px-1 text-[10px] font-bold text-slate-400">{group.name}</div>
+              {group.items.map((item) => (
+                <button
+                  type="button"
+                  key={item.source_id}
+                  onClick={() => onSelect(item)}
+                  className="group w-full rounded-lg border border-slate-100 bg-white px-3 py-2 text-left transition-colors hover:border-sky-200 hover:bg-sky-50"
+                  title="填入输入框"
+                >
+                  <span className="block line-clamp-3 whitespace-pre-wrap break-words text-xs leading-5 text-slate-600 group-hover:text-slate-700">
+                    {item.content}
+                  </span>
+                  <span className="mt-1 flex items-center gap-2 text-[10px] text-slate-400">
+                    {item.quick_key ? <span className="truncate">{item.quick_key}</span> : null}
+                    {item.images.length > 0 ? (
+                      <span className="inline-flex shrink-0 items-center gap-0.5">
+                        <ImageIcon size={11} />
+                        {item.images.length}
+                      </span>
+                    ) : null}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ))}
+          {!status.isLoading && !status.unavailable && !status.error && items.length === 0 ? (
+            <p className="px-1 py-5 text-center text-xs text-slate-400">暂无话术</p>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export default function StatusPanel({
   bot,
   events,
@@ -104,10 +244,33 @@ export default function StatusPanel({
   customerOrders,
   isLoadingCustomerOrders,
   onRefreshCustomerOrders,
+  customerProducts,
+  isLoadingCustomerProducts,
+  onRefreshCustomerProducts,
+  onSendCustomerProduct,
+  shopSummary,
+  isLoadingShopSummary,
+  isGeneratingShopSummary,
+  isSavingShopSummary,
+  onGenerateShopSummary,
+  onSaveShopSummary,
+  quickReplies,
+  quickReplyStatus,
+  onRefreshQuickReplies,
+  onSelectQuickReply,
+  conversation,
 }: StatusPanelProps) {
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
-  const [activeView, setActiveView] = useState<'orders' | 'status'>('status');
+  const [activeView, setActiveView] = useState<'products' | 'orders' | 'quickReplies' | 'status'>('products');
+  const [isPersonalRepliesOpen, setIsPersonalRepliesOpen] = useState(true);
+  const [isTeamRepliesOpen, setIsTeamRepliesOpen] = useState(true);
+  const [isSummaryOpen, setIsSummaryOpen] = useState(false);
+  const [summaryDraft, setSummaryDraft] = useState({ shop_intro: '', on_sale_products: '' });
+  const [summaryNotice, setSummaryNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [refreshError, setRefreshError] = useState('');
+  const [productRefreshError, setProductRefreshError] = useState('');
+  const [sendingProductId, setSendingProductId] = useState('');
+  const [productPage, setProductPage] = useState(1);
   const [copiedOrderId, setCopiedOrderId] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -118,6 +281,34 @@ export default function StatusPanel({
     document.addEventListener('mousedown', closeMenu);
     return () => document.removeEventListener('mousedown', closeMenu);
   }, [isModelMenuOpen]);
+
+  const productPageSize = 10;
+  const productItems = customerProducts?.products || [];
+  const productPageCount = Math.max(1, Math.ceil(productItems.length / productPageSize));
+  const normalizedProductPage = Math.min(productPage, productPageCount);
+  const visibleProducts = productItems.slice(
+    (normalizedProductPage - 1) * productPageSize,
+    normalizedProductPage * productPageSize,
+  );
+  const isPinduoduoConversation = conversation?.platform === 'pinduoduo';
+
+  useEffect(() => {
+    setProductPage(1);
+  }, [customerProducts?.conversation_id, customerProducts?.observed_at]);
+
+  useEffect(() => {
+    setProductPage((current) => Math.min(current, productPageCount));
+  }, [productPageCount]);
+
+  useEffect(() => {
+    const nextDraft = {
+      shop_intro: shopSummary.shop_intro || '',
+      on_sale_products: shopSummary.on_sale_products || '',
+    };
+    setSummaryDraft(nextDraft);
+    setSummaryNotice(null);
+    setIsSummaryOpen(!nextDraft.shop_intro && !nextDraft.on_sale_products);
+  }, [conversation?.shopId, shopSummary.shop_intro, shopSummary.on_sale_products]);
 
   const connectionLabel = {
     connecting: '连接中',
@@ -143,16 +334,292 @@ export default function StatusPanel({
     }
   };
 
+  const handleGenerateSummary = async () => {
+    setSummaryNotice(null);
+    setIsSummaryOpen(true);
+    try {
+      const nextSummary = await onGenerateShopSummary();
+      setSummaryDraft({
+        shop_intro: nextSummary.shop_intro || '',
+        on_sale_products: nextSummary.on_sale_products || '',
+      });
+      setSummaryNotice({ type: 'success', text: '已生成，可继续编辑后保存' });
+    } catch (error) {
+      setSummaryNotice({ type: 'error', text: error instanceof Error ? error.message : '生成失败' });
+    }
+  };
+
+  const handleSaveSummary = async () => {
+    setSummaryNotice(null);
+    try {
+      const nextSummary = await onSaveShopSummary(summaryDraft);
+      setSummaryDraft({
+        shop_intro: nextSummary.shop_intro || '',
+        on_sale_products: nextSummary.on_sale_products || '',
+      });
+      setSummaryNotice({ type: 'success', text: '已保存到店铺资料' });
+    } catch (error) {
+      setSummaryNotice({ type: 'error', text: error instanceof Error ? error.message : '保存失败' });
+    }
+  };
+
+  const hasShopSummary = Boolean(shopSummary.shop_intro || shopSummary.on_sale_products);
+  const summaryTimestamp = shopSummary.edited_at || shopSummary.generated_at || '';
+
   return (
-    <div className="w-80 h-full flex flex-col border-l border-brand-border bg-slate-50/50" id="status-panel">
+    <div className="h-full w-full flex flex-col border-l border-brand-border bg-slate-50/50" id="status-panel">
+      <div className="border-b border-brand-border bg-white p-4">
+        <div className="flex items-center gap-3">
+          <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-100 bg-slate-50 text-slate-300">
+            {conversation?.shopLogoUrl ? (
+              <img
+                src={conversation.shopLogoUrl}
+                alt=""
+                className="h-full w-full object-cover"
+                referrerPolicy="no-referrer"
+              />
+            ) : (
+              <Store size={26} />
+            )}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <h2 className="min-w-0 truncate text-sm font-bold text-slate-800">
+                {conversation?.shopName || '未选择店铺'}
+              </h2>
+              {conversation?.shopIsMallOwner ? (
+                <span className="shrink-0 rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-600">
+                  主账号
+                </span>
+              ) : null}
+            </div>
+            <p className="mt-1 truncate text-[11px] font-medium text-slate-500">
+              客服账号：{conversation?.shopServiceUsername || '未识别'}
+            </p>
+          </div>
+        </div>
+      </div>
+      <div className="border-b border-brand-border bg-white px-4 py-3">
+        <div className="flex items-center justify-between gap-2">
+          <button
+            type="button"
+            onClick={() => setIsSummaryOpen((value) => !value)}
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <Sparkles size={14} className="shrink-0 text-sky-500" />
+            <span className="min-w-0 truncate text-xs font-bold text-slate-700">店铺在售商品信息摘要</span>
+            <ChevronDown
+              size={14}
+              className={`shrink-0 text-slate-300 transition-transform ${isSummaryOpen ? 'rotate-180' : ''}`}
+            />
+          </button>
+          <button
+            type="button"
+            disabled={!conversation || isLoadingShopSummary || isGeneratingShopSummary}
+            onClick={() => void handleGenerateSummary()}
+            className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-sky-100 bg-sky-50 px-1.5 text-[9px] font-medium leading-none text-sky-600 hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Sparkles size={11} />
+            {isGeneratingShopSummary ? '生成中' : hasShopSummary ? '重新生成' : '生成'}
+          </button>
+        </div>
+        {!isSummaryOpen && hasShopSummary ? (
+          <p className="mt-2 line-clamp-2 text-[10px] leading-4 text-slate-500">
+            {shopSummary.shop_intro || shopSummary.on_sale_products}
+          </p>
+        ) : null}
+        {isSummaryOpen ? (
+          <div className="mt-3 space-y-3">
+            <label className="block">
+              <span className="flex items-center gap-1 text-[10px] font-bold text-slate-500">
+                <Edit3 size={11} />
+                店铺简介
+              </span>
+              <textarea
+                value={summaryDraft.shop_intro}
+                onChange={(event) => setSummaryDraft((current) => ({ ...current, shop_intro: event.target.value }))}
+                placeholder="例如：主营二次元抱枕、枕套和周边定制。"
+                className="mt-1 h-16 w-full resize-none rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-[10px] leading-[15px] text-slate-700 outline-none focus:border-sky-300 focus:bg-white"
+              />
+            </label>
+            <label className="block">
+              <span className="flex items-center gap-1 text-[10px] font-bold text-slate-500">
+                <PackageSearch size={11} />
+                当前在售商品
+              </span>
+              <textarea
+                value={summaryDraft.on_sale_products}
+                onChange={(event) => setSummaryDraft((current) => ({ ...current, on_sale_products: event.target.value }))}
+                placeholder="当前店铺在售商品：商品标题一；商品标题二；..."
+                className="mt-1 h-28 w-full resize-none rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-[10px] leading-[15px] text-slate-700 outline-none focus:border-sky-300 focus:bg-white"
+              />
+            </label>
+            <div className="flex items-center justify-between gap-2">
+              <p className="min-w-0 truncate text-[9px] text-slate-400">
+                {summaryTimestamp ? `最近更新：${new Date(summaryTimestamp).toLocaleString('zh-CN')}` : '保存后会参与自动回复判断'}
+              </p>
+              <button
+                type="button"
+                disabled={!conversation || isSavingShopSummary}
+                onClick={() => void handleSaveSummary()}
+                className="inline-flex shrink-0 items-center gap-1 rounded-md bg-sky-500 px-2.5 py-1 text-[10px] font-semibold text-white hover:bg-sky-600 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                <Save size={12} />
+                {isSavingShopSummary ? '保存中' : '保存'}
+              </button>
+            </div>
+            {summaryNotice ? (
+              <p className={`text-[10px] ${summaryNotice.type === 'success' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                {summaryNotice.text}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
       <div className="p-4 border-b border-brand-border bg-white">
-        <div className="grid grid-cols-2 gap-1 rounded-xl bg-slate-100 p-1">
-          <button onClick={() => setActiveView('orders')} className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors ${activeView === 'orders' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}`}>客户订单</button>
-          <button onClick={() => setActiveView('status')} className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors ${activeView === 'status' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}`}>运行状态</button>
+        <div className="grid grid-cols-4 gap-1 rounded-xl bg-slate-100 p-1">
+          <button onClick={() => setActiveView('products')} className={`rounded-lg px-1.5 py-1.5 text-[11px] font-semibold leading-4 transition-colors ${activeView === 'products' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}`}>商品列表</button>
+          <button onClick={() => setActiveView('orders')} className={`rounded-lg px-1.5 py-1.5 text-[11px] font-semibold leading-4 transition-colors ${activeView === 'orders' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}`}>客户订单</button>
+          <button onClick={() => setActiveView('quickReplies')} className={`rounded-lg px-1.5 py-1.5 text-[11px] font-semibold leading-4 transition-colors ${activeView === 'quickReplies' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}`}>快捷回复</button>
+          <button onClick={() => setActiveView('status')} className={`rounded-lg px-1.5 py-1.5 text-[11px] font-semibold leading-4 transition-colors ${activeView === 'status' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}`}>运行状态</button>
         </div>
       </div>
 
-      {activeView === 'status' ? <>
+      {activeView === 'products' ? <div className="flex-1 overflow-y-auto p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-bold text-slate-800">商品列表</h2>
+            <p className="mt-1 text-[10px] text-slate-400">来自拼多多 recommendGoods</p>
+          </div>
+          <button
+            onClick={() => {
+              setProductRefreshError('');
+              void onRefreshCustomerProducts().catch((error) => setProductRefreshError(error instanceof Error ? error.message : '商品刷新失败'));
+            }}
+            disabled={isLoadingCustomerProducts}
+            className="rounded-lg border border-slate-200 bg-white p-2 text-slate-500 hover:text-indigo-600 disabled:opacity-50"
+            title="刷新商品列表"
+          >
+            <RefreshCw size={15} className={isLoadingCustomerProducts ? 'animate-spin' : ''} />
+          </button>
+        </div>
+
+        {productRefreshError && <div className="rounded-xl border border-rose-100 bg-rose-50 p-3 text-xs text-rose-600">{productRefreshError}</div>}
+        {isLoadingCustomerProducts && !customerProducts && <div className="py-16 text-center text-xs text-slate-400">正在读取商品列表...</div>}
+        {!isLoadingCustomerProducts && (!customerProducts || customerProducts.collection_status === 'not_collected' || customerProducts.collection_status === 'unavailable') && (
+          <div className="rounded-2xl border border-dashed border-slate-200 bg-white py-12 text-center">
+            <PackageSearch size={28} className="mx-auto text-slate-300" />
+            <p className="mt-3 text-xs font-semibold text-slate-500">尚未采集商品列表</p>
+            <p className="mt-1 text-[10px] text-slate-400">可点击右上角刷新</p>
+          </div>
+        )}
+        {customerProducts?.collection_status === 'empty' && (
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 text-center text-xs font-semibold text-slate-600">未读取到商品信息</div>
+        )}
+        {visibleProducts.map((product, index) => {
+          const productKey = product.product_id || product.link_url || `${product.title || 'product'}:${index}`;
+          const isSending = sendingProductId === productKey;
+          return (
+            <article key={productKey} className="border border-slate-200 bg-white p-2.5 shadow-sm">
+              <div className="flex gap-3">
+                {product.image_url ? (
+                  <img src={product.image_url} alt="商品" className="h-20 w-20 shrink-0 border border-slate-100 object-cover" referrerPolicy="no-referrer" />
+                ) : (
+                  <div className="flex h-20 w-20 shrink-0 items-center justify-center border border-dashed border-slate-200 bg-slate-50 text-slate-300">
+                    <PackageSearch size={22} />
+                  </div>
+                )}
+                <div className="flex min-w-0 flex-1 flex-col items-start">
+                  <p className="line-clamp-2 text-[11px] font-semibold leading-5 text-slate-700">{product.title || '商品信息暂缺'}</p>
+                  {product.price_label && <p className="mt-1 text-xs font-bold text-rose-500">{product.price_label}</p>}
+                  <button
+                    type="button"
+                    disabled={isSending || !product.product_id}
+                    onClick={() => {
+                      setProductRefreshError('');
+                      setSendingProductId(productKey);
+                      void onSendCustomerProduct(product)
+                        .catch((error) => setProductRefreshError(error instanceof Error ? error.message : '商品发送失败'))
+                        .finally(() => setSendingProductId((current) => current === productKey ? '' : current));
+                    }}
+                    className="mt-auto rounded bg-sky-500 px-1.5 py-0 leading-none text-white transition-colors hover:bg-sky-600 disabled:bg-slate-300"
+                  >
+                    <span className="block origin-center scale-75 text-[15px] font-medium">
+                      {isSending ? '发送中' : '发送商品'}
+                    </span>
+                  </button>
+                </div>
+              </div>
+            </article>
+          );
+        })}
+        {customerProducts?.collection_status === 'success' && productItems.length > productPageSize && (
+          <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500">
+            <button
+              type="button"
+              disabled={normalizedProductPage <= 1}
+              onClick={() => setProductPage((current) => Math.max(1, current - 1))}
+              className="flex items-center gap-1 rounded-md px-2 py-1 font-semibold text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300"
+            >
+              <ChevronLeft size={14} />
+              上一页
+            </button>
+            <span className="font-semibold text-slate-500">
+              {normalizedProductPage} / {productPageCount}
+              <span className="ml-1 font-normal text-slate-400">共 {productItems.length} 件</span>
+            </span>
+            <button
+              type="button"
+              disabled={normalizedProductPage >= productPageCount}
+              onClick={() => setProductPage((current) => Math.min(productPageCount, current + 1))}
+              className="flex items-center gap-1 rounded-md px-2 py-1 font-semibold text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300"
+            >
+              下一页
+              <ChevronRight size={14} />
+            </button>
+          </div>
+        )}
+        {customerProducts?.observed_at && <p className="text-center text-[9px] text-slate-400">最近采集：{new Date(customerProducts.observed_at).toLocaleString('zh-CN')}</p>}
+      </div> : activeView === 'quickReplies' ? (
+        <div className="flex-1 overflow-y-auto p-5">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h2 className="text-sm font-bold text-slate-800">快捷回复</h2>
+              <p className="mt-1 truncate text-[10px] text-slate-400">来自当前拼多多店铺的平台话术</p>
+            </div>
+          </div>
+
+          {!isPinduoduoConversation ? (
+            <div className="rounded-xl border border-dashed border-slate-200 bg-white px-4 py-12 text-center">
+              <MessageSquareText size={28} className="mx-auto text-slate-300" />
+              <p className="mt-3 text-xs font-semibold text-slate-500">当前平台暂不支持快捷回复</p>
+            </div>
+          ) : (
+            <>
+              <div className="divide-y divide-slate-200">
+                <QuickReplySection
+                  title="个人话术"
+                  items={quickReplies.personal}
+                  status={quickReplyStatus.personal}
+                  isOpen={isPersonalRepliesOpen}
+                  onToggle={() => setIsPersonalRepliesOpen((value) => !value)}
+                  onRefresh={() => onRefreshQuickReplies('personal')}
+                  onSelect={onSelectQuickReply}
+                />
+                <QuickReplySection
+                  title="团队话术"
+                  items={quickReplies.team}
+                  status={quickReplyStatus.team}
+                  isOpen={isTeamRepliesOpen}
+                  onToggle={() => setIsTeamRepliesOpen((value) => !value)}
+                  onRefresh={() => onRefreshQuickReplies('team')}
+                  onSelect={onSelectQuickReply}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      ) : activeView === 'status' ? <>
       <div className="p-6 text-center border-b border-brand-border bg-white">
         <div className="w-20 h-20 bg-slate-50 rounded-3xl shadow-sm border border-slate-100 flex items-center justify-center mx-auto mb-4 relative">
           <div className="absolute -top-1 -right-1 w-6 h-6 bg-green-500 border-4 border-white rounded-full" />

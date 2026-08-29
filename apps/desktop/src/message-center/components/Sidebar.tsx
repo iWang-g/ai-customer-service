@@ -11,11 +11,31 @@ import {
   ChevronDown,
   X,
   Trash2,
-  AlertTriangle,
+  Settings,
 } from 'lucide-react';
 import type { Conversation, Shop } from '../types';
 import CustomerAvatar from './CustomerAvatar';
 import ConversationResetModal from './ConversationResetModal';
+
+function normalizeHexColor(value?: string): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const shortMatch = trimmed.match(/^#([0-9a-f]{3})$/i);
+  if (shortMatch) {
+    return `#${shortMatch[1].split('').map((char) => `${char}${char}`).join('')}`;
+  }
+  return /^#[0-9a-f]{6}$/i.test(trimmed) ? trimmed : null;
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const normalized = normalizeHexColor(hex);
+  if (!normalized) return `rgba(71, 85, 105, ${alpha})`;
+  const value = normalized.slice(1);
+  const red = Number.parseInt(value.slice(0, 2), 16);
+  const green = Number.parseInt(value.slice(2, 4), 16);
+  const blue = Number.parseInt(value.slice(4, 6), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+}
 
 interface SidebarProps {
   conversations: Conversation[];
@@ -34,6 +54,8 @@ interface SidebarProps {
   onClearHumanRequired: (conversationId: string) => Promise<void>;
   onClearConversationHistory: (conversationId: string) => Promise<void>;
   onDeleteConversation: (conversationId: string) => Promise<void>;
+  shopNameColors: Record<string, string>;
+  onShopNameColorsChange: (colors: Record<string, string>) => void;
   lang: 'zh' | 'en';
 }
 
@@ -54,9 +76,12 @@ export default function Sidebar({
   onClearHumanRequired,
   onClearConversationHistory,
   onDeleteConversation,
+  shopNameColors,
+  onShopNameColorsChange,
   lang
 }: SidebarProps) {
   const [isShopDropdownOpen, setIsShopDropdownOpen] = useState(false);
+  const [isShopSettingsOpen, setIsShopSettingsOpen] = useState(false);
   const [shopFilterText, setShopFilterText] = useState('');
   const [contextMenu, setContextMenu] = useState<{ conversationId: string; x: number; y: number } | null>(null);
   const [resetConversation, setResetConversation] = useState<Conversation | null>(null);
@@ -72,6 +97,8 @@ export default function Sidebar({
     shop.platformName ? `${shop.platformName} | ${shop.name}` : shop.name
   );
   const currentShopName = currentShop ? shopLabel(currentShop) : '全部门店';
+
+  const colorOptions = ['#475569', '#2563eb', '#0891b2', '#059669', '#7c3aed', '#c2410c', '#be123c'];
 
   const t = {
     zh: {
@@ -140,14 +167,25 @@ export default function Sidebar({
       <div className="p-4 space-y-3 bg-slate-50/50">
         {/* Shop Selector */}
         <div className="relative">
-          <button 
-            onClick={() => setIsShopDropdownOpen(!isShopDropdownOpen)}
-            className="w-full flex items-center justify-between px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-700 hover:border-brand-active transition-all"
-            id="shop-selector-btn"
-          >
-            <span className="min-w-0 truncate" title={currentShopName}>{currentShopName}</span>
-            <ChevronDown size={14} className={`transition-transform ${isShopDropdownOpen ? 'rotate-180' : ''}`} />
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setIsShopDropdownOpen(!isShopDropdownOpen)}
+              className="min-w-0 flex-1 flex items-center justify-between px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-700 hover:border-brand-active transition-all"
+              id="shop-selector-btn"
+            >
+              <span className="min-w-0 truncate" title={currentShopName}>{currentShopName}</span>
+              <ChevronDown size={14} className={`shrink-0 transition-transform ${isShopDropdownOpen ? 'rotate-180' : ''}`} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsShopSettingsOpen(true)}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition-colors hover:border-brand-active hover:text-brand-active"
+              title="店铺会话背景颜色"
+              aria-label="店铺会话背景颜色设置"
+            >
+              <Settings size={15} />
+            </button>
+          </div>
           
           {isShopDropdownOpen && (
             <>
@@ -214,65 +252,68 @@ export default function Sidebar({
           <div className="py-16 text-center text-xs font-semibold text-slate-400">正在从服务端加载会话...</div>
         ) : error && conversations.length === 0 ? (
           <div className="m-3 p-4 rounded-xl bg-rose-50 border border-rose-100 text-xs font-semibold text-rose-600 leading-relaxed">{error}</div>
-        ) : conversations.length > 0 ? conversations.map((conv) => (
-          <motion.button
-            key={conv.id}
-            onClick={() => onSelect(conv.id)}
-            onContextMenu={(event) => {
-              if (!conv.humanRequired && conv.platform !== 'pinduoduo') return;
-              event.preventDefault();
-              setContextMenu({ conversationId: conv.id, x: event.clientX, y: event.clientY });
-            }}
-            className={`w-full flex items-start gap-3 p-4 rounded-2xl transition-all text-left ${
-              selectedId === conv.id 
-                ? 'bg-sky-50 shadow-sm border border-sky-100' 
-                : 'hover:bg-slate-50 border border-transparent'
-            }`}
-          >
-            <CustomerAvatar name={conv.userName} />
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center justify-between mb-1">
-                <div className="flex items-center gap-2 truncate">
-                  <span className="font-bold text-slate-800 truncate text-[15px]">{conv.userName}</span>
-                  <span
-                    className="min-w-0 max-w-[142px] truncate px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px] font-bold"
-                    title={`${conv.platformName} | ${conv.shopName}`}
-                  >
-                    {conv.platformName} | {conv.shopName}
-                  </span>
+        ) : conversations.length > 0 ? conversations.map((conv) => {
+          const isSelected = selectedId === conv.id;
+          const shopConversationColor = normalizeHexColor(shopNameColors[conv.shopId]);
+          const conversationTintStyle = shopConversationColor && !isSelected
+            ? {
+                backgroundImage: `radial-gradient(circle at center, ${hexToRgba(shopConversationColor, 0.08)} 0%, ${hexToRgba(shopConversationColor, 0.04)} 48%, rgba(255, 255, 255, 0) 82%)`,
+                borderColor: 'transparent',
+              }
+            : undefined;
+          return (
+            <motion.button
+              key={conv.id}
+              onClick={() => onSelect(conv.id)}
+              onContextMenu={(event) => {
+                if (!conv.humanRequired && conv.platform !== 'pinduoduo') return;
+                event.preventDefault();
+                setContextMenu({ conversationId: conv.id, x: event.clientX, y: event.clientY });
+              }}
+              className={`relative w-full overflow-hidden flex items-start gap-3 p-4 rounded-2xl border transition-all text-left ${
+                isSelected
+                  ? 'bg-sky-50 shadow-sm border-sky-100'
+                  : 'border-transparent hover:bg-slate-50'
+              }`}
+              style={conversationTintStyle}
+            >
+              <CustomerAvatar name={conv.userName} src={conv.avatarUrl} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center justify-between mb-1">
+                  <div className="flex items-center gap-2 truncate">
+                    <span className="font-bold text-slate-800 truncate text-[15px]">{conv.userName}</span>
+                    <span
+                      className="min-w-0 max-w-[142px] truncate px-1.5 py-0.5 bg-white/65 rounded text-[10px] font-bold text-slate-500"
+                      title={`${conv.platformName} | ${conv.shopName}`}
+                    >
+                      <span>{conv.platformName} | </span>
+                      <span>{conv.shopName}</span>
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-slate-400 font-medium whitespace-nowrap ml-1">{conv.time}</span>
                 </div>
-                <span className="text-[11px] text-slate-400 font-medium whitespace-nowrap ml-1">{conv.time}</span>
+                <p className="text-sm text-slate-500 truncate leading-relaxed">
+                  {conv.lastMessage}
+                </p>
+                {conv.humanRequired && (
+                  <span
+                    className="mt-2 inline-flex items-center rounded-md bg-sky-50 px-2 py-0.5 text-[10px] font-bold text-green-600 ring-1 ring-inset ring-sky-200"
+                    title={conv.humanRequiredWord ? `命中敏感词：${conv.humanRequiredWord}` : '该会话等待人工处理'}
+                  >
+                    待人工处理
+                  </span>
+                )}
               </div>
-              <p className="text-sm text-slate-500 truncate leading-relaxed">
-                {conv.lastMessage}
-              </p>
-              {conv.humanRequired && (
-                <span
-                  className="mt-2 inline-flex items-center rounded-md bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700 ring-1 ring-inset ring-amber-200"
-                  title={conv.humanRequiredWord ? `命中敏感词：${conv.humanRequiredWord}` : '该会话等待人工处理'}
-                >
-                  待人工处理
-                </span>
+              {conv.awaitingReply && (
+                <div
+                  className="w-2 h-2 rounded-full bg-brand-active mt-3 flex-shrink-0 shadow-[0_0_8px_rgba(14,165,233,0.5)]"
+                  title={lang === 'zh' ? '客户消息待回复' : 'Customer message awaiting reply'}
+                  aria-label={lang === 'zh' ? '客户消息待回复' : 'Customer message awaiting reply'}
+                />
               )}
-            </div>
-            {conv.syncIssue?.requiresAttention && (
-              <span
-                className="mt-2 shrink-0 text-amber-500"
-                title="消息序列同步异常"
-                aria-label="消息序列同步异常"
-              >
-                <AlertTriangle size={15} />
-              </span>
-            )}
-            {conv.awaitingReply && (
-              <div
-                className="w-2 h-2 rounded-full bg-brand-active mt-3 flex-shrink-0 shadow-[0_0_8px_rgba(14,165,233,0.5)]"
-                title={lang === 'zh' ? '客户消息待回复' : 'Customer message awaiting reply'}
-                aria-label={lang === 'zh' ? '客户消息待回复' : 'Customer message awaiting reply'}
-              />
-            )}
-          </motion.button>
-        )) : searchTerm.trim() ? (
+            </motion.button>
+          );
+        }) : searchTerm.trim() ? (
           <div className="flex-1 px-6 py-16 text-center" id="sidebar-search-empty-state">
             <Search size={28} className="mx-auto text-slate-300" />
             <h3 className="mt-4 text-[15px] font-bold text-slate-700">{t.searchEmptyTitle}</h3>
@@ -360,6 +401,89 @@ export default function Sidebar({
         onClose={() => setResetConversation(null)}
         onConfirm={conversationAction === 'delete' ? onDeleteConversation : onClearConversationHistory}
       />
+      {isShopSettingsOpen && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-900/30 p-4">
+          <div className="w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+              <div>
+                <h2 className="text-sm font-bold text-slate-800">店铺会话背景颜色</h2>
+                <p className="mt-1 text-[11px] text-slate-400">用于区分不同店铺的会话项背景，设置会保存在本机。</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsShopSettingsOpen(false)}
+                className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                aria-label="关闭店铺会话背景颜色设置"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto p-4">
+              {shops.filter((shop) => shop.id !== 'all').map((shop) => {
+                const configuredColor = normalizeHexColor(shopNameColors[shop.id]);
+                const currentColor = configuredColor || '#475569';
+                return (
+                  <div key={shop.id} className="flex items-center gap-3 border-b border-slate-100 py-3 last:border-b-0">
+                    {shop.logoUrl ? (
+                      <img src={shop.logoUrl} alt="" className="h-8 w-8 shrink-0 rounded-full object-cover" referrerPolicy="no-referrer" />
+                    ) : (
+                      <div className="h-8 w-8 shrink-0 rounded-full bg-slate-100" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-xs font-bold text-slate-700">{shopLabel(shop)}</p>
+                      <div
+                        className="mt-1 h-5 rounded-md border px-2 text-[10px] font-medium leading-5 text-slate-500"
+                        style={configuredColor
+                          ? {
+                              backgroundImage: `radial-gradient(circle at center, ${hexToRgba(configuredColor, 0.08)} 0%, ${hexToRgba(configuredColor, 0.04)} 48%, rgba(255, 255, 255, 0) 82%)`,
+                              borderColor: 'transparent',
+                            }
+                          : undefined}
+                      >
+                        {configuredColor ? '会话背景预览' : '默认样式'}
+                      </div>
+                      <div className="mt-2 flex items-center gap-1.5">
+                        {colorOptions.map((color) => (
+                          <button
+                            key={color}
+                            type="button"
+                            onClick={() => onShopNameColorsChange({ ...shopNameColors, [shop.id]: color })}
+                            className={`h-5 w-5 rounded-full border ${configuredColor === color ? 'border-slate-900 ring-2 ring-slate-200' : 'border-white'}`}
+                            style={{ backgroundColor: color }}
+                            aria-label={`选择颜色 ${color}`}
+                            title={color}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                    <input
+                      type="color"
+                      value={currentColor}
+                      onChange={(event) => onShopNameColorsChange({ ...shopNameColors, [shop.id]: event.target.value })}
+                      className="h-8 w-8 shrink-0 rounded border border-slate-200 bg-white p-1"
+                      aria-label={`${shop.name} 自定义颜色`}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = { ...shopNameColors };
+                        delete next[shop.id];
+                        onShopNameColorsChange(next);
+                      }}
+                      className="shrink-0 rounded-lg px-2 py-1 text-[11px] font-semibold text-slate-400 hover:bg-slate-50 hover:text-slate-600"
+                    >
+                      默认
+                    </button>
+                  </div>
+                );
+              })}
+              {shops.filter((shop) => shop.id !== 'all').length === 0 && (
+                <div className="py-10 text-center text-xs font-semibold text-slate-400">暂无可设置的店铺</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

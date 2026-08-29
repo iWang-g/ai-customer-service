@@ -36,8 +36,13 @@ export interface ApiConversation {
   platform_code: string;
   platform_name: string | null;
   shop_name: string | null;
+  shop_logo_url: string | null;
+  shop_service_username: string | null;
+  shop_is_mall_owner: boolean;
+  latest_customer_message_at: string | null;
   external_conversation_id: string | null;
   customer_name: string | null;
+  avatar_url: string | null;
   title: string | null;
   latest_message_text: string | null;
   latest_message_at: string | null;
@@ -113,6 +118,7 @@ export interface ApiMessage {
 export interface CustomerOrder {
   id: string;
   platform_order_id: string;
+  goods_id: string;
   status: string;
   raw_status: string;
   products_json: Array<Record<string, unknown>>;
@@ -137,11 +143,46 @@ export interface CustomerOrdersResponse {
   orders: CustomerOrder[];
   outreach: Array<{
     strategy_type: string;
+    goods_id: string;
     status: string;
     due_at: string;
     cancel_reason: string | null;
     completed_at: string | null;
   }>;
+}
+
+export interface CustomerProduct {
+  id: string;
+  goods_id: string;
+  product_id: string | null;
+  platform_product_id?: string;
+  title: string | null;
+  image_url: string | null;
+  link_url: string | null;
+  price: number | null;
+  price_label: string | null;
+  quantity: number | null;
+  sold_quantity: number | null;
+  sold_quantity_30d: number | null;
+  source: string | null;
+  raw_payload: Record<string, unknown>;
+  last_observed_at: string;
+}
+
+export interface CustomerProductsResponse {
+  conversation_id: string;
+  status: 'collected' | 'failed';
+  method?: 'api_recommend_goods' | null;
+  conversation_key: string | null;
+  customer_name: string | null;
+  collection_status: 'not_collected' | 'success' | 'empty' | 'unavailable';
+  collection_error: string | null;
+  observed_at: string | null;
+  customer_key: string;
+  total_count: number;
+  has_more: boolean;
+  products: CustomerProduct[];
+  error?: string | null;
 }
 
 export interface AiModel {
@@ -362,6 +403,34 @@ export interface KnowledgeDocumentChunkPage {
   pages: number;
 }
 
+export interface ProductDocumentSearchResult {
+  source_id: string;
+  chunk_id: string;
+  context_chunk_ids: string[];
+  base_id: string;
+  source_title: string;
+  title_path: string;
+  chunk_type: string;
+  snippet: string;
+  score: number;
+}
+
+export interface ProductDocumentSearchMetadata {
+  mode: string;
+  candidate_count: number;
+  fts_candidate_count?: number;
+  vector_candidate_count?: number;
+  embedding_enabled?: boolean;
+  embedding_model?: string;
+  count: number;
+  chunk_strategy_version?: string;
+}
+
+export interface ProductDocumentSearchResponse {
+  results: ProductDocumentSearchResult[];
+  metadata: ProductDocumentSearchMetadata;
+}
+
 export interface QaEntry {
   id: string;
   base_id: string;
@@ -408,6 +477,65 @@ export interface QaEntryPage {
   pages: number;
 }
 
+export interface PlatformPhraseRecord {
+  source_id: string;
+  category: string;
+  quick_key: string;
+  content: string;
+  images: Array<{ url: string; width?: number | null; height?: number | null; image_size?: number | null }>;
+}
+
+export interface PlatformQuickReply extends PlatformPhraseRecord {
+  source: 'personal' | 'team';
+}
+
+export interface PlatformPhraseQaDraft {
+  source_id: string;
+  category: string;
+  question: string;
+  keywords: string[];
+  answer: string;
+  image_url: string;
+  weight: number;
+  enabled: boolean;
+}
+
+export interface PlatformPhraseNormalizeResponse {
+  items: PlatformPhraseQaDraft[];
+  provider: string;
+  used_fallback: boolean;
+  error: string | null;
+  total_records?: number;
+  generated_count?: number;
+  failed_count?: number;
+  batch_count?: number;
+  completed_batches?: number;
+}
+
+export interface PlatformPhraseSnapshot {
+  id: string;
+  platform_account_id: string;
+  local_account_id: string | null;
+  platform: 'pinduoduo';
+  source: 'personal' | 'team';
+  records: PlatformPhraseRecord[];
+  record_count: number;
+  raw_count: number;
+  content_hash: string;
+  status: string;
+  error: string | null;
+  collected_at: string;
+  updated_at: string;
+}
+
+export interface PlatformPhraseNormalizeTask extends PlatformPhraseNormalizeResponse {
+  task_id: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  cancel_requested: boolean;
+  current_batch: number;
+  message: string;
+}
+
 export interface RobotPlatformScope {
   platform_code: string;
   platform_account_id: string | null;
@@ -449,6 +577,14 @@ export interface PlatformAccount {
   local_account_id: string | null;
   login_status: string;
   is_active: boolean;
+  metadata_json: Record<string, unknown>;
+}
+
+export interface ShopProductSummary {
+  shop_intro: string;
+  on_sale_products: string;
+  generated_at?: string | null;
+  edited_at?: string | null;
 }
 
 interface PageResponse<T> {
@@ -459,12 +595,15 @@ interface PageResponse<T> {
 export interface RealtimeEvent {
   type: string;
   message?: ApiMessage;
+  follow_up_message?: ApiMessage | null;
+  follow_up_messages?: ApiMessage[];
   task?: {
     id: string;
     conversation_id: string | null;
     message_id: string | null;
     task_type: string;
     status: string;
+    payload_json: Record<string, unknown>;
     result_json: Record<string, unknown>;
     error_message: string | null;
   };
@@ -575,7 +714,7 @@ async function apiRequest<T>(
     throw new Error('无法连接业务服务，请确认后端已在 8001 端口启动');
   }
 
-  if (response.status === 401 && requireAuth && retryAfterRefresh) {
+  if ((response.status === 401 || response.status === 403) && requireAuth && retryAfterRefresh) {
     const refreshed = await refreshSession();
     if (refreshed) return apiRequest<T>(path, init, true, false);
     if (getStoredSession()) throw new Error('服务暂时无法刷新登录状态，请稍后重试');
@@ -601,7 +740,7 @@ async function knowledgeRequest<T>(
   } catch {
     throw new Error('无法连接知识库服务，请确认 8010 端口已启动');
   }
-  if (response.status === 401 && retryAfterRefresh) {
+  if ((response.status === 401 || response.status === 403) && retryAfterRefresh) {
     const refreshed = await refreshSession();
     if (refreshed) return knowledgeRequest<T>(path, init, false);
   }
@@ -781,6 +920,77 @@ export function createQaEntry(baseId: string, input: QaEntryInput): Promise<QaEn
   });
 }
 
+export function normalizePlatformPhrases(input: {
+  platform: 'pinduoduo';
+  source: 'personal' | 'team';
+  existing_categories: string[];
+  records: PlatformPhraseRecord[];
+}): Promise<PlatformPhraseNormalizeResponse> {
+  return apiRequest<PlatformPhraseNormalizeResponse>('/platform-phrases/normalize', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function getPlatformPhraseCache(input: {
+  source: 'personal' | 'team';
+  platformAccountId?: string | null;
+  localAccountId?: string | null;
+}): Promise<{ item: PlatformPhraseSnapshot | null }> {
+  const query = new URLSearchParams({ source: input.source });
+  if (input.platformAccountId) query.set('platform_account_id', input.platformAccountId);
+  if (input.localAccountId) query.set('local_account_id', input.localAccountId);
+  return apiRequest<{ item: PlatformPhraseSnapshot | null }>(`/platform-phrases/cache?${query}`);
+}
+
+export function savePlatformPhraseCache(input: {
+  platform: 'pinduoduo';
+  source: 'personal' | 'team';
+  platformAccountId?: string | null;
+  localAccountId?: string | null;
+  records: PlatformPhraseRecord[];
+  rawCount?: number;
+  status?: 'collected' | 'failed';
+  error?: string | null;
+}): Promise<PlatformPhraseSnapshot> {
+  return apiRequest<PlatformPhraseSnapshot>('/platform-phrases/cache', {
+    method: 'PUT',
+    body: JSON.stringify({
+      platform: input.platform,
+      source: input.source,
+      platform_account_id: input.platformAccountId || null,
+      local_account_id: input.localAccountId || null,
+      records: input.records,
+      raw_count: input.rawCount ?? input.records.length,
+      status: input.status || 'collected',
+      error: input.error || null,
+    }),
+  });
+}
+
+export function createPlatformPhraseNormalizeTask(input: {
+  platform: 'pinduoduo';
+  source: 'personal' | 'team';
+  existing_categories: string[];
+  records: PlatformPhraseRecord[];
+}): Promise<PlatformPhraseNormalizeTask> {
+  return apiRequest<PlatformPhraseNormalizeTask>('/platform-phrases/normalize-tasks', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function getPlatformPhraseNormalizeTask(taskId: string): Promise<PlatformPhraseNormalizeTask> {
+  return apiRequest<PlatformPhraseNormalizeTask>(`/platform-phrases/normalize-tasks/${encodeURIComponent(taskId)}`);
+}
+
+export function cancelPlatformPhraseNormalizeTask(taskId: string): Promise<PlatformPhraseNormalizeTask> {
+  return apiRequest<PlatformPhraseNormalizeTask>(
+    `/platform-phrases/normalize-tasks/${encodeURIComponent(taskId)}/cancel`,
+    { method: 'POST' },
+  );
+}
+
 export function updateQaEntry(entryId: string, input: QaEntryInput): Promise<QaEntry> {
   return knowledgeRequest<QaEntry>(`/qa-entries/${encodeURIComponent(entryId)}`, {
     method: 'PATCH',
@@ -806,6 +1016,13 @@ export function getQaImageUrl(imageUrl: string): string {
   }
   if (/^(?:data:|blob:)/i.test(imageUrl)) return imageUrl;
   return `${KNOWLEDGE_BASE_URL}${imageUrl.startsWith('/') ? '' : '/'}${imageUrl}`;
+}
+
+export function getBusinessAssetUrl(assetUrl: string): string {
+  if (!assetUrl) return assetUrl;
+  if (/^(?:https?:|data:|blob:)/i.test(assetUrl)) return assetUrl;
+  const apiRoot = API_BASE_URL.replace(/\/api\/v1$/, '');
+  return `${apiRoot}${assetUrl.startsWith('/') ? '' : '/'}${assetUrl}`;
 }
 
 export async function loadQaImageUrl(imageUrl: string): Promise<string> {
@@ -860,6 +1077,21 @@ export function reprocessKnowledgeDocument(documentId: string): Promise<Knowledg
   });
 }
 
+export function searchProductDocuments(input: {
+  query: string;
+  baseIds: string[];
+  topK?: number;
+}): Promise<ProductDocumentSearchResponse> {
+  return knowledgeRequest<ProductDocumentSearchResponse>('/documents/search', {
+    method: 'POST',
+    body: JSON.stringify({
+      query: input.query,
+      base_ids: input.baseIds,
+      top_k: input.topK ?? 5,
+    }),
+  });
+}
+
 export function listRobots(): Promise<ApiRobot[]> {
   return apiRequest<ApiRobot[]>('/robots');
 }
@@ -883,6 +1115,32 @@ export function listPlatformAccounts(): Promise<{ items: PlatformAccount[] }> {
   return apiRequest<{ items: PlatformAccount[] }>('/platform-accounts');
 }
 
+export function updatePlatformAccount(
+  accountId: string,
+  input: { metadata_json?: Record<string, unknown> },
+): Promise<PlatformAccount> {
+  return apiRequest<PlatformAccount>(`/platform-accounts/${encodeURIComponent(accountId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
+export function generatePlatformAccountShopSummary(accountId: string): Promise<PlatformAccount> {
+  return apiRequest<PlatformAccount>(`/platform-accounts/${encodeURIComponent(accountId)}/shop-summary/generate`, {
+    method: 'POST',
+  });
+}
+
+export function updatePlatformAccountShopSummary(
+  accountId: string,
+  input: { shop_intro: string; on_sale_products: string },
+): Promise<PlatformAccount> {
+  return apiRequest<PlatformAccount>(`/platform-accounts/${encodeURIComponent(accountId)}/shop-summary`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
 export function listConversations(): Promise<PageResponse<ApiConversation>> {
   return apiRequest<PageResponse<ApiConversation>>('/conversations?limit=100');
 }
@@ -893,9 +1151,22 @@ export function getCustomerOrders(conversationId: string): Promise<CustomerOrder
   );
 }
 
+export function getCustomerProducts(conversationId: string): Promise<CustomerProductsResponse> {
+  return apiRequest<CustomerProductsResponse>(
+    `/conversations/${encodeURIComponent(conversationId)}/products`,
+  );
+}
+
 export function clearConversationHumanRequired(conversationId: string): Promise<{ conversation: ApiConversation }> {
   return apiRequest<{ conversation: ApiConversation }>(
     `/conversations/${encodeURIComponent(conversationId)}/clear-human-required`,
+    { method: 'POST' },
+  );
+}
+
+export function clearConversationAwaitingReply(conversationId: string): Promise<{ conversation: ApiConversation }> {
+  return apiRequest<{ conversation: ApiConversation }>(
+    `/conversations/${encodeURIComponent(conversationId)}/clear-awaiting-reply`,
     { method: 'POST' },
   );
 }
@@ -969,6 +1240,7 @@ export function recordSentMessage(
   platformMessageId?: string | null,
   clientMessageId?: string | null,
   mediaType: 'text' | 'image' = 'text',
+  options: { platformSentAt?: string | null; rawPayload?: Record<string, unknown> | null } = {},
 ): Promise<{ message: ApiMessage }> {
   return apiRequest<{ message: ApiMessage }>('/messages/record-sent', {
     method: 'POST',
@@ -978,6 +1250,8 @@ export function recordSentMessage(
       platform_message_id: platformMessageId || null,
       client_message_id: clientMessageId || null,
       media_type: mediaType,
+      platform_sent_at: options.platformSentAt || null,
+      raw_payload: options.rawPayload || null,
     }),
   });
 }

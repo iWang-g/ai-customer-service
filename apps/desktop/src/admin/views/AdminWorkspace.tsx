@@ -48,6 +48,7 @@ import {
   CheckCircle2
 } from 'lucide-react';
 import ImagePreview from '../../shared/components/ImagePreview';
+import AppSelect from '../../shared/components/AppSelect';
 import { getDashboardAnalytics } from '../../shared/api/client';
 import type { DashboardAnalytics, TestReplyResult } from '../../shared/api/client';
 import type { EmailTemplateInput } from '../../shared/api/client';
@@ -74,8 +75,12 @@ function cn(...inputs: ClassValue[]) {
 const DEFAULT_CONTEXT_LENGTH = 10;
 const LEGACY_DEFAULT_ADVANCED_INSTRUCTION = '善用颜文字';
 const DEFAULT_SENSITIVE_WORD_REPLY_TEXT = '亲亲，已收到您的消息，正在为您核实，请稍等~';
+const DEFAULT_ENTRY_WELCOME_TEXT = '亲亲，我是本店小助理，发送“转人工”可为您转接客服。';
 const DEFAULT_ORDER_FOLLOW_UP_TEXT = '亲亲，现在下单可以享受九五折优惠哦~';
 const DEFAULT_POST_RECEIPT_CARE_TEXT = '亲亲，商品还满意吗？欢迎反馈真实体验，可参与平台评价领奖励活动哦~';
+const DEFAULT_PRODUCT_RECOMMEND_TEXT = '可以看下我们这些款式哦亲亲';
+const DEFAULT_PRODUCT_CARD_ACK_TEXT = '亲亲，关于这款商品有什么想要了解的吗';
+type HumanHandoffStrategy = 'mark_only' | 'transfer_conversation';
 const PRODUCT_DOCUMENT_EXTENSIONS = new Set(['txt', 'md', 'csv', 'json', 'html', 'pdf', 'docx', 'xlsx', 'xlsm']);
 
 const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat('sv-SE', {
@@ -100,6 +105,14 @@ function formatResponseTime(seconds: number | null): string {
   if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`;
   const minutes = seconds / 60;
   return `${minutes.toFixed(minutes < 10 ? 1 : 0)} 分钟`;
+}
+
+function formatProductSearchMode(mode: string | undefined): string {
+  if (mode === 'hybrid') return '混合召回';
+  if (mode === 'vector') return '语义召回';
+  if (mode === 'fts5_bm25') return '关键词召回';
+  if (mode === 'keyword') return '关键词兜底';
+  return mode || '--';
 }
 
 interface AdminWorkspaceProps {
@@ -153,6 +166,24 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     isLoadingQA,
     isSavingQA,
     qaNotice,
+    isPlatformPhraseImportOpen,
+    platformPhraseAccounts,
+    platformPhraseAccountId,
+    setPlatformPhraseAccountId,
+    platformPhraseSource,
+    setPlatformPhraseSource,
+    platformPhraseDrafts,
+    selectedPlatformPhraseIds,
+    isLoadingPlatformPhrases,
+    isImportingPlatformPhrases,
+    platformPhraseNotice,
+    platformPhraseProgress,
+    openPlatformPhraseImport,
+    closePlatformPhraseImport,
+    loadPlatformPhrases,
+    cancelPlatformPhraseGeneration,
+    togglePlatformPhraseDraft,
+    importPlatformPhraseDrafts,
     isSidebarCollapsed,
     setIsSidebarCollapsed,
     expandedMenus,
@@ -182,6 +213,11 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     isLoadingProductDocumentDetail,
     isReprocessingProductDocument,
     productDocumentDetailNotice,
+    productSearchQuery,
+    setProductSearchQuery,
+    productSearchResult,
+    isTestingProductSearch,
+    productSearchNotice,
     toneBases,
     isLoadingToneKB,
     isSavingToneKB,
@@ -209,6 +245,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     handleImportProductDocument,
     handleDeleteProductDocument,
     refreshProductDocuments,
+    handleTestProductSearch,
     openProductDocumentDetail,
     closeProductDocumentDetail,
     handleReprocessProductDocument,
@@ -324,9 +361,12 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [inboundSensitiveWords, setInboundSensitiveWords] = useState<string[]>([]);
   const [sensitiveWordDraft, setSensitiveWordDraft] = useState('');
   const [sensitiveWordReplyText, setSensitiveWordReplyText] = useState(DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
+  const [entryWelcomeEnabled, setEntryWelcomeEnabled] = useState(false);
+  const [entryWelcomeText, setEntryWelcomeText] = useState(DEFAULT_ENTRY_WELCOME_TEXT);
   const [prohibitedContentInstruction, setProhibitedContentInstruction] = useState('');
   const [fallbackReplyText, setFallbackReplyText] = useState('您的问题我将为您接入专业产品客服，请稍后');
   const [fallbackMarkHumanRequired, setFallbackMarkHumanRequired] = useState(false);
+  const [humanHandoffStrategy, setHumanHandoffStrategy] = useState<HumanHandoffStrategy>('mark_only');
   const [timeoutEnabled, setTimeoutEnabled] = useState(false);
   const [timeoutSeconds, setTimeoutSeconds] = useState(10);
   const [timeoutReplyText, setTimeoutReplyText] = useState('专项客服正在赶来的路上请稍等~~');
@@ -336,6 +376,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [postReceiptCareEnabled, setPostReceiptCareEnabled] = useState(false);
   const [postReceiptCareText, setPostReceiptCareText] = useState(DEFAULT_POST_RECEIPT_CARE_TEXT);
   const [postReceiptCareMarkHumanRequired, setPostReceiptCareMarkHumanRequired] = useState(false);
+  const [productRecommendEnabled, setProductRecommendEnabled] = useState(false);
+  const [productRecommendText, setProductRecommendText] = useState(DEFAULT_PRODUCT_RECOMMEND_TEXT);
+  const [productCardAckText, setProductCardAckText] = useState(DEFAULT_PRODUCT_CARD_ACK_TEXT);
   const [selectedToneKB, setSelectedToneKB] = useState('');
   const platformOptions = ['拼多多'];
   const platformCodeByLabel: Record<string, string> = {
@@ -410,6 +453,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       setInboundSensitiveWords([]);
       setSensitiveWordDraft('');
       setSensitiveWordReplyText(DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
+      setEntryWelcomeEnabled(false);
+      setEntryWelcomeText(DEFAULT_ENTRY_WELCOME_TEXT);
       setProhibitedContentInstruction('');
       setFallbackReplyText('您的问题我将为您接入专业产品客服，请稍后');
       setFallbackMarkHumanRequired(false);
@@ -422,6 +467,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       setPostReceiptCareEnabled(false);
       setPostReceiptCareText(DEFAULT_POST_RECEIPT_CARE_TEXT);
       setPostReceiptCareMarkHumanRequired(false);
+      setProductRecommendEnabled(false);
+      setProductRecommendText(DEFAULT_PRODUCT_RECOMMEND_TEXT);
+      setProductCardAckText(DEFAULT_PRODUCT_CARD_ACK_TEXT);
       setSelectedQaKBIds([]);
       setSelectedProductKBIds([]);
       setSelectedToneKB('');
@@ -456,6 +504,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setSensitiveWordReplyText(typeof config.sensitive_word_reply_text === 'string' && config.sensitive_word_reply_text.trim()
       ? config.sensitive_word_reply_text
       : DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
+    setEntryWelcomeEnabled(config.entry_welcome_enabled === true);
+    setEntryWelcomeText(typeof config.entry_welcome_text === 'string' && config.entry_welcome_text.trim()
+      ? config.entry_welcome_text
+      : DEFAULT_ENTRY_WELCOME_TEXT);
     setProhibitedContentInstruction(typeof config.prohibited_content_instruction === 'string'
       ? config.prohibited_content_instruction
       : '');
@@ -467,6 +519,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         ? config.fallback_mark_human_required
         : config.fallback_transfer_to_human === true,
     );
+    setHumanHandoffStrategy(config.human_handoff_strategy === 'transfer_conversation' ? 'transfer_conversation' : 'mark_only');
     setTimeoutEnabled(config.timeout_enabled === true);
     setTimeoutSeconds(typeof config.timeout_seconds === 'number' ? Math.max(1, Math.min(60, Math.round(config.timeout_seconds))) : 10);
     setTimeoutReplyText(typeof config.timeout_reply_text === 'string' && config.timeout_reply_text.trim()
@@ -482,6 +535,13 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
       ? config.post_receipt_care_text
       : DEFAULT_POST_RECEIPT_CARE_TEXT);
     setPostReceiptCareMarkHumanRequired(config.post_receipt_care_mark_human_required === true);
+    setProductRecommendEnabled(config.product_recommend_enabled === true);
+    setProductRecommendText(typeof config.product_recommend_text === 'string' && config.product_recommend_text.trim()
+      ? config.product_recommend_text
+      : DEFAULT_PRODUCT_RECOMMEND_TEXT);
+    setProductCardAckText(typeof config.product_card_ack_text === 'string' && config.product_card_ack_text.trim()
+      ? config.product_card_ack_text
+      : DEFAULT_PRODUCT_CARD_ACK_TEXT);
     setSelectedQaKBIds(selectedRobot.api.qa_knowledge_base_ids);
     setSelectedProductKBIds(selectedRobot.api.product_knowledge_base_ids);
     setSelectedToneKB(selectedRobot.api.tone_knowledge_base_id || '');
@@ -597,8 +657,11 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         inbound_sensitive_words: inboundSensitiveWords,
         sensitive_word_action: 'mark_human',
         sensitive_word_reply_text: sensitiveWordReplyText.trim() || DEFAULT_SENSITIVE_WORD_REPLY_TEXT,
+        entry_welcome_enabled: entryWelcomeEnabled,
+        entry_welcome_text: entryWelcomeText.trim() || DEFAULT_ENTRY_WELCOME_TEXT,
         fallback_reply_text: fallbackReplyText.trim(),
         fallback_mark_human_required: fallbackMarkHumanRequired,
+        human_handoff_strategy: humanHandoffStrategy,
         timeout_enabled: timeoutEnabled,
         timeout_seconds: timeoutSeconds,
         timeout_reply_text: timeoutReplyText.trim(),
@@ -609,6 +672,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         post_receipt_care_text: postReceiptCareText.trim() || DEFAULT_POST_RECEIPT_CARE_TEXT,
         post_receipt_care_max_order_age_days: 30,
         post_receipt_care_mark_human_required: postReceiptCareMarkHumanRequired,
+        product_recommend_enabled: productRecommendEnabled,
+        product_recommend_text: productRecommendText.trim() || DEFAULT_PRODUCT_RECOMMEND_TEXT,
+        product_card_ack_text: productCardAckText.trim() || DEFAULT_PRODUCT_CARD_ACK_TEXT,
       },
       qa_knowledge_base_ids: selectedQaKBIds,
       product_knowledge_base_ids: selectedProductKBIds,
@@ -1349,6 +1415,29 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <input type="checkbox" checked={allowRobotAutoReply} onChange={(event) => setAllowRobotAutoReply(event.target.checked)} className="h-4 w-4 accent-indigo-600" />
                             <span className="text-sm font-bold text-slate-700">启用 AI 自动回复</span>
                           </label>
+                          <div className="space-y-3 rounded-xl border border-slate-100 bg-slate-50 p-4">
+                            <div className="flex items-center justify-between gap-4">
+                              <div>
+                                <h4 className="text-sm font-bold text-slate-800">进店欢迎语</h4>
+                                <p className="mt-1 text-xs text-slate-400">新客户首次进入会话时，先自动发送一条欢迎话术。</p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setEntryWelcomeEnabled((value) => !value)}
+                                className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", entryWelcomeEnabled ? "bg-indigo-500" : "bg-slate-300")}
+                                title="启用进店欢迎语"
+                              >
+                                <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm", entryWelcomeEnabled ? "right-1" : "left-1")}></div>
+                              </button>
+                            </div>
+                            <textarea
+                              value={entryWelcomeText}
+                              onChange={(event) => setEntryWelcomeText(event.target.value)}
+                              maxLength={1000}
+                              className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
+                              placeholder={DEFAULT_ENTRY_WELCOME_TEXT}
+                            />
+                          </div>
                         </div>
                       </div>
                       {robotNotice && <div className="px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-600">{robotNotice}</div>}
@@ -1627,7 +1716,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
                               <div className="p-4 bg-orange-50/80 rounded-xl border border-orange-100/50 flex items-start gap-3">
                                 <Info className="w-5 h-5 text-orange-500 shrink-0 mt-0.5" />
-                                <p className="text-sm text-orange-800">客户消息命中敏感词后，立即标记为待人工处理，不再进入 QA 匹配或 AI 回复流程。</p>
+                                <p className="text-sm text-orange-800">客户消息命中敏感词后，会标记为待人工处理并发送对应话术；同一会话中其它可正常回答的消息仍会继续自动回复。</p>
                               </div>
                             
                             <div className="space-y-4">
@@ -1669,12 +1758,12 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 placeholder={DEFAULT_SENSITIVE_WORD_REPLY_TEXT}
                                 className="w-full h-24 px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all resize-none"
                               />
-                              <p className="text-xs text-slate-400">为空时使用系统默认转人工安抚话术；命中敏感词和已待人工会话的后续入站回复都会使用该话术。</p>
+                              <p className="text-xs text-slate-400">为空时使用系统默认敏感词安抚话术；仅命中敏感词的消息使用该话术，其它可正常回答的消息继续按知识库或 AI 回复。</p>
                             </div>
 
                             <div className="pt-2">
                               <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
-                                <span className="text-sm font-bold text-slate-700">命中后标记待人工处理，并停止机器人处理该会话</span>
+                                <span className="text-sm font-bold text-slate-700">命中后标记待人工处理，但不阻塞该会话其它消息自动回复</span>
                                 <div className="w-12 h-6 bg-indigo-500 rounded-full relative shadow-inner" title="当前版本固定启用">
                                   <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm"></div>
                                 </div>
@@ -1692,6 +1781,43 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           </div>
                           
                           <div className="space-y-4">
+                            <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+                              <div className="space-y-1">
+                                <h3 className="text-base font-bold text-slate-900">转人工处理方式</h3>
+                                <p className="text-sm text-slate-500">当机器人需要人工处理时，选择只在消息中心标记，或在客户确认后调用拼多多转移会话。</p>
+                              </div>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <button
+                                  type="button"
+                                  onClick={() => setHumanHandoffStrategy('mark_only')}
+                                  className={cn(
+                                    "flex items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors",
+                                    humanHandoffStrategy === 'mark_only' ? "border-indigo-300 bg-indigo-50 text-indigo-700" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50",
+                                  )}
+                                >
+                                  <Headset className="h-4 w-4 shrink-0" />
+                                  <span>
+                                    <span className="block text-sm font-bold">仅标记待人工处理</span>
+                                    <span className="block mt-1 text-xs text-slate-400">保持现有处理方式，不调用平台转移接口。</span>
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setHumanHandoffStrategy('transfer_conversation')}
+                                  className={cn(
+                                    "flex items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors",
+                                    humanHandoffStrategy === 'transfer_conversation' ? "border-indigo-300 bg-indigo-50 text-indigo-700" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50",
+                                  )}
+                                >
+                                  <ArrowUpRight className="h-4 w-4 shrink-0" />
+                                  <span>
+                                    <span className="block text-sm font-bold">转移会话给其他客服</span>
+                                    <span className="block mt-1 text-xs text-slate-400">从拼多多实时客服列表中随机选择可接待客服。</span>
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+
                             {/* 常规兜底话术 Card */}
                             <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
                               <div className="space-y-1">
@@ -1709,8 +1835,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 </div>
                                 <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
                                   <div>
-                                    <span className="block text-sm font-bold text-slate-700">发出兜底话术后标记待人工处理，并停止机器人处理该会话</span>
-                                    <span className="block mt-1 text-xs text-slate-400">仅标记消息中心会话，不调用平台的“转移会话”功能。</span>
+                                    <span className="block text-sm font-bold text-slate-700">发出兜底话术后标记待人工处理，但不阻塞该会话其它消息自动回复</span>
+                                    <span className="block mt-1 text-xs text-slate-400">仅标记消息中心会话，不调用平台的“转移会话”功能；其它可正常回答的消息继续自动回复。</span>
                                   </div>
                                   <button type="button" onClick={() => setFallbackMarkHumanRequired((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", fallbackMarkHumanRequired ? "bg-indigo-500" : "bg-slate-300")} title="发送任务入队后立即标记待人工处理">
                                     <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm", fallbackMarkHumanRequired ? "right-1" : "left-1")}></div>
@@ -1738,7 +1864,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                     onChange={(event) => setTimeoutReplyText(event.target.value)}
                                   />
                                 </div>
-                                <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
+                            <div className="flex items-center justify-between bg-white px-4 py-3 border border-slate-200 rounded-xl">
                                   <span className="text-sm font-bold text-slate-700">启用超时安抚（只发送一次，不打断正式回复）</span>
                                   <button type="button" onClick={() => setTimeoutEnabled((value) => !value)} className={cn("w-12 h-6 rounded-full relative shadow-inner transition-colors", timeoutEnabled ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm", timeoutEnabled ? "right-1" : "left-1")}></div>
@@ -1747,10 +1873,44 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                               </div>
                             </div>
 
+                            <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-5">
+                              <div className="flex items-center justify-between gap-4">
+                                <div>
+                                  <h4 className="text-sm font-bold text-slate-800">自动推荐商品</h4>
+                                  <p className="mt-1 text-xs text-slate-400">客户明确询问商品、款式或推荐时，从当前店铺商品列表模糊匹配，最多发送 2 个商品卡。</p>
+                                </div>
+                                <button type="button" onClick={() => setProductRecommendEnabled((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", productRecommendEnabled ? "bg-indigo-500" : "bg-slate-300")}>
+                                  <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", productRecommendEnabled ? "right-1" : "left-1")}></div>
+                                </button>
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm font-bold text-slate-700">商品推荐附加话术</label>
+                                <textarea
+                                  value={productRecommendText}
+                                  onChange={(event) => setProductRecommendText(event.target.value)}
+                                  maxLength={500}
+                                  className="w-full h-20 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
+                                  placeholder={DEFAULT_PRODUCT_RECOMMEND_TEXT}
+                                />
+                                <p className="text-xs text-slate-400">默认关闭；开启后仅在命中商品推荐意图且有可用商品时发送。</p>
+                              </div>
+                              <div className="space-y-2 border-t border-slate-200 pt-5">
+                                <label className="text-sm font-bold text-slate-700">客户单独发送商品卡时的回复</label>
+                                <textarea
+                                  value={productCardAckText}
+                                  onChange={(event) => setProductCardAckText(event.target.value)}
+                                  maxLength={500}
+                                  className="w-full h-20 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
+                                  placeholder={DEFAULT_PRODUCT_CARD_ACK_TEXT}
+                                />
+                                <p className="text-xs text-slate-400">客户只发送商品卡时使用；商品卡和文字问题一起发送时，仍按正常 QA、知识库或 AI 流程处理。</p>
+                              </div>
+                            </div>
+
                             <div className="space-y-4 pt-2">
                               <div>
                                 <h3 className="text-base font-bold text-slate-900">其他话术策略</h3>
-                                <p className="mt-1 text-sm text-slate-500">基于客户最新订单状态触发，同一客户每类话术最多成功发送一次。</p>
+                                <p className="mt-1 text-sm text-slate-500">基于客户最新订单状态触发，同一客户同一商品每类话术最多成功发送一次。</p>
                               </div>
 
                               <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-5">
@@ -1770,7 +1930,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-4 py-3">
                                   <div>
                                     <p className="text-sm font-bold text-slate-700">发出话术后标记待人工处理</p>
-                                    <p className="mt-1 text-xs text-slate-400">话术确认发送成功后，停止机器人处理该会话。</p>
+                                    <p className="mt-1 text-xs text-slate-400">话术确认发送成功后，仅标记消息中心会话，不阻塞其它消息自动回复。</p>
                                   </div>
                                   <button type="button" onClick={() => setOrderFollowUpMarkHumanRequired((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", orderFollowUpMarkHumanRequired ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", orderFollowUpMarkHumanRequired ? "right-1" : "left-1")}></div>
@@ -1782,7 +1942,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 <div className="flex items-center justify-between">
                                   <div>
                                     <h4 className="text-sm font-bold text-slate-800">签收后关怀话术</h4>
-                                    <p className="mt-1 text-xs text-slate-400">订单首次识别为已签收或已完成后复查订单状态，无退款、售后或待人工情况时立即发送。</p>
+                                    <p className="mt-1 text-xs text-slate-400">订单接口主状态首次识别为“已签收”后复查订单状态，仍为“已签收”则发送。</p>
                                   </div>
                                   <button type="button" onClick={() => setPostReceiptCareEnabled((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", postReceiptCareEnabled ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", postReceiptCareEnabled ? "right-1" : "left-1")}></div>
@@ -1795,7 +1955,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-4 py-3">
                                   <div>
                                     <p className="text-sm font-bold text-slate-700">发出话术后标记待人工处理</p>
-                                    <p className="mt-1 text-xs text-slate-400">话术确认发送成功后，停止机器人处理该会话。</p>
+                                    <p className="mt-1 text-xs text-slate-400">话术确认发送成功后，仅标记消息中心会话，不阻塞其它消息自动回复。</p>
                                   </div>
                                   <button type="button" onClick={() => setPostReceiptCareMarkHumanRequired((value) => !value)} className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", postReceiptCareMarkHumanRequired ? "bg-indigo-500" : "bg-slate-300")}>
                                     <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm transition-all", postReceiptCareMarkHumanRequired ? "right-1" : "left-1")}></div>
@@ -1982,6 +2142,83 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                       </div>
                     </div>}
 
+                    <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-5">
+                      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                        <div>
+                          <h2 className="text-lg font-bold text-slate-900">检索测试</h2>
+                          <p className="text-sm text-slate-500 mt-1">输入客户问法，查看实际召回的产品文档片段。</p>
+                        </div>
+                        {productSearchResult && (
+                          <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <span className="rounded-lg bg-indigo-50 px-2.5 py-1 font-bold text-indigo-600">
+                              {formatProductSearchMode(productSearchResult.metadata.mode)}
+                            </span>
+                            <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-bold text-slate-600">
+                              FTS {productSearchResult.metadata.fts_candidate_count ?? 0}
+                            </span>
+                            <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-bold text-slate-600">
+                              向量 {productSearchResult.metadata.vector_candidate_count ?? 0}
+                            </span>
+                            <span className={cn(
+                              "rounded-lg px-2.5 py-1 font-bold",
+                              productSearchResult.metadata.embedding_enabled ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600",
+                            )}>
+                              {productSearchResult.metadata.embedding_enabled ? 'Embedding 已启用' : 'Embedding 未启用'}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex flex-col gap-3 lg:flex-row">
+                        <label className="relative flex-1">
+                          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                          <input
+                            value={productSearchQuery}
+                            onChange={(event) => setProductSearchQuery(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' && !event.shiftKey) {
+                                event.preventDefault();
+                                void handleTestProductSearch();
+                              }
+                            }}
+                            placeholder="例如：这个能连手机吗"
+                            className="w-full rounded-xl border border-slate-200 bg-slate-50 pl-9 pr-4 py-3 text-sm outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => void handleTestProductSearch()}
+                          disabled={isTestingProductSearch || !productSearchQuery.trim()}
+                          className="inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-bold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <Search className="w-4 h-4" />
+                          {isTestingProductSearch ? '检索中...' : '检索'}
+                        </button>
+                      </div>
+                      {productSearchNotice && <div className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-700">{productSearchNotice}</div>}
+                      {productSearchResult && productSearchResult.results.length > 0 && (
+                        <div className="space-y-3">
+                          {productSearchResult.results.map((item, index) => (
+                            <article key={`${item.chunk_id}-${index}`} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                                  <span className="rounded-lg bg-white px-2.5 py-1 text-xs font-bold text-indigo-600">#{index + 1}</span>
+                                  <span className="text-sm font-bold text-slate-800">{item.source_title || '未命名文档'}</span>
+                                  {item.title_path && <span className="max-w-full truncate text-xs text-slate-500">{item.title_path}</span>}
+                                </div>
+                                <span className="rounded-lg bg-white px-2.5 py-1 text-xs font-bold text-slate-600">
+                                  score {item.score.toFixed(4)}
+                                </span>
+                              </div>
+                              <p className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-700">{item.snippet}</p>
+                            </article>
+                          ))}
+                        </div>
+                      )}
+                      {productSearchResult?.metadata.embedding_model && (
+                        <p className="text-xs text-slate-400">模型：{productSearchResult.metadata.embedding_model}</p>
+                      )}
+                    </div>
+
                     <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                       <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between">
                         <div><h2 className="text-lg font-bold text-slate-900">已导入文档</h2><p className="text-sm text-slate-500 mt-1">共 {selectedProductKB.count} 份文档</p></div>
@@ -2104,29 +2341,44 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           <h3 className="text-lg font-bold text-slate-900">问答列表</h3>
                           <p className="mt-1 text-xs text-slate-400">共 {qaTotal} 条问答</p>
                         </div>
-                        {selectedQABase.isOwner && <button onClick={() => { setShowQaCategoryCreator(false); openAddQAItem(); }} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all">
-                          <Plus className="w-4 h-4" />
-                          添加问答
-                        </button>}
+                        {selectedQABase.isOwner && (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button onClick={() => void openPlatformPhraseImport()} className="flex items-center gap-2 px-4 py-2 bg-white border border-indigo-100 text-indigo-600 rounded-xl text-sm font-bold hover:bg-indigo-50 transition-all">
+                              <UploadCloud className="w-4 h-4" />
+                              导入平台话术
+                            </button>
+                            <button onClick={() => { setShowQaCategoryCreator(false); openAddQAItem(); }} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all">
+                              <Plus className="w-4 h-4" />
+                              添加问答
+                            </button>
+                          </div>
+                        )}
                       </div>
 
                       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
                         <label className="flex min-w-[220px] items-center gap-2">
                           <span className="shrink-0 text-xs font-bold text-slate-500">分类</span>
-                          <select
-                            aria-label="筛选问答分类"
+                          <AppSelect
+                            ariaLabel="筛选问答分类"
                             value={qaCategoryFilter}
-                            onChange={(event) => changeQaCategoryFilter(event.target.value)}
-                            className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:ring-2 focus:ring-indigo-500"
-                          >
-                            <option value="all">全部分类（{selectedQABase.count}）</option>
-                            {qaCategories.map((category) => (
-                              <option key={category.id} value={category.id}>{category.name}（{category.item_count}）</option>
-                            ))}
-                            {selectedQABase.count > qaCategories.reduce((sum, category) => sum + category.item_count, 0) && (
-                              <option value="uncategorized">未分类（{selectedQABase.count - qaCategories.reduce((sum, category) => sum + category.item_count, 0)}）</option>
-                            )}
-                          </select>
+                            onChange={changeQaCategoryFilter}
+                            searchable
+                            searchPlaceholder="搜索分类..."
+                            className="min-w-0 flex-1"
+                            options={[
+                              { value: 'all', label: `全部分类（${selectedQABase.count}）` },
+                              ...qaCategories.map((category) => ({
+                                value: category.id,
+                                label: `${category.name}（${category.item_count}）`,
+                              })),
+                              ...(selectedQABase.count > qaCategories.reduce((sum, category) => sum + category.item_count, 0)
+                                ? [{
+                                    value: 'uncategorized',
+                                    label: `未分类（${selectedQABase.count - qaCategories.reduce((sum, category) => sum + category.item_count, 0)}）`,
+                                  }]
+                                : []),
+                            ]}
+                          />
                         </label>
                         <form
                           onSubmit={(event) => { event.preventDefault(); submitQaSearch(); }}
@@ -2358,11 +2610,11 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                         <label className="flex items-center gap-3 text-sm font-bold text-slate-700"><input type="checkbox" checked={emailConfig.enabled} onChange={(event) => updateEmailConfig('enabled', event.target.checked)} className="w-4 h-4 accent-indigo-600" />启用邮件服务</label>
                       </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                        <label className="space-y-2"><span className="text-sm font-bold text-slate-700">邮件服务商</span><select value={emailConfig.provider} onChange={(event) => applyEmailProviderDefaults(event.target.value as 'qq' | 'gmail' | 'custom')} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white"><option value="qq">QQ 邮箱</option><option value="gmail">Gmail</option><option value="custom">自定义 SMTP</option></select></label>
+                        <label className="space-y-2"><span className="text-sm font-bold text-slate-700">邮件服务商</span><AppSelect value={emailConfig.provider} onChange={(nextValue) => applyEmailProviderDefaults(nextValue as 'qq' | 'gmail' | 'custom')} options={[{ value: 'qq', label: 'QQ 邮箱' }, { value: 'gmail', label: 'Gmail' }, { value: 'custom', label: '自定义 SMTP' }]} /></label>
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">发件邮箱</span><input type="email" value={emailConfig.sender_email} onChange={(event) => updateEmailConfig('sender_email', event.target.value)} placeholder="service@example.com" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">SMTP Host</span><input value={emailConfig.smtp_host} onChange={(event) => updateEmailConfig('smtp_host', event.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">SMTP 端口</span><input type="number" min={1} max={65535} value={emailConfig.smtp_port} onChange={(event) => updateEmailConfig('smtp_port', Number(event.target.value))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
-                        <label className="space-y-2"><span className="text-sm font-bold text-slate-700">安全方式</span><select value={emailConfig.security} onChange={(event) => updateEmailConfig('security', event.target.value as 'ssl' | 'starttls' | 'none')} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white"><option value="ssl">SSL</option><option value="starttls">STARTTLS</option><option value="none">无加密</option></select></label>
+                        <label className="space-y-2"><span className="text-sm font-bold text-slate-700">安全方式</span><AppSelect value={emailConfig.security} onChange={(nextValue) => updateEmailConfig('security', nextValue as 'ssl' | 'starttls' | 'none')} options={[{ value: 'ssl', label: 'SSL' }, { value: 'starttls', label: 'STARTTLS' }, { value: 'none', label: '无加密' }]} /></label>
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">授权码 / 应用密码</span><input type="password" value={emailConfig.auth_code} onChange={(event) => updateEmailConfig('auth_code', event.target.value)} placeholder={emailAuthCodeSaved ? '已保存，留空保持不变' : '请输入 SMTP 授权码'} autoComplete="new-password" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                       </div>
                       <div className="rounded-xl bg-slate-50 p-4 space-y-4">
@@ -2376,7 +2628,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                       </div>
                       <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto_auto] md:items-end gap-4 rounded-xl bg-slate-50 p-4">
                         <label className="space-y-2 flex-1"><span className="text-sm font-bold text-slate-700">测试收件邮箱</span><input type="email" value={emailTestRecipient} onChange={(event) => setEmailTestRecipient(event.target.value)} placeholder="recipient@example.com" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white" /></label>
-                        <label className="space-y-2"><span className="text-sm font-bold text-slate-700">测试邮件模板</span><select value={emailTestTemplateId} onChange={(event) => setEmailTestTemplateId(event.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white"><option value="">使用默认测试正文</option>{emailTemplates.filter((item) => item.enabled).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+                        <label className="space-y-2"><span className="text-sm font-bold text-slate-700">测试邮件模板</span><AppSelect value={emailTestTemplateId} onChange={setEmailTestTemplateId} searchable searchPlaceholder="搜索模板..." options={[{ value: '', label: '使用默认测试正文' }, ...emailTemplates.filter((item) => item.enabled).map((item) => ({ value: item.id, label: item.name }))]} /></label>
                         <button onClick={() => void handleTestEmailConfig(emailTestRecipient, emailTestTemplateId || undefined)} disabled={isTestingEmail || !emailTestRecipient || !emailConfig.enabled} className="px-4 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-700 disabled:opacity-50">{isTestingEmail ? '发送中...' : '发送测试邮件'}</button>
                         <button onClick={() => void handleSaveEmailConfig()} disabled={isSavingEmail || !emailConfig.sender_email || !emailConfig.smtp_host} className="px-5 py-2.5 rounded-xl bg-indigo-600 text-white text-sm font-bold disabled:opacity-50">{isSavingEmail ? '保存中...' : '保存配置'}</button>
                       </div>
@@ -2630,7 +2882,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
               <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto custom-scrollbar">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <label className="space-y-2"><span className="text-sm font-bold text-slate-700">模板名称</span><input value={emailTemplateForm.name} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, name: event.target.value }))} placeholder="例如：店铺看图地址" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
-                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">绑定店铺</span><select value={emailTemplateForm.platform_account_id || ''} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, platform_account_id: event.target.value || null }))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm bg-white"><option value="">未绑定店铺</option>{platformAccounts.filter((account) => account.platform_code === 'pinduoduo' && account.is_active).map((account) => <option key={account.id} value={account.id}>{account.account_alias || account.account_name}</option>)}</select></label>
+                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">绑定店铺</span><AppSelect value={emailTemplateForm.platform_account_id || ''} onChange={(nextValue) => setEmailTemplateForm((prev) => ({ ...prev, platform_account_id: nextValue || null }))} searchable searchPlaceholder="搜索店铺..." options={[{ value: '', label: '未绑定店铺' }, ...platformAccounts.filter((account) => account.platform_code === 'pinduoduo' && account.is_active).map((account) => ({ value: account.id, label: account.account_alias || account.account_name }))]} /></label>
                 </div>
                 <label className="space-y-2 block"><span className="text-sm font-bold text-slate-700">邮件主题</span><input value={emailTemplateForm.subject} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, subject: event.target.value }))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                 <label className="space-y-2 block"><span className="text-sm font-bold text-slate-700">邮件正文</span><textarea value={emailTemplateForm.body} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, body: event.target.value }))} className="w-full h-48 rounded-xl border border-slate-200 p-4 text-sm resize-none" /></label>
@@ -2684,6 +2936,179 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
           </motion.div>
         )}
 
+        {isPlatformPhraseImportOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-slate-900/40 z-50 flex items-center justify-center p-4 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="bg-white rounded-2xl shadow-xl w-full max-w-4xl overflow-hidden flex max-h-[86vh] flex-col"
+            >
+              <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900">导入平台话术</h3>
+                  <p className="mt-1 text-xs text-slate-500">从已登录店铺读取话术，生成问答草稿后再确认导入。</p>
+                </div>
+                <button onClick={closePlatformPhraseImport} className="text-slate-400 hover:text-slate-600 transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="space-y-4 overflow-y-auto p-6 custom-scrollbar">
+                <div className="grid gap-3 md:grid-cols-[150px_1fr_180px_auto]">
+                  <label className="space-y-2">
+                    <span className="text-sm font-bold text-slate-700">平台</span>
+                    <AppSelect
+                      value="pinduoduo"
+                      disabled
+                      onChange={() => undefined}
+                      options={[{ value: 'pinduoduo', label: '拼多多' }]}
+                    />
+                  </label>
+                  <label className="space-y-2">
+                    <span className="text-sm font-bold text-slate-700">店铺</span>
+                    <AppSelect
+                      value={platformPhraseAccountId}
+                      onChange={setPlatformPhraseAccountId}
+                      searchable
+                      placeholder="请选择店铺"
+                      searchPlaceholder="搜索店铺..."
+                      options={[
+                        { value: '', label: '请选择店铺' },
+                        ...platformPhraseAccounts.map((account) => ({
+                          value: account.id,
+                          label: `${account.name}（${account.status}）`,
+                        })),
+                      ]}
+                    />
+                  </label>
+                  <label className="space-y-2">
+                    <span className="text-sm font-bold text-slate-700">来源</span>
+                    <AppSelect
+                      value={platformPhraseSource}
+                      onChange={(nextValue) => setPlatformPhraseSource(nextValue as 'personal' | 'team')}
+                      options={[
+                        { value: 'personal', label: '个人话术' },
+                        { value: 'team', label: '团队话术' },
+                      ]}
+                    />
+                  </label>
+                  <div className="flex items-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void loadPlatformPhrases()}
+                      disabled={isLoadingPlatformPhrases || !platformPhraseAccountId}
+                      className="inline-flex h-[42px] items-center gap-2 rounded-xl bg-indigo-600 px-4 text-sm font-bold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <RefreshCw className={cn('h-4 w-4', isLoadingPlatformPhrases && 'animate-spin')} />
+                      {isLoadingPlatformPhrases ? '生成中' : '读取话术'}
+                    </button>
+                    {isLoadingPlatformPhrases && platformPhraseProgress && (
+                      <button
+                        type="button"
+                        onClick={() => void cancelPlatformPhraseGeneration()}
+                        className="inline-flex h-[42px] items-center rounded-xl border border-slate-200 bg-white px-4 text-sm font-bold text-slate-600 hover:bg-slate-50"
+                      >
+                        停止
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {platformPhraseNotice && (
+                  <div className="rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm text-indigo-700">
+                    {platformPhraseNotice}
+                  </div>
+                )}
+                {platformPhraseProgress && (
+                  <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                    <div className="flex items-center justify-between gap-3 text-xs font-bold text-slate-600">
+                      <span>{platformPhraseProgress.message || '正在生成话术草稿'}</span>
+                      <span>
+                        {platformPhraseProgress.generated}/{platformPhraseProgress.total}
+                        {platformPhraseProgress.failed ? `，失败 ${platformPhraseProgress.failed}` : ''}
+                      </span>
+                    </div>
+                    <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100">
+                      <div
+                        className="h-full rounded-full bg-indigo-600 transition-all"
+                        style={{
+                          width: `${platformPhraseProgress.total
+                            ? Math.min(100, Math.round(((platformPhraseProgress.generated + platformPhraseProgress.failed) / platformPhraseProgress.total) * 100))
+                            : 0}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="mt-2 text-xs text-slate-400">
+                      批次 {platformPhraseProgress.completedBatches}/{platformPhraseProgress.batchCount || 0}
+                    </div>
+                  </div>
+                )}
+                <div className="overflow-hidden rounded-xl border border-slate-200">
+                  <table className="w-full text-left">
+                    <thead className="bg-slate-50 text-xs font-semibold text-slate-500">
+                      <tr>
+                        <th className="w-12 px-4 py-3">选</th>
+                        <th className="px-4 py-3">分类</th>
+                        <th className="px-4 py-3">问题</th>
+                        <th className="px-4 py-3">关键词</th>
+                        <th className="px-4 py-3">答案</th>
+                        <th className="px-4 py-3">图片</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-sm">
+                      {platformPhraseDrafts.length === 0 && (
+                        <tr>
+                          <td colSpan={6} className="px-4 py-10 text-center text-sm text-slate-400">
+                            读取平台话术后将在这里预览草稿
+                          </td>
+                        </tr>
+                      )}
+                      {platformPhraseDrafts.map((item) => (
+                        <tr key={item.source_id} className="align-top hover:bg-slate-50/70">
+                          <td className="px-4 py-3">
+                            <input
+                              type="checkbox"
+                              checked={selectedPlatformPhraseIds.includes(item.source_id)}
+                              onChange={() => togglePlatformPhraseDraft(item.source_id)}
+                              className="h-4 w-4 accent-indigo-600"
+                            />
+                          </td>
+                          <td className="max-w-[130px] px-4 py-3 text-slate-700">{item.category}</td>
+                          <td className="max-w-[180px] px-4 py-3 font-semibold text-slate-900">{item.question}</td>
+                          <td className="max-w-[170px] px-4 py-3 text-xs text-slate-500">{item.keywords.join('、')}</td>
+                          <td className="max-w-[280px] px-4 py-3 text-xs text-slate-600">
+                            <div className="line-clamp-3">{item.answer}</div>
+                          </td>
+                          <td className="px-4 py-3">
+                            {item.image_url ? <ImagePreview src={item.image_url} alt="话术图片" /> : <span className="text-xs text-slate-400">无</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-3 border-t border-slate-100 bg-slate-50 px-6 py-4">
+                <span className="text-xs text-slate-500">已选择 {selectedPlatformPhraseIds.length} / {platformPhraseDrafts.length} 条</span>
+                <div className="flex items-center gap-3">
+                  <button onClick={closePlatformPhraseImport} className="rounded-xl border border-slate-200 bg-white px-5 py-2.5 text-sm font-bold text-slate-600 hover:bg-slate-50">取消</button>
+                  <button
+                    onClick={() => void importPlatformPhraseDrafts()}
+                    disabled={isImportingPlatformPhrases || selectedPlatformPhraseIds.length === 0}
+                    className="rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isImportingPlatformPhrases ? '导入中...' : '确认导入'}
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+
         {isAddQAItemModalOpen && (
           <motion.div
             initial={{ opacity: 0 }}
@@ -2708,18 +3133,22 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                 <div className="space-y-2">
                   <label className="text-sm font-bold text-slate-700">分类</label>
                   <div className="flex items-center gap-2">
-                    <select
-                      aria-label="问答分类"
-                      className="min-w-0 flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
+                    <AppSelect
+                      ariaLabel="问答分类"
                       value={qaItemForm.categoryId}
-                      onChange={(event) => {
-                        const category = qaCategories.find((item) => item.id === event.target.value);
+                      onChange={(nextValue) => {
+                        const category = qaCategories.find((item) => item.id === nextValue);
                         setQaItemForm({ ...qaItemForm, categoryId: category?.id ?? '', category: category?.name ?? '' });
                       }}
-                    >
-                      {!qaItemForm.categoryId && <option value="">未分类</option>}
-                      {qaCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
-                    </select>
+                      searchable
+                      placeholder="未分类"
+                      searchPlaceholder="搜索分类..."
+                      className="min-w-0 flex-1"
+                      options={[
+                        { value: '', label: '未分类' },
+                        ...qaCategories.map((category) => ({ value: category.id, label: category.name })),
+                      ]}
+                    />
                     <button
                       type="button"
                       onClick={() => setShowQaCategoryCreator((current) => !current)}

@@ -6,10 +6,20 @@ export interface Platform {
 
 export interface Message {
   id: string;
+  platformMessageId?: string | null;
   sender: 'user' | 'bot' | 'agent' | 'platform';
   content: string;
   timestamp: string;
-  deliveryStatus?: 'sending' | 'sent';
+  deliveryStatus?: 'sending' | 'sent' | 'failed';
+  quote?: {
+    platformMessageId?: string | null;
+    sender: 'user' | 'bot' | 'agent' | 'platform';
+    content: string;
+    media?: {
+      type: 'image';
+      url: string;
+    };
+  } | null;
   media?: {
     type: 'image';
     url: string;
@@ -24,6 +34,19 @@ export interface Message {
       price_label?: string | null;
       image_url?: string | null;
       source_label?: string | null;
+      sales_tip?: string | null;
+      link_url?: string | null;
+      button_text?: string | null;
+      customer_number?: number | null;
+      order_sequence_no?: string | null;
+      order_id?: string | null;
+      group_order_id?: string | null;
+      order_status_label?: string | null;
+      after_sales_label?: string | null;
+      quantity?: number | null;
+      spec?: string | null;
+      amount?: number | null;
+      amount_label?: string | null;
     };
   };
 }
@@ -31,8 +54,13 @@ export interface Message {
 export interface Conversation {
   id: string;
   userName: string;
+  avatarUrl?: string | null;
+  shopLogoUrl?: string | null;
   shopId: string;
+  localShopId?: string | null;
   shopName: string;
+  shopServiceUsername?: string | null;
+  shopIsMallOwner?: boolean;
   externalConversationId?: string | null;
   lastMessage: string;
   platform: string;
@@ -42,6 +70,7 @@ export interface Conversation {
   humanRequired?: boolean;
   humanRequiredReason?: string | null;
   humanRequiredWord?: string | null;
+  latestCustomerMessageAt?: string | null;
   syncIssue?: {
     observationId: string;
     firstDetectedAt: string;
@@ -61,6 +90,7 @@ export interface Shop {
   name: string;
   platform?: string;
   platformName?: string;
+  logoUrl?: string | null;
 }
 
 export interface BotStatus {

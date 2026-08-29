@@ -56,13 +56,15 @@ export default function App() {
       dataError={controller.dataError}
       onSendMessage={controller.handleSendMessage}
       onSendImage={controller.handleSendImage}
+      onListTransferCs={controller.handleListTransferCs}
+      onTransferConversation={controller.handleTransferConversation}
+      quickReplies={controller.quickReplies}
+      quickReplyStatus={controller.quickReplyStatus}
+      onRefreshQuickReplies={controller.refreshPlatformQuickReplies}
       automaticSendNotice={controller.automaticSendNotice}
       onClearHumanRequired={controller.handleClearHumanRequired}
       onClearConversationHistory={controller.handleClearConversationHistory}
       onDeleteConversation={controller.handleDeleteConversation}
-      onLoadMessageSyncIssue={controller.handleLoadMessageSyncIssue}
-      onDismissMessageSyncIssue={controller.handleDismissMessageSyncIssue}
-      onRebuildMessageQueue={controller.handleRebuildMessageQueue}
       bot={controller.bot}
       logs={controller.logs}
       statusEvents={controller.statusEvents}
@@ -72,6 +74,16 @@ export default function App() {
       customerOrders={controller.customerOrders}
       isLoadingCustomerOrders={controller.isLoadingCustomerOrders}
       onRefreshCustomerOrders={controller.handleRefreshCustomerOrders}
+      customerProducts={controller.customerProducts}
+      isLoadingCustomerProducts={controller.isLoadingCustomerProducts}
+      onRefreshCustomerProducts={controller.handleRefreshCustomerProducts}
+      onSendCustomerProduct={controller.handleSendCustomerProduct}
+      shopSummary={controller.selectedShopSummary}
+      isLoadingShopSummary={controller.isLoadingPlatformAccounts}
+      isGeneratingShopSummary={controller.isGeneratingShopSummary}
+      isSavingShopSummary={controller.isSavingShopSummary}
+      onGenerateShopSummary={controller.handleGenerateShopSummary}
+      onSaveShopSummary={controller.handleSaveShopSummary}
       onViewLogs={() => controller.setIsLogModalOpen(true)}
       isLogModalOpen={controller.isLogModalOpen}
       onCloseLogModal={() => controller.setIsLogModalOpen(false)}

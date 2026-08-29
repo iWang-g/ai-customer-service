@@ -48,7 +48,7 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
   }[lang];
 
   return (
-    <div className="w-18 h-full flex flex-col items-center py-6 bg-white border-r border-slate-200 gap-6" id="platform-rail">
+    <div className="w-18 h-full shrink-0 flex flex-col items-center py-6 bg-white border-r border-slate-200 gap-6" id="platform-rail">
       {/* Top Icons */}
       <div className="flex-1 flex flex-col items-center gap-4 w-full">
         {railPlatforms.map((p) => {

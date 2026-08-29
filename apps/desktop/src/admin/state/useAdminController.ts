@@ -14,6 +14,9 @@ import {
   getUserSettings,
   getKnowledgeBase,
   getKnowledgeDocument,
+  getPlatformPhraseCache,
+  createPlatformPhraseNormalizeTask,
+  getPlatformPhraseNormalizeTask,
   importProductDocument,
   listPlatformAccounts,
   listKnowledgeBases,
@@ -22,11 +25,14 @@ import {
   listProductDocuments,
   listKnowledgeDocumentChunks,
   reprocessKnowledgeDocument,
+  searchProductDocuments,
   listRobots,
   listEmailTemplates,
   saveEmailConfig,
   saveUserSettings,
   listAiModels,
+  cancelPlatformPhraseNormalizeTask,
+  savePlatformPhraseCache,
   syncAiModels,
   testRobotReply,
   testEmailConfig,
@@ -46,7 +52,11 @@ import {
   type KnowledgeDocumentChunk,
   type KnowledgeDocumentDetail,
   type KnowledgeBaseSummary,
+  type ProductDocumentSearchResponse,
   type PlatformAccount,
+  type PlatformPhraseNormalizeTask,
+  type PlatformPhraseQaDraft,
+  type PlatformPhraseRecord,
   type QaCategory,
   type QaEntry,
   type RobotInput,
@@ -71,19 +81,41 @@ type QAItem = {
   enabled: boolean;
 };
 type QAItemForm = Omit<QAItem, 'id' | 'baseId' | 'calls'>;
+type PlatformPhraseSource = 'personal' | 'team';
+type PlatformPhraseImportAccount = {
+  id: string;
+  name: string;
+  status: string;
+  platformAccountId: string | null;
+};
+type PlatformPhraseProgress = {
+  taskId: string;
+  status: PlatformPhraseNormalizeTask['status'];
+  total: number;
+  generated: number;
+  failed: number;
+  completedBatches: number;
+  batchCount: number;
+  message: string;
+};
+
+const wait = (ms: number) => new Promise((resolve) => {
+  window.setTimeout(resolve, ms);
+});
 
 function mapQABase(base: KnowledgeBaseSummary): QABase {
   return { id: base.id, name: base.name, count: base.item_count, date: base.updated_at.slice(0, 10), isPublic: base.is_public, isOwner: base.is_owner, ownerName: base.owner_display_name };
 }
 
 function mapQAItem(entry: QaEntry): QAItem {
+  const keywords = Array.isArray(entry.keywords) ? entry.keywords : [];
   return {
     id: entry.id,
     baseId: entry.base_id,
     categoryId: entry.category_id,
     category: entry.category,
     question: entry.question,
-    keywords: entry.keywords.join('、'),
+    keywords: keywords.join('、'),
     answer: entry.answer,
     image: null,
     imageUrl: entry.image_url,
@@ -206,6 +238,17 @@ export function useAdminController() {
   const [isLoadingQA, setIsLoadingQA] = useState(false);
   const [isSavingQA, setIsSavingQA] = useState(false);
   const [qaNotice, setQaNotice] = useState('');
+  const [isPlatformPhraseImportOpen, setIsPlatformPhraseImportOpen] = useState(false);
+  const [platformPhraseAccounts, setPlatformPhraseAccounts] = useState<PlatformPhraseImportAccount[]>([]);
+  const [platformPhraseAccountId, setPlatformPhraseAccountId] = useState('');
+  const [platformPhraseSource, setPlatformPhraseSource] = useState<PlatformPhraseSource>('personal');
+  const [platformPhraseDrafts, setPlatformPhraseDrafts] = useState<PlatformPhraseQaDraft[]>([]);
+  const [selectedPlatformPhraseIds, setSelectedPlatformPhraseIds] = useState<string[]>([]);
+  const [isLoadingPlatformPhrases, setIsLoadingPlatformPhrases] = useState(false);
+  const [isImportingPlatformPhrases, setIsImportingPlatformPhrases] = useState(false);
+  const [platformPhraseNotice, setPlatformPhraseNotice] = useState('');
+  const [platformPhraseProgress, setPlatformPhraseProgress] = useState<PlatformPhraseProgress | null>(null);
+  const platformPhraseTaskIdRef = useRef('');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [expandedMenus, setExpandedMenus] = useState<string[]>(['agent']);
   const [robotSubTab, setRobotSubTab] = useState('base');
@@ -230,6 +273,10 @@ export function useAdminController() {
   const [isLoadingProductDocumentDetail, setIsLoadingProductDocumentDetail] = useState(false);
   const [isReprocessingProductDocument, setIsReprocessingProductDocument] = useState(false);
   const [productDocumentDetailNotice, setProductDocumentDetailNotice] = useState('');
+  const [productSearchQuery, setProductSearchQuery] = useState('');
+  const [productSearchResult, setProductSearchResult] = useState<ProductDocumentSearchResponse | null>(null);
+  const [isTestingProductSearch, setIsTestingProductSearch] = useState(false);
+  const [productSearchNotice, setProductSearchNotice] = useState('');
   const [toneBases, setToneBases] = useState<ToneKB[]>([]);
   const [isAddToneKBModalOpen, setIsAddToneKBModalOpen] = useState(false);
   const [editingToneKBId, setEditingToneKBId] = useState<string | null>(null);
@@ -718,6 +765,240 @@ export function useAdminController() {
     }
   };
 
+  const openPlatformPhraseImport = async () => {
+    if (!selectedQABase) return;
+    setIsPlatformPhraseImportOpen(true);
+    setPlatformPhraseNotice('');
+    setPlatformPhraseDrafts([]);
+    setSelectedPlatformPhraseIds([]);
+    try {
+      const state = await window.pddWorkspace?.getState();
+      const accounts = (state?.accounts || [])
+        .filter((account) => !account.paused && account.loginStatus !== 'login_required')
+        .map((account) => ({
+          id: account.id,
+          name: account.platformAccountName || account.alias || account.id,
+          status: account.loginStatus,
+          platformAccountId: account.platformAccountId || null,
+        }));
+      setPlatformPhraseAccounts(accounts);
+      const active = accounts.find((account) => account.id === state?.activeAccountId) || accounts[0] || null;
+      setPlatformPhraseAccountId(active?.id || '');
+      if (!accounts.length) setPlatformPhraseNotice('暂无可读取话术的拼多多店铺，请先打开并登录拼多多工作区');
+    } catch (error) {
+      setPlatformPhraseNotice(error instanceof Error ? error.message : '读取拼多多店铺列表失败');
+    }
+  };
+
+  const closePlatformPhraseImport = () => {
+    const taskId = platformPhraseTaskIdRef.current;
+    if (taskId) {
+      void cancelPlatformPhraseNormalizeTask(taskId).catch(() => undefined);
+    }
+    setIsPlatformPhraseImportOpen(false);
+    setPlatformPhraseNotice('');
+    setPlatformPhraseDrafts([]);
+    setSelectedPlatformPhraseIds([]);
+    setIsLoadingPlatformPhrases(false);
+    setIsImportingPlatformPhrases(false);
+    setPlatformPhraseProgress(null);
+    platformPhraseTaskIdRef.current = '';
+  };
+
+  const applyPlatformPhraseTask = (task: PlatformPhraseNormalizeTask) => {
+    setPlatformPhraseProgress({
+      taskId: task.task_id,
+      status: task.status,
+      total: task.total_records || 0,
+      generated: task.generated_count || task.items.length,
+      failed: task.failed_count || 0,
+      completedBatches: task.completed_batches || 0,
+      batchCount: task.batch_count || 0,
+      message: task.message,
+    });
+  };
+
+  const pollPlatformPhraseTask = async (taskId: string) => {
+    while (platformPhraseTaskIdRef.current === taskId) {
+      await wait(1200);
+      let task: PlatformPhraseNormalizeTask;
+      try {
+        task = await getPlatformPhraseNormalizeTask(taskId);
+      } catch (error) {
+        if (platformPhraseTaskIdRef.current !== taskId) return;
+        platformPhraseTaskIdRef.current = '';
+        setIsLoadingPlatformPhrases(false);
+        setPlatformPhraseNotice(error instanceof Error ? error.message : '读取生成进度失败');
+        return;
+      }
+      if (platformPhraseTaskIdRef.current !== taskId) return;
+      applyPlatformPhraseTask(task);
+      if (!['queued', 'running'].includes(task.status)) {
+        platformPhraseTaskIdRef.current = '';
+        setIsLoadingPlatformPhrases(false);
+        if (task.items.length) {
+          setPlatformPhraseDrafts(task.items);
+          setSelectedPlatformPhraseIds(task.items.map((item) => item.source_id));
+          const suffix = task.failed_count ? `，${task.failed_count} 条未生成` : '';
+          setPlatformPhraseNotice(`已生成 ${task.items.length}/${task.total_records || task.items.length} 条草稿${suffix}`);
+          return;
+        }
+        setPlatformPhraseDrafts([]);
+        setSelectedPlatformPhraseIds([]);
+        setPlatformPhraseNotice(task.error || task.message || 'AI 未生成可导入的话术草稿，请重试');
+        return;
+      }
+    }
+  };
+
+  const loadPlatformPhrases = async () => {
+    if (!platformPhraseAccountId) {
+      setPlatformPhraseNotice('请先选择店铺');
+      return;
+    }
+    if (!window.desktopBridge?.importPddPlatformPhrases) {
+      setPlatformPhraseNotice('当前运行环境不支持导入平台话术');
+      return;
+    }
+    setIsLoadingPlatformPhrases(true);
+    setPlatformPhraseProgress(null);
+    setPlatformPhraseNotice('正在读取平台话术...');
+    let taskStarted = false;
+    try {
+      const account = platformPhraseAccounts.find((item) => item.id === platformPhraseAccountId) || null;
+      const cached = await getPlatformPhraseCache({
+        source: platformPhraseSource,
+        platformAccountId: account?.platformAccountId,
+        localAccountId: platformPhraseAccountId,
+      });
+      let records = cached.item?.records || [];
+      if (records.length) {
+        setPlatformPhraseNotice(`使用已保存的${platformPhraseSource === 'team' ? '团队' : '个人'}话术 ${records.length} 条，正在生成草稿...`);
+      } else {
+        const result = await window.desktopBridge.importPddPlatformPhrases({
+          accountId: platformPhraseAccountId,
+          source: platformPhraseSource,
+        });
+        if (result.status !== 'collected') {
+          setPlatformPhraseDrafts([]);
+          setSelectedPlatformPhraseIds([]);
+          setPlatformPhraseNotice(
+            result.error || (platformPhraseSource === 'team' ? '当前店铺未启用团队话术' : '平台话术读取失败'),
+          );
+          setIsLoadingPlatformPhrases(false);
+          return;
+        }
+        records = result.records as PlatformPhraseRecord[];
+        if (records.length) {
+          void savePlatformPhraseCache({
+            platform: 'pinduoduo',
+            source: platformPhraseSource,
+            platformAccountId: account?.platformAccountId,
+            localAccountId: platformPhraseAccountId,
+            records,
+            rawCount: result.raw_count,
+          }).catch(() => undefined);
+        }
+      }
+      if (!records.length) {
+        setPlatformPhraseDrafts([]);
+        setSelectedPlatformPhraseIds([]);
+        setPlatformPhraseNotice('平台接口没有返回可导入的话术');
+        setIsLoadingPlatformPhrases(false);
+        return;
+      }
+      const task = await createPlatformPhraseNormalizeTask({
+        platform: 'pinduoduo',
+        source: platformPhraseSource,
+        existing_categories: qaCategories.map((category) => category.name),
+        records,
+      });
+      platformPhraseTaskIdRef.current = task.task_id;
+      taskStarted = true;
+      applyPlatformPhraseTask(task);
+      setPlatformPhraseNotice(task.message || `正在生成 0/${records.length} 条话术草稿`);
+      void pollPlatformPhraseTask(task.task_id);
+    } catch (error) {
+      setPlatformPhraseNotice(error instanceof Error ? error.message : '导入平台话术失败');
+      platformPhraseTaskIdRef.current = '';
+      setPlatformPhraseProgress(null);
+      setIsLoadingPlatformPhrases(false);
+    } finally {
+      if (!taskStarted && platformPhraseTaskIdRef.current === '') {
+        setIsLoadingPlatformPhrases(false);
+      }
+    }
+  };
+
+  const cancelPlatformPhraseGeneration = async () => {
+    const taskId = platformPhraseTaskIdRef.current;
+    if (!taskId) return;
+    try {
+      const task = await cancelPlatformPhraseNormalizeTask(taskId);
+      applyPlatformPhraseTask(task);
+      setPlatformPhraseNotice(task.message || '正在停止生成');
+    } catch (error) {
+      setPlatformPhraseNotice(error instanceof Error ? error.message : '停止生成失败');
+    } finally {
+      platformPhraseTaskIdRef.current = '';
+      setIsLoadingPlatformPhrases(false);
+    }
+  };
+
+  const togglePlatformPhraseDraft = (sourceId: string) => {
+    setSelectedPlatformPhraseIds((current) => (
+      current.includes(sourceId)
+        ? current.filter((item) => item !== sourceId)
+        : [...current, sourceId]
+    ));
+  };
+
+  const importPlatformPhraseDrafts = async () => {
+    if (!selectedQABase || isImportingPlatformPhrases) return;
+    const selected = platformPhraseDrafts.filter((item) => selectedPlatformPhraseIds.includes(item.source_id));
+    if (!selected.length) {
+      setPlatformPhraseNotice('请至少选择一条草稿');
+      return;
+    }
+    setIsImportingPlatformPhrases(true);
+    setPlatformPhraseNotice('正在写入问答库...');
+    try {
+      const categoryCache = new Map(qaCategories.map((category) => [category.name.trim().toLowerCase(), category]));
+      for (const item of selected) {
+        const categoryName = item.category.trim() || '其他';
+        const categoryKey = categoryName.toLowerCase();
+        let category = categoryCache.get(categoryKey);
+        if (!category) {
+          category = await createQaCategory(selectedQABase.id, categoryName);
+          categoryCache.set(categoryKey, category);
+        }
+        await createQaEntry(selectedQABase.id, {
+          category_id: category.id,
+          category: category.name,
+          question: item.question.trim(),
+          keywords: item.keywords.map((keyword) => keyword.trim()).filter(Boolean),
+          answer: item.answer.trim(),
+          image_url: item.image_url || '',
+          weight: Number(item.weight) || 10,
+          enabled: item.enabled !== false,
+        });
+      }
+      await refreshQaPage(1);
+      const summary = await getKnowledgeBase(selectedQABase.id);
+      const updatedBase = mapQABase(summary);
+      setQaBases((prev) => prev.map((base) => base.id === updatedBase.id ? updatedBase : base));
+      setSelectedQABase(updatedBase);
+      setPlatformPhraseNotice(`已导入 ${selected.length} 条问答`);
+      setIsPlatformPhraseImportOpen(false);
+      setPlatformPhraseDrafts([]);
+      setSelectedPlatformPhraseIds([]);
+    } catch (error) {
+      setPlatformPhraseNotice(error instanceof Error ? error.message : '写入问答库失败');
+    } finally {
+      setIsImportingPlatformPhrases(false);
+    }
+  };
+
   const changeQaCategoryFilter = (categoryId: string) => {
     setQaCategoryFilter(categoryId);
     setQaPage(1);
@@ -856,6 +1137,9 @@ export function useAdminController() {
     setSelectedProductFile(null);
     setProductImportProgress(0);
     setProductImportNotice('正在加载文档列表...');
+    setProductSearchQuery('');
+    setProductSearchResult(null);
+    setProductSearchNotice('');
     setIsLoadingProductDocuments(true);
     try {
       const [documents, summary] = await Promise.all([
@@ -883,6 +1167,10 @@ export function useAdminController() {
     setIsImportingProductDocument(false);
     setProductImportProgress(0);
     setProductImportNotice('');
+    setProductSearchQuery('');
+    setProductSearchResult(null);
+    setProductSearchNotice('');
+    setIsTestingProductSearch(false);
   };
 
   const handleUpdateProductKB = async () => {
@@ -976,6 +1264,25 @@ export function useAdminController() {
       setProductImportNotice(error instanceof Error ? error.message : '刷新文档列表失败');
     } finally {
       setIsLoadingProductDocuments(false);
+    }
+  };
+
+  const handleTestProductSearch = async () => {
+    if (!selectedProductKB || !productSearchQuery.trim() || isTestingProductSearch) return;
+    setIsTestingProductSearch(true);
+    setProductSearchNotice('');
+    try {
+      const result = await searchProductDocuments({
+        query: productSearchQuery.trim(),
+        baseIds: [selectedProductKB.id],
+        topK: 5,
+      });
+      setProductSearchResult(result);
+      setProductSearchNotice(result.results.length ? '' : '没有召回可用片段，可尝试换一种问法或检查文档切片');
+    } catch (error) {
+      setProductSearchNotice(error instanceof Error ? error.message : '产品文档检索测试失败');
+    } finally {
+      setIsTestingProductSearch(false);
     }
   };
 
@@ -1161,6 +1468,24 @@ export function useAdminController() {
     isLoadingQA,
     isSavingQA,
     qaNotice,
+    isPlatformPhraseImportOpen,
+    platformPhraseAccounts,
+    platformPhraseAccountId,
+    setPlatformPhraseAccountId,
+    platformPhraseSource,
+    setPlatformPhraseSource,
+    platformPhraseDrafts,
+    selectedPlatformPhraseIds,
+    isLoadingPlatformPhrases,
+    isImportingPlatformPhrases,
+    platformPhraseNotice,
+    platformPhraseProgress,
+    openPlatformPhraseImport,
+    closePlatformPhraseImport,
+    loadPlatformPhrases,
+    cancelPlatformPhraseGeneration,
+    togglePlatformPhraseDraft,
+    importPlatformPhraseDrafts,
     isSidebarCollapsed,
     setIsSidebarCollapsed,
     expandedMenus,
@@ -1192,6 +1517,11 @@ export function useAdminController() {
     isLoadingProductDocumentDetail,
     isReprocessingProductDocument,
     productDocumentDetailNotice,
+    productSearchQuery,
+    setProductSearchQuery,
+    productSearchResult,
+    isTestingProductSearch,
+    productSearchNotice,
     toneBases,
     isLoadingToneKB,
     isSavingToneKB,
@@ -1223,6 +1553,7 @@ export function useAdminController() {
     handleImportProductDocument,
     handleDeleteProductDocument,
     refreshProductDocuments,
+    handleTestProductSearch,
     openProductDocumentDetail,
     closeProductDocumentDetail,
     handleReprocessProductDocument,

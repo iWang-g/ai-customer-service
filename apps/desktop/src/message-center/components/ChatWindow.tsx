@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { 
   Send, 
@@ -14,29 +14,51 @@ import {
   ShoppingBag,
   Info,
   Paperclip,
-  AlertTriangle,
-  Eye,
-  LoaderCircle,
-  RefreshCw,
+  Quote,
+  ArrowRightLeft,
+  Search,
+  Loader2,
 } from 'lucide-react';
 import type { Conversation, Message } from '../types';
 import CustomerAvatar from './CustomerAvatar';
-import { loadQaImageUrl, type MessageSyncIssueDetail } from '../../shared/api/client';
+import { loadQaImageUrl, type PlatformQuickReply } from '../../shared/api/client';
 
 interface ChatWindowProps {
   conversation?: Conversation;
   isLoading: boolean;
   error: string;
-  onSendMessage: (content: string) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | null }>;
-  onSendImage: (imageDataUrl: string) => Promise<void>;
+  onSendMessage: (content: string, options?: { quote?: Message | null }) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | 'api_send_message' | null }>;
+  onSendImage: (imageDataUrl: string, options?: { quote?: Message | null }) => Promise<void>;
+  onListTransferCs?: (conversation: Conversation) => Promise<{
+    status: 'collected';
+    cs_list: PddTransferCs[];
+    trans_reason: PddTransferReason[];
+  }>;
+  onTransferConversation?: (
+    conversation: Conversation,
+    targetCsid: string,
+    transReason: string,
+  ) => Promise<{
+    status: 'transferred';
+    target_cs_id: string | null;
+    target_cs_username: string | null;
+    target_cs_nickname: string | null;
+  }>;
+  quickReplies: {
+    personal: PlatformQuickReply[];
+    team: PlatformQuickReply[];
+  };
+  quickReplyInsert?: {
+    conversationId: string;
+    sourceId: string;
+    content: string;
+  } | null;
+  onQuickReplyInserted?: () => void;
   automaticSendNotice?: {
     kind: 'sending' | 'success' | 'error';
     text: string;
     version: number;
   } | null;
-  onLoadMessageSyncIssue: (conversationId: string) => Promise<MessageSyncIssueDetail>;
-  onDismissMessageSyncIssue: (conversationId: string) => Promise<void>;
-  onRebuildMessageQueue: (conversationId: string) => Promise<void>;
 }
 
 function ChatImage({ src, onOpen }: { src: string; onOpen: (url: string) => void }) {
@@ -105,6 +127,62 @@ function TimelineCard({ message }: { message: Message }) {
   const heading = isOrder ? '订单信息' : isContext
     ? data?.source_label || '商品来源'
     : timeline?.type === 'unknown' ? '平台内容' : '商品信息';
+  const linkUrl = data?.link_url || '';
+  const title = data?.title || message.content;
+  if (isOrder) {
+    return (
+      <div className="w-[360px] max-w-full overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+        <div className="flex items-center gap-2 border-b border-slate-100 px-3 py-2 text-xs font-semibold text-slate-500">
+          <Icon size={14} />
+          {heading}
+        </div>
+        <div className="space-y-3 p-3">
+          {data?.order_sequence_no ? (
+            <div className="flex min-w-0 items-center gap-2 text-xs text-slate-500">
+              <span className="shrink-0 font-medium text-slate-600">订单编号：</span>
+              <span className="min-w-0 flex-1 truncate">{data.order_sequence_no}</span>
+            </div>
+          ) : null}
+          {(data?.order_status_label || data?.after_sales_label) ? (
+            <div className="flex flex-wrap gap-2 text-xs">
+              {data?.order_status_label ? (
+                <span className="font-semibold text-rose-500">{data.order_status_label}</span>
+              ) : null}
+              {data?.after_sales_label ? (
+                <span className="text-slate-500">{data.after_sales_label}</span>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="flex gap-3">
+            {imageUrl ? <img src={imageUrl} alt="商品" className="h-16 w-16 shrink-0 rounded object-cover" referrerPolicy="no-referrer" /> : null}
+            <div className="min-w-0 flex-1">
+              {linkUrl ? (
+                <a
+                  href={linkUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block whitespace-pre-wrap break-words text-sm leading-5 text-sky-600 hover:text-sky-700 hover:underline"
+                >
+                  {title}
+                </a>
+              ) : (
+                <p className="whitespace-pre-wrap break-words text-sm leading-5 text-slate-700">{title}</p>
+              )}
+              {data?.spec ? <p className="mt-1 truncate text-xs text-slate-400">{data.spec}</p> : null}
+              <div className="mt-2 flex items-center justify-between gap-2 text-xs">
+                {data?.quantity ? <span className="text-slate-500">x{data.quantity}</span> : <span />}
+                {data?.amount_label ? (
+                  <span className="shrink-0 font-semibold text-rose-500">实收 {data.amount_label}</span>
+                ) : typeof data?.amount === 'number' ? (
+                  <span className="shrink-0 font-semibold text-rose-500">实收 ¥{data.amount.toFixed(2)}</span>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="w-[360px] max-w-full overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
       <div className="flex items-center gap-2 border-b border-slate-100 px-3 py-2 text-xs font-semibold text-slate-500">
@@ -114,7 +192,18 @@ function TimelineCard({ message }: { message: Message }) {
       <div className="flex gap-3 p-3">
         {imageUrl ? <img src={imageUrl} alt="商品" className="h-16 w-16 shrink-0 rounded object-cover" referrerPolicy="no-referrer" /> : null}
         <div className="min-w-0 flex-1">
-          <p className="whitespace-pre-wrap break-words text-sm leading-5 text-slate-700">{data?.title || message.content}</p>
+          {linkUrl ? (
+            <a
+              href={linkUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="block whitespace-pre-wrap break-words text-sm leading-5 text-sky-600 hover:text-sky-700 hover:underline"
+            >
+              {title}
+            </a>
+          ) : (
+            <p className="whitespace-pre-wrap break-words text-sm leading-5 text-slate-700">{title}</p>
+          )}
           <div className="mt-2 flex items-center justify-between gap-2 text-xs">
             {data?.product_id ? <span className="truncate text-slate-400">商品ID：{data.product_id}</span> : <span />}
             {data?.price_label ? (
@@ -123,13 +212,54 @@ function TimelineCard({ message }: { message: Message }) {
               <span className="shrink-0 font-semibold text-rose-500">¥{data.price.toFixed(2)}</span>
             ) : null}
           </div>
-          {timeline?.type === 'product' ? (
-            <span className="mt-2 inline-flex rounded border border-sky-200 px-2 py-1 text-xs font-medium text-sky-600">查看商品规格</span>
-          ) : null}
         </div>
       </div>
     </div>
   );
+}
+
+function QuotePreview({
+  quote,
+  compact = false,
+}: {
+  quote: NonNullable<Message['quote']>;
+  compact?: boolean;
+}) {
+  const isCustomer = quote.sender === 'user';
+  return (
+    <div className={`flex max-w-full items-center gap-2 rounded-md border-l-2 border-slate-300 bg-slate-100/80 px-2 py-1.5 text-xs text-slate-500 ${compact ? 'w-full' : 'mb-2'}`}>
+      {quote.media?.type === 'image' ? (
+        <img src={quote.media.url} alt="quoted" className="h-8 w-8 shrink-0 rounded object-cover" />
+      ) : null}
+      <div className="min-w-0 flex-1">
+        <div className="mb-0.5 font-semibold text-slate-400">{isCustomer ? '客户消息' : '客服消息'}</div>
+        <div className="truncate">{quote.content}</div>
+      </div>
+    </div>
+  );
+}
+
+function quoteFromMessage(message: Message): NonNullable<Message['quote']> {
+  return {
+    platformMessageId: message.platformMessageId || null,
+    sender: message.sender,
+    content: message.content || (message.media?.type === 'image' ? '[图片]' : '[引用消息]'),
+    ...(message.media ? { media: message.media } : {}),
+  };
+}
+
+function canQuoteMessage(message: Message): boolean {
+  if (!message.platformMessageId || message.sender === 'platform') return false;
+  if (message.media?.type === 'image') return true;
+  if (message.timeline?.type === 'image' || message.timeline?.type === 'text') return true;
+  return !message.timeline;
+}
+
+function isActiveConversation(conversation: Conversation): boolean {
+  if (!conversation.latestCustomerMessageAt) return false;
+  const date = new Date(conversation.latestCustomerMessageAt);
+  if (Number.isNaN(date.getTime())) return false;
+  return Date.now() - date.getTime() <= 3 * 24 * 60 * 60 * 1000;
 }
 
 export default function ChatWindow({
@@ -138,10 +268,12 @@ export default function ChatWindow({
   error,
   onSendMessage,
   onSendImage,
+  onListTransferCs,
+  onTransferConversation,
+  quickReplies,
+  quickReplyInsert,
+  onQuickReplyInserted,
   automaticSendNotice,
-  onLoadMessageSyncIssue,
-  onDismissMessageSyncIssue,
-  onRebuildMessageQueue,
 }: ChatWindowProps) {
   const [inputValue, setInputValue] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -149,18 +281,58 @@ export default function ChatWindow({
   const [sendNotice, setSendNotice] = useState('');
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [pendingImage, setPendingImage] = useState<{ url: string; name: string } | null>(null);
-  const [syncIssueDetail, setSyncIssueDetail] = useState<MessageSyncIssueDetail | null>(null);
-  const [isLoadingSyncIssue, setIsLoadingSyncIssue] = useState(false);
-  const [isRebuildingQueue, setIsRebuildingQueue] = useState(false);
-  const [syncIssueError, setSyncIssueError] = useState('');
-  const [confirmRebuild, setConfirmRebuild] = useState(false);
+  const [quotedMessage, setQuotedMessage] = useState<Message | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; message: Message } | null>(null);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
+  const [isSuggestionDismissed, setIsSuggestionDismissed] = useState(false);
+  const [isComposing, setIsComposing] = useState(false);
+  const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
+  const [isLoadingTransferCs, setIsLoadingTransferCs] = useState(false);
+  const [transferCsList, setTransferCsList] = useState<PddTransferCs[]>([]);
+  const [transferReasons, setTransferReasons] = useState<PddTransferReason[]>([]);
+  const [transferSearch, setTransferSearch] = useState('');
+  const [transferError, setTransferError] = useState('');
+  const [transferSuccess, setTransferSuccess] = useState('');
+  const [selectedTransferReason, setSelectedTransferReason] = useState('无原因直接转移');
+  const [transferringCsid, setTransferringCsid] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const previousConversationIdRef = useRef<string | undefined>(undefined);
   const sendNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeMessages = conversation?.messages ?? [];
   const hasSendingMessages = activeMessages.some((message) => message.deliveryStatus === 'sending');
+  const activeConversation = conversation ? isActiveConversation(conversation) : false;
+  const isPddConversation = conversation?.platform === 'pinduoduo';
+  const canTransferConversation = Boolean(
+    isPddConversation
+    && conversation?.shopId
+    && conversation?.externalConversationId
+    && onListTransferCs
+    && onTransferConversation,
+  );
+  const quickReplySuggestions = useMemo(() => {
+    const query = inputValue.trim().toLocaleLowerCase();
+    if (!conversation || pendingImage || !query) return [];
+    return [...quickReplies.personal, ...quickReplies.team]
+      .filter((item) => item.content.toLocaleLowerCase().includes(query))
+      .filter((item, index, items) => (
+        items.findIndex((candidate) => candidate.content === item.content) === index
+      ))
+      .slice(0, 5);
+  }, [conversation, inputValue, pendingImage, quickReplies.personal, quickReplies.team]);
+  const visibleTransferCsList = useMemo(() => {
+    const query = transferSearch.trim().toLocaleLowerCase();
+    if (!query) return transferCsList;
+    return transferCsList.filter((item) => [
+      item.accountName,
+      item.username,
+      item.nickname,
+      item.remark,
+      item.csid,
+    ].some((value) => String(value || '').toLocaleLowerCase().includes(query)));
+  }, [transferCsList, transferSearch]);
 
   useEffect(() => {
     const conversationChanged = previousConversationIdRef.current !== conversation?.id;
@@ -174,10 +346,14 @@ export default function ChatWindow({
   useEffect(() => {
     setPreviewImage(null);
     setPendingImage(null);
+    setQuotedMessage(null);
+    setContextMenu(null);
     setSendNotice('');
-    setSyncIssueDetail(null);
-    setSyncIssueError('');
-    setConfirmRebuild(false);
+    setIsTransferModalOpen(false);
+    setTransferSearch('');
+    setTransferError('');
+    setTransferSuccess('');
+    setTransferringCsid(null);
     if (sendNoticeTimerRef.current) {
       clearTimeout(sendNoticeTimerRef.current);
       sendNoticeTimerRef.current = null;
@@ -185,16 +361,33 @@ export default function ChatWindow({
   }, [conversation?.id]);
 
   useEffect(() => {
-    if (!conversation?.syncIssue?.requiresAttention) {
-      setSyncIssueDetail(null);
-      setSyncIssueError('');
-      setConfirmRebuild(false);
-    }
-  }, [conversation?.syncIssue?.observationId, conversation?.syncIssue?.requiresAttention]);
+    setActiveSuggestionIndex(0);
+  }, [inputValue, quickReplySuggestions.length]);
+
+  useEffect(() => {
+    if (!quickReplyInsert || quickReplyInsert.conversationId !== conversation?.id) return;
+    setInputValue(quickReplyInsert.content);
+    setSendError('');
+    setActiveSuggestionIndex(0);
+    setIsSuggestionDismissed(true);
+    onQuickReplyInserted?.();
+    window.requestAnimationFrame(() => inputRef.current?.focus());
+  }, [conversation?.id, onQuickReplyInserted, quickReplyInsert]);
 
   useEffect(() => () => {
     if (sendNoticeTimerRef.current) clearTimeout(sendNoticeTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!contextMenu) return undefined;
+    const close = () => setContextMenu(null);
+    document.addEventListener('click', close);
+    document.addEventListener('keydown', close);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('keydown', close);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     if (!previewImage) return undefined;
@@ -219,12 +412,13 @@ export default function ChatWindow({
       sendNoticeTimerRef.current = null;
     }
     try {
-      if (pendingImage) await onSendImage(pendingImage.url);
+      if (pendingImage) await onSendImage(pendingImage.url, { quote: quotedMessage });
       else {
-        await onSendMessage(content);
+        await onSendMessage(content, { quote: quotedMessage });
         setInputValue('');
       }
       setPendingImage(null);
+      setQuotedMessage(null);
       setSendNotice('发送成功');
       sendNoticeTimerRef.current = setTimeout(() => {
         setSendNotice('');
@@ -237,46 +431,57 @@ export default function ChatWindow({
     }
   };
 
-  const handleLoadSyncIssue = async () => {
-    if (!conversation || isLoadingSyncIssue) return;
-    if (syncIssueDetail?.issue.observation_id === conversation.syncIssue?.observationId) {
-      setSyncIssueDetail(null);
-      return;
-    }
-    setIsLoadingSyncIssue(true);
-    setSyncIssueError('');
+  const openTransferModal = async () => {
+    if (!conversation || !onListTransferCs) return;
+    setIsTransferModalOpen(true);
+    setIsLoadingTransferCs(true);
+    setTransferCsList([]);
+    setTransferReasons([]);
+    setTransferSearch('');
+    setTransferError('');
+    setTransferSuccess('');
+    setSelectedTransferReason('无原因直接转移');
     try {
-      setSyncIssueDetail(await onLoadMessageSyncIssue(conversation.id));
-    } catch (issueError) {
-      setSyncIssueError(issueError instanceof Error ? issueError.message : '读取采集快照失败');
+      const result = await onListTransferCs(conversation);
+      const reasons = result.trans_reason?.length
+        ? result.trans_reason
+        : [{ code: null, desc: '无原因直接转移' }];
+      setTransferCsList(result.cs_list || []);
+      setTransferReasons(reasons);
+      setSelectedTransferReason(
+        reasons.find((reason) => reason.desc === '无原因直接转移')?.desc
+        || reasons[0]?.desc
+        || '无原因直接转移',
+      );
+    } catch (transferListError) {
+      setTransferError(transferListError instanceof Error ? transferListError.message : '客服列表加载失败');
     } finally {
-      setIsLoadingSyncIssue(false);
+      setIsLoadingTransferCs(false);
     }
   };
 
-  const handleDismissSyncIssue = async () => {
-    if (!conversation) return;
-    setSyncIssueError('');
+  const submitTransfer = async (target: PddTransferCs) => {
+    if (!conversation || !onTransferConversation || transferringCsid) return;
+    setTransferringCsid(target.csid);
+    setTransferError('');
+    setTransferSuccess('');
     try {
-      await onDismissMessageSyncIssue(conversation.id);
-    } catch (issueError) {
-      setSyncIssueError(issueError instanceof Error ? issueError.message : '暂时隐藏提示失败');
+      await onTransferConversation(conversation, target.csid, selectedTransferReason || '无原因直接转移');
+      setTransferSuccess(`已转移给 ${target.nickname || target.accountName || target.csid}`);
+      window.setTimeout(() => setIsTransferModalOpen(false), 800);
+    } catch (transferErrorResult) {
+      setTransferError(transferErrorResult instanceof Error ? transferErrorResult.message : '会话转移失败');
+    } finally {
+      setTransferringCsid(null);
     }
   };
 
-  const handleRebuildQueue = async () => {
-    if (!conversation || isRebuildingQueue) return;
-    setIsRebuildingQueue(true);
-    setSyncIssueError('');
-    try {
-      await onRebuildMessageQueue(conversation.id);
-      setSyncIssueDetail(null);
-      setConfirmRebuild(false);
-    } catch (issueError) {
-      setSyncIssueError(issueError instanceof Error ? issueError.message : '重建会话消息队列失败');
-    } finally {
-      setIsRebuildingQueue(false);
-    }
+  const selectQuickReply = (item: PlatformQuickReply) => {
+    setInputValue(item.content);
+    setSendError('');
+    setActiveSuggestionIndex(0);
+    setIsSuggestionDismissed(true);
+    window.requestAnimationFrame(() => inputRef.current?.focus());
   };
 
   const selectImage = (file: File | null) => {
@@ -302,7 +507,7 @@ export default function ChatWindow({
 
   if (!conversation) {
     return (
-      <div className="flex-1 h-full flex flex-col items-center justify-center bg-brand-bg relative overflow-hidden" id="empty-chat">
+      <div className="min-w-0 flex-1 h-full flex flex-col items-center justify-center bg-brand-bg relative overflow-hidden" id="empty-chat">
          <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#0ea5e9 1px, transparent 1px)', backgroundSize: '24px 24px' }}></div>
          <div className="text-center space-y-4 z-10">
            <div className="w-20 h-20 bg-white rounded-3xl shadow-xl flex items-center justify-center mx-auto mb-6">
@@ -318,115 +523,40 @@ export default function ChatWindow({
   }
 
   return (
-    <div className="flex-1 h-full flex flex-col bg-white" id="chat-window">
+    <div className="min-w-0 flex-1 h-full flex flex-col bg-white" id="chat-window">
       {/* Header */}
-      <div className="h-16 border-bottom border-brand-border px-6 flex items-center justify-between bg-white z-10 sticky top-0" id="chat-header">
-        <div className="flex items-center gap-3">
-          <CustomerAvatar name={conversation.userName} size="header" />
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-slate-800">{conversation.userName}</span>
-              <span className="px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px] font-bold uppercase tracking-wider">
-                {conversation.platform}
+      <div className="h-16 shrink-0 border-bottom border-brand-border px-6 flex items-center justify-between bg-white z-10 sticky top-0" id="chat-header">
+        <div className="flex min-w-0 items-center gap-3">
+          <CustomerAvatar name={conversation.userName} size="header" src={conversation.avatarUrl} />
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="min-w-0 truncate font-bold text-slate-800">{conversation.userName}</span>
+              <span className="px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px] font-bold">
+                {conversation.platformName}
               </span>
             </div>
             <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500"></span>
-              <span className="text-[10px] text-slate-400 font-medium uppercase tracking-tight">Active Conversation</span>
+              <span className={`w-1.5 h-1.5 rounded-full ${activeConversation ? 'bg-green-500' : 'bg-slate-300'}`}></span>
+              <span className="text-[10px] text-slate-400 font-medium tracking-tight">
+                {activeConversation ? '活跃会话' : '非活跃会话'}
+              </span>
             </div>
           </div>
         </div>
-
+        {isPddConversation && (
+          <button
+            type="button"
+            onClick={openTransferModal}
+            disabled={!canTransferConversation || isLoadingTransferCs || Boolean(transferringCsid)}
+            className="ml-4 inline-flex h-9 shrink-0 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 shadow-sm transition-colors hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label="转移会话"
+            title={canTransferConversation ? '转移会话' : '当前会话缺少可转移参数'}
+          >
+            <ArrowRightLeft size={15} />
+            转移会话
+          </button>
+        )}
       </div>
-
-      {conversation.syncIssue?.requiresAttention && (
-        <div className="border-y border-amber-200 bg-amber-50 px-6 py-3 text-amber-950">
-          <div className="flex items-start gap-3">
-            <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-600" />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-bold">该会话的消息序列无法安全衔接</p>
-              <p className="mt-1 text-xs leading-5 text-amber-800">
-                检测到未读消息，但最新采集内容暂未写入聊天区。其他会话的采集和自动回复不受影响。
-              </p>
-              <div className="mt-2 flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => void handleLoadSyncIssue()}
-                  disabled={isLoadingSyncIssue || isRebuildingQueue}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-amber-300 bg-white px-2.5 py-1.5 text-xs font-bold text-amber-800 hover:bg-amber-100 disabled:opacity-50"
-                >
-                  {isLoadingSyncIssue ? <LoaderCircle size={14} className="animate-spin" /> : <Eye size={14} />}
-                  {syncIssueDetail ? '收起采集内容' : '查看采集内容'}
-                </button>
-                {!confirmRebuild ? (
-                  <button
-                    type="button"
-                    onClick={() => setConfirmRebuild(true)}
-                    disabled={isRebuildingQueue}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-amber-700 disabled:opacity-50"
-                  >
-                    <RefreshCw size={14} />
-                    重建消息队列
-                  </button>
-                ) : (
-                  <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="font-semibold text-amber-800">将用最新完整快照替换当前消息队列，且不会触发自动回复。</span>
-                    <button
-                      type="button"
-                      onClick={() => void handleRebuildQueue()}
-                      disabled={isRebuildingQueue}
-                      className="inline-flex items-center gap-1.5 rounded-md bg-rose-600 px-2.5 py-1.5 font-bold text-white hover:bg-rose-700 disabled:opacity-60"
-                    >
-                      {isRebuildingQueue ? <LoaderCircle size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                      确认重建
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfirmRebuild(false)}
-                      disabled={isRebuildingQueue}
-                      className="rounded-md px-2 py-1.5 font-bold text-amber-800 hover:bg-amber-100 disabled:opacity-50"
-                    >
-                      取消
-                    </button>
-                  </div>
-                )}
-                <button
-                  type="button"
-                  onClick={() => void handleDismissSyncIssue()}
-                  disabled={isRebuildingQueue}
-                  className="rounded-md px-2 py-1.5 text-xs font-bold text-amber-700 hover:bg-amber-100 disabled:opacity-50"
-                >
-                  暂不处理
-                </button>
-              </div>
-              {syncIssueError && <p className="mt-2 text-xs font-semibold text-rose-600">{syncIssueError}</p>}
-              {syncIssueDetail && (
-                <div className="mt-3 max-h-48 overflow-y-auto border-t border-amber-200 pt-2">
-                  <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-amber-700">
-                    <span>最近快照共 {syncIssueDetail.messages.length} 条内容</span>
-                    <span>{new Date(syncIssueDetail.issue.latest_detected_at).toLocaleString('zh-CN')}</span>
-                  </div>
-                  <div className="space-y-1.5">
-                    {syncIssueDetail.messages.map((message) => (
-                      <div
-                        key={`${message.dom_sequence}:${message.sender_role}:${message.content}`}
-                        className="flex gap-2 text-xs leading-5"
-                      >
-                        <span className="w-12 shrink-0 font-bold text-amber-700">
-                          {message.sender_role === 'customer' ? '客户' : message.sender_role === 'agent' ? '客服' : '平台'}
-                        </span>
-                        <span className="min-w-0 flex-1 break-words text-amber-950">
-                          {message.content || `[${message.message_type}]`}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Message List */}
       <div 
@@ -435,7 +565,7 @@ export default function ChatWindow({
           const element = event.currentTarget;
           stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
         }}
-        className="flex-1 overflow-y-auto px-6 py-8 space-y-6 bg-brand-bg relative" 
+        className="min-w-0 flex-1 overflow-y-auto px-6 py-8 space-y-6 bg-brand-bg relative"
         id="message-list"
       >
         <div className="absolute inset-0 opacity-[0.02] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#0ea5e9 1px, transparent 1px)', backgroundSize: '32px 32px' }}></div>
@@ -472,18 +602,25 @@ export default function ChatWindow({
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 className={`flex items-start gap-3 ${isPlatform ? 'justify-center' : isCustomer ? 'justify-start' : 'justify-start flex-row-reverse'}`}
                 id={`msg-${msg.id}`}
+                onContextMenu={(event) => {
+                  if (!canQuoteMessage(msg)) return;
+                  event.preventDefault();
+                  setContextMenu({ x: event.clientX, y: event.clientY, message: msg });
+                }}
               >
                 {isPlatform ? null : isFirst ? (
                   <CustomerAvatar
                     name={isCustomer ? conversation.userName : '客服'}
                     size="message"
                     type={isCustomer ? 'customer' : 'service'}
+                    src={isCustomer ? conversation.avatarUrl : conversation.shopLogoUrl}
                   />
                 ) : (
-                  <div className="w-8 flex-shrink-0" />
+                  <div className="w-10 flex-shrink-0" />
                 )}
                 
                 <div className={`min-w-0 group relative z-10 flex flex-col ${isPlatform ? 'max-w-[80%] items-center' : isCustomer ? 'max-w-[70%] items-start' : 'max-w-[70%] items-end'}`}>
+                  {msg.quote ? <QuotePreview quote={msg.quote} /> : null}
                   {displayMode === 'card' ? (
                     <TimelineCard message={msg} />
                   ) : msg.media?.type === 'image' ? (
@@ -492,7 +629,7 @@ export default function ChatWindow({
                     <div className={`w-fit max-w-full px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm break-words whitespace-pre-wrap ${
                       isCustomer 
                         ? 'bg-white text-slate-700 rounded-tl-md border border-slate-100' 
-                        : `bg-sky-500 text-white rounded-tr-md ${msg.deliveryStatus === 'sending' ? 'opacity-70' : ''}`
+                        : `bg-sky-500 text-white rounded-tr-md ${msg.deliveryStatus === 'sending' || msg.deliveryStatus === 'failed' ? 'opacity-70' : ''}`
                     }`}>
                       {msg.content}
                     </div>
@@ -505,11 +642,33 @@ export default function ChatWindow({
                   {!isCustomer && msg.deliveryStatus === 'sending' && (
                     <div className="mt-1 text-[10px] font-medium text-slate-400">发送中...</div>
                   )}
+                  {!isCustomer && msg.deliveryStatus === 'failed' && (
+                    <div className="mt-1 text-[10px] font-medium text-rose-500">发送失败</div>
+                  )}
                 </div>
               </motion.div>
             );
           })}
         </AnimatePresence>
+        {contextMenu && (
+          <div
+            className="fixed z-[80] min-w-32 rounded-md border border-slate-200 bg-white p-1 shadow-lg"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-xs font-semibold text-slate-600 hover:bg-slate-50"
+              onClick={() => {
+                setQuotedMessage(contextMenu.message);
+                setContextMenu(null);
+              }}
+            >
+              <Quote size={14} />
+              引用回复
+            </button>
+          </div>
+        )}
       </div>
 
       <AnimatePresence>
@@ -545,8 +704,149 @@ export default function ChatWindow({
         )}
       </AnimatePresence>
 
+      <AnimatePresence>
+        {isTransferModalOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[75] flex items-center justify-center bg-slate-950/35 p-6"
+            role="dialog"
+            aria-modal="true"
+            aria-label="转移会话"
+            onClick={() => !transferringCsid && setIsTransferModalOpen(false)}
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 12, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.98 }}
+              className="flex max-h-[82vh] w-[760px] max-w-full flex-col overflow-hidden rounded-lg bg-white shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 px-5">
+                <h2 className="text-sm font-semibold text-slate-800">转移会话</h2>
+                <button
+                  type="button"
+                  onClick={() => setIsTransferModalOpen(false)}
+                  disabled={Boolean(transferringCsid)}
+                  className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-label="关闭转移会话弹窗"
+                  title="关闭"
+                >
+                  <X size={17} />
+                </button>
+              </div>
+
+              <div className="flex min-h-0 flex-1 flex-col gap-3 p-5">
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="relative min-w-0 flex-1">
+                    <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="search"
+                      value={transferSearch}
+                      onChange={(event) => setTransferSearch(event.target.value)}
+                      placeholder="请输入内容"
+                      className="h-9 w-full rounded-md border border-slate-200 bg-white pl-9 pr-3 text-sm text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                    />
+                  </label>
+                  <select
+                    value={selectedTransferReason}
+                    onChange={(event) => setSelectedTransferReason(event.target.value)}
+                    className="h-9 w-44 rounded-md border border-slate-200 bg-white px-3 text-xs font-medium text-slate-600 outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                    aria-label="转移原因"
+                  >
+                    {(transferReasons.length ? transferReasons : [{ code: null, desc: '无原因直接转移' }]).map((reason) => (
+                      <option key={`${reason.code ?? 'default'}:${reason.desc}`} value={reason.desc}>
+                        {reason.desc}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {transferError && (
+                  <div className="rounded-md border border-rose-100 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-600">
+                    {transferError}
+                  </div>
+                )}
+                {transferSuccess && (
+                  <div className="rounded-md border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-600">
+                    {transferSuccess}
+                  </div>
+                )}
+
+                <div className="min-h-[260px] overflow-hidden rounded-md border border-slate-200">
+                  <div className="grid h-10 grid-cols-[1.2fr_1fr_1fr_96px_176px] items-center border-b border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-500">
+                    <div className="min-w-0">账号名</div>
+                    <div className="min-w-0">昵称</div>
+                    <div className="min-w-0">备注</div>
+                    <div className="text-right">当前未回复</div>
+                    <div className="text-right">操作</div>
+                  </div>
+                  <div className="max-h-[360px] overflow-y-auto">
+                    {isLoadingTransferCs ? (
+                      <div className="flex h-48 items-center justify-center gap-2 text-xs font-semibold text-slate-400">
+                        <Loader2 size={16} className="animate-spin" />
+                        正在加载客服账号...
+                      </div>
+                    ) : visibleTransferCsList.length ? (
+                      visibleTransferCsList.map((item) => {
+                        const isCurrentTransferring = transferringCsid === item.csid;
+                        return (
+                          <div
+                            key={item.csid}
+                            className="grid min-h-12 grid-cols-[1.2fr_1fr_1fr_96px_176px] items-center border-b border-slate-100 px-3 text-xs text-slate-600 last:border-b-0 hover:bg-slate-50"
+                          >
+                            <div className="min-w-0 truncate font-medium text-slate-700" title={item.accountName || item.username || item.csid}>
+                              {item.accountName || item.username || item.csid}
+                            </div>
+                            <div className="min-w-0 truncate" title={item.nickname || '-'}>
+                              {item.nickname || '-'}
+                            </div>
+                            <div className="min-w-0 truncate text-slate-400" title={item.remark || '-'}>
+                              {item.remark || '-'}
+                            </div>
+                            <div className="text-right font-semibold text-slate-700">{item.unreplyNum || 0}</div>
+                            <div className="flex justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => submitTransfer(item)}
+                                disabled={Boolean(transferringCsid)}
+                                className="inline-flex h-8 items-center justify-center rounded-md bg-sky-500 px-3 text-xs font-semibold text-white transition-colors hover:bg-sky-600 disabled:cursor-not-allowed disabled:bg-slate-300"
+                              >
+                                {isCurrentTransferring ? (
+                                  <>
+                                    <Loader2 size={14} className="mr-1.5 animate-spin" />
+                                    转移中
+                                  </>
+                                ) : '转移'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled
+                                className="inline-flex h-8 items-center justify-center rounded-md border border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-300"
+                                title="暂不支持微信通知"
+                              >
+                                转移并微信通知
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div className="flex h-48 items-center justify-center text-xs font-semibold text-slate-400">
+                        {transferSearch ? '没有匹配的客服账号' : '暂无可转移客服账号'}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Input Area */}
-      <div className="p-6 border-top border-brand-border bg-white" id="input-area">
+      <div className="relative shrink-0 p-6 border-top border-brand-border bg-white" id="input-area">
         {sendError && <p className="max-w-4xl mx-auto mb-2 text-xs font-semibold text-rose-600">{sendError}</p>}
         {!sendError && (sendNotice || automaticSendNotice || hasSendingMessages) && (
           <p className={`max-w-4xl mx-auto mb-2 text-xs font-semibold ${
@@ -568,16 +868,92 @@ export default function ChatWindow({
             <button type="button" onClick={() => setPendingImage(null)} className="rounded-lg p-2 text-slate-400 hover:bg-white hover:text-rose-500" aria-label="移除待发送图片"><X size={17} /></button>
           </div>
         )}
-        <div className="flex items-end gap-3 max-w-4xl mx-auto bg-slate-50 border border-slate-100 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-brand-active/10 focus-within:border-brand-active transition-all">
+        {quotedMessage && (
+          <div className="mx-auto mb-2 flex max-w-4xl items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-2">
+            <QuotePreview quote={quoteFromMessage(quotedMessage)} compact />
+            <button
+              type="button"
+              onClick={() => setQuotedMessage(null)}
+              className="shrink-0 rounded-lg p-2 text-slate-400 hover:bg-white hover:text-rose-500"
+              aria-label="取消引用"
+              title="取消引用"
+            >
+              <X size={17} />
+            </button>
+          </div>
+        )}
+        {quickReplySuggestions.length > 0 && !isComposing && !isSuggestionDismissed && (
+          <div
+            className="absolute bottom-[calc(100%-1.25rem)] left-6 right-6 z-30 mx-auto max-w-4xl overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl"
+            role="listbox"
+            aria-label="内容联想"
+          >
+            {quickReplySuggestions.map((item, index) => (
+              <button
+                key={`${item.source_id}:${item.content}`}
+                type="button"
+                role="option"
+                aria-selected={index === activeSuggestionIndex}
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  selectQuickReply(item);
+                }}
+                className={`flex w-full items-start gap-2 border-b border-slate-100 px-3 py-2 text-left last:border-b-0 ${
+                  index === activeSuggestionIndex ? 'bg-sky-50' : 'bg-white hover:bg-slate-50'
+                }`}
+              >
+                <span className="mt-0.5 shrink-0 text-[10px] font-semibold text-slate-400">
+                  {item.source === 'personal' ? '个人' : '团队'}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-xs leading-5 text-slate-700">{item.content}</span>
+                  <span className="block truncate text-[10px] leading-4 text-slate-400">
+                    {item.category || '未分类'}
+                    {item.quick_key ? ` · ${item.quick_key}` : ''}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="mx-auto flex max-w-4xl min-w-0 items-end gap-3 bg-slate-50 border border-slate-100 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-brand-active/10 focus-within:border-brand-active transition-all">
           <input ref={fileInputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(event) => { selectImage(event.target.files?.[0] || null); event.currentTarget.value = ''; }} />
           <button type="button" onClick={() => fileInputRef.current?.click()} disabled={isSending || Boolean(pendingImage)} className="rounded-xl p-2.5 text-slate-400 transition-colors hover:bg-white hover:text-brand-active disabled:opacity-40" title="发送图片" aria-label="发送图片"><Paperclip size={18} /></button>
           <textarea
+            ref={inputRef}
             rows={1}
             value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
+            onChange={(e) => {
+              setInputValue(e.target.value);
+              setIsSuggestionDismissed(false);
+            }}
             placeholder="输入消息..."
-            className="flex-1 bg-transparent border-none outline-none focus:outline-none focus-visible:outline-none focus:ring-0 focus-visible:ring-0 text-sm py-2.5 resize-none max-h-32 text-slate-700 appearance-none"
+            className="min-w-0 flex-1 bg-transparent border-none outline-none focus:outline-none focus-visible:outline-none focus:ring-0 focus-visible:ring-0 text-sm py-2.5 resize-none max-h-32 text-slate-700 appearance-none"
             onKeyDown={(e) => {
+              if (!isComposing && !isSuggestionDismissed && quickReplySuggestions.length > 0) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setActiveSuggestionIndex((current) => (current + 1) % quickReplySuggestions.length);
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setActiveSuggestionIndex((current) => (
+                    (current - 1 + quickReplySuggestions.length) % quickReplySuggestions.length
+                  ));
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setIsSuggestionDismissed(true);
+                  return;
+                }
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  selectQuickReply(quickReplySuggestions[activeSuggestionIndex] || quickReplySuggestions[0]);
+                  return;
+                }
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 handleSend();
@@ -590,6 +966,8 @@ export default function ChatWindow({
                 selectImage(image);
               }
             }}
+            onCompositionStart={() => setIsComposing(true)}
+            onCompositionEnd={() => setIsComposing(false)}
             id="chat-input"
           />
           <button 

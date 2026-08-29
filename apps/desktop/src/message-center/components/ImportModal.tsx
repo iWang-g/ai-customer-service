@@ -68,6 +68,8 @@ export default function ImportModal({
     if (!term) return candidates;
     return candidates.filter((candidate) => [
       candidate.customerName,
+      candidate.externalConversationId || '',
+      candidate.conversationKey,
       candidate.shopName,
       candidate.platformName,
       candidate.previewText || '',
@@ -167,6 +169,7 @@ export default function ImportModal({
                           <div className="min-w-0">
                             <div className="text-xs font-bold text-slate-700 truncate">{candidate.platformName} - {candidate.shopName}</div>
                             <div className="text-[11px] text-slate-500 font-semibold mt-0.5 truncate">{candidate.customerName}</div>
+                            <div className="text-[10px] text-slate-400 mt-0.5 truncate">UID {candidate.externalConversationId || candidate.conversationKey}</div>
                             {candidate.previewText && <div className="text-[10px] text-slate-400 mt-0.5 truncate">{candidate.previewText}</div>}
                           </div>
                         </div>
