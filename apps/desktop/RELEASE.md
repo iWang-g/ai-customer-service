@@ -16,13 +16,12 @@
 
 发布前检查 `config/release.json`。第一版当前使用：
 
-- Business API：`http://43.139.142.142/api/v1`；
-- Knowledge Base：`http://43.139.142.142/kb-api/api/v1`；
-- WebSocket：`ws://43.139.142.142`。
+- 本地测试配置：`config/release.json`，默认指向 `127.0.0.1` 的三个本地服务。
+- 远程测试配置：`config/remote.json`，指向 `43.139.142.142`。
 
 配置会作为 `runtime-config.json` 写入安装目录。Electron 渲染进程、拼多多工作区
-和本机 RPA 共用该配置。校验器会拒绝把正式安装包指向 `127.0.0.1`、`localhost`
-或 `::1`。
+和本机 RPA 共用该配置。校验器默认会拒绝把正式安装包指向 `127.0.0.1`、`localhost`
+和 `::1`，除非配置中显式设置 `allowLoopback: true`，用于本地开发测试包。
 
 切换服务器、域名或 HTTPS 时，修改这一份文件后重新构建即可。配置中不能放 JWT
 密钥、AI Key、服务器密码或其他秘密。

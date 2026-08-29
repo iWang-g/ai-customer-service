@@ -11,10 +11,13 @@
     "dev:desktop": "pnpm --dir apps/desktop dev",
     "build": "pnpm --dir apps/desktop build",
     "lint": "pnpm --dir apps/desktop lint",
+    "test:pdd-api-adapter": "pnpm --dir apps/desktop test:pdd-api-adapter",
     "smoke:phase-b": "python scripts/smoke_phase_b.py",
     "smoke:phase-c": "python scripts/smoke_phase_c.py",
     "start": "pnpm --dir apps/desktop start",
     "dist": "pnpm --dir apps/desktop dist",
+    "dist:local": "pnpm --dir apps/desktop dist:local",
+    "dist:remote": "pnpm --dir apps/desktop dist:remote",
     "validate:release": "pnpm --dir apps/desktop validate:release",
     "build:rpa": "pnpm --dir apps/desktop build:rpa"
   }

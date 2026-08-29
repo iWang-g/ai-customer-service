@@ -6,6 +6,7 @@ import packageJson from '../package.json' with { type: 'json' };
 
 const desktopDirectory = path.resolve(import.meta.dirname, '..');
 const configuredOutput = process.argv[2] || packageJson.build.directories.output;
+const expectedConfigPath = process.argv[3] || path.join('config', 'release.json');
 const outputDirectory = path.resolve(desktopDirectory, configuredOutput);
 const productName = packageJson.build.productName;
 const installerPath = path.join(
@@ -27,7 +28,7 @@ const packagedConfig = validateRuntimeConfig(
   { rejectLoopback: true },
 );
 const expectedConfig = validateRuntimeConfig(
-  JSON.parse(fs.readFileSync(path.join(desktopDirectory, 'config', 'release.json'), 'utf8')),
+  JSON.parse(fs.readFileSync(path.resolve(desktopDirectory, expectedConfigPath), 'utf8')),
   { rejectLoopback: true },
 );
 assert.deepEqual({ ...packagedConfig }, { ...expectedConfig });

@@ -7,7 +7,7 @@ const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopDirectory = path.resolve(scriptDirectory, '..');
 const configPath = path.resolve(
   desktopDirectory,
-  process.argv[2] || path.join('config', 'release.json'),
+  process.env.RUNTIME_CONFIG_FILE || process.argv[2] || path.join('config', 'release.json'),
 );
 
 let config;

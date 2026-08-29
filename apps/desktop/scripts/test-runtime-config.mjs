@@ -14,8 +14,22 @@ const remoteConfig = {
   knowledgeBaseUrl: 'http://43.139.142.142/kb-api/api/v1',
   websocketUrl: 'ws://43.139.142.142',
 };
+const localPackagedConfig = {
+  businessApiUrl: 'http://127.0.0.1:8001/api/v1',
+  knowledgeBaseUrl: 'http://127.0.0.1:8010/api/v1',
+  websocketUrl: 'ws://127.0.0.1:8001',
+  allowLoopback: true,
+};
 
 assert.deepEqual({ ...validateRuntimeConfig(remoteConfig, { rejectLoopback: true }) }, remoteConfig);
+assert.deepEqual(
+  { ...validateRuntimeConfig(localPackagedConfig, { rejectLoopback: true }) },
+  {
+    businessApiUrl: localPackagedConfig.businessApiUrl,
+    knowledgeBaseUrl: localPackagedConfig.knowledgeBaseUrl,
+    websocketUrl: localPackagedConfig.websocketUrl,
+  },
+);
 assert.equal(serviceProxyBypassRules(remoteConfig), '43.139.142.142');
 assert.equal(serviceProxyBypassRules({
   businessApiUrl: 'https://api.example.com/api/v1',

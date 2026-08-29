@@ -18,12 +18,15 @@
     "lint": "tsc --noEmit",
     "smoke:pdd-workspace": "electron scripts/smoke-pdd-workspace.mjs",
     "smoke:pdd-adapter": "electron scripts/smoke-pdd-adapter.mjs",
+    "test:pdd-api-adapter": "node scripts/test-pdd-api-adapter.mjs",
     "test:pdd-collector": "node scripts/test-pdd-collector.mjs",
     "test:store-actor": "node scripts/test-store-actor.mjs",
     "test:pdd-session-health": "electron scripts/test-pdd-session-health.mjs",
     "test:wechat-process-manager": "node scripts/test-wechat-process-manager.mjs",
     "start": "electron .",
-    "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1"
+    "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1",
+    "dist:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1 -RuntimeConfigFile config/local.json",
+    "dist:remote": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1 -RuntimeConfigFile config/remote.json"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
