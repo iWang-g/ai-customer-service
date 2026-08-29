@@ -8,6 +8,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.errors import request_validation_exception_handler
 from app.api.routes.auth import router as auth_router
@@ -19,6 +20,7 @@ from app.api.routes.health import router as health_router
 from app.api.routes.messages import router as messages_router
 from app.api.routes.monitoring import router as monitoring_router
 from app.api.routes.platform_accounts import router as platform_accounts_router
+from app.api.routes.platform_phrases import router as platform_phrases_router
 from app.api.routes.rpa import router as rpa_router
 from app.api.routes.robots import router as robots_router
 from app.api.routes.settings import router as settings_router
@@ -29,6 +31,12 @@ from app.core.config import get_settings
 from app.db.session import engine, init_db
 from app.models import Base
 from app.services.auth_service import bootstrap_admin_user
+from app.services.avatar_cache_service import (
+    AVATAR_CACHE_ROUTE,
+    LOGO_CACHE_ROUTE,
+    get_avatar_cache_dir,
+    get_logo_cache_dir,
+)
 from app.services.order_service import schedule_due_outreach_rechecks
 from app.db.session import SessionLocal
 from sqlalchemy.orm import Session
@@ -45,6 +53,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    avatar_cache_dir = get_avatar_cache_dir()
+    avatar_cache_dir.mkdir(parents=True, exist_ok=True)
+    app.mount(AVATAR_CACHE_ROUTE, StaticFiles(directory=avatar_cache_dir), name="avatar-cache")
+    logo_cache_dir = get_logo_cache_dir()
+    logo_cache_dir.mkdir(parents=True, exist_ok=True)
+    app.mount(LOGO_CACHE_ROUTE, StaticFiles(directory=logo_cache_dir), name="logo-cache")
 
     app.include_router(health_router)
     app.include_router(auth_router, prefix=settings.api_prefix)
@@ -56,6 +70,7 @@ def create_app() -> FastAPI:
     app.include_router(messages_router, prefix=settings.api_prefix)
     app.include_router(monitoring_router, prefix=settings.api_prefix)
     app.include_router(platform_accounts_router, prefix=settings.api_prefix)
+    app.include_router(platform_phrases_router, prefix=settings.api_prefix)
     app.include_router(robots_router, prefix=settings.api_prefix)
     app.include_router(settings_router, prefix=settings.api_prefix)
     app.include_router(ai_config_router, prefix=settings.api_prefix)

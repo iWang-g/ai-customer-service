@@ -4,6 +4,74 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 
+def _sqlite_unique_columns(connection, table_name: str) -> set[tuple[str, ...]]:
+    columns: set[tuple[str, ...]] = set()
+    for row in connection.execute(text(f"PRAGMA index_list('{table_name}')")).mappings():
+        if not row.get("unique"):
+            continue
+        index_name = row.get("name")
+        if not index_name:
+            continue
+        index_columns = tuple(
+            item["name"]
+            for item in connection.execute(text(f"PRAGMA index_info('{index_name}')")).mappings()
+            if item.get("name")
+        )
+        if index_columns:
+            columns.add(index_columns)
+    return columns
+
+
+def _ensure_customer_outreach_goods_unique(connection) -> None:
+    unique_columns = _sqlite_unique_columns(connection, "customer_outreach_runs")
+    expected = ("platform_account_id", "customer_key", "strategy_type", "goods_id")
+    if expected in unique_columns:
+        return
+    connection.execute(text(
+        """CREATE TABLE IF NOT EXISTS customer_outreach_runs__new (
+            id VARCHAR(32) PRIMARY KEY,
+            user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            robot_id VARCHAR(32) NOT NULL REFERENCES robots(id) ON DELETE CASCADE,
+            platform_account_id VARCHAR(32) NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+            conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            customer_key VARCHAR(160) NOT NULL,
+            strategy_type VARCHAR(64) NOT NULL,
+            goods_id VARCHAR(128) NOT NULL DEFAULT '',
+            order_id VARCHAR(32) REFERENCES customer_orders(id) ON DELETE SET NULL,
+            source_message_id VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+            due_at DATETIME NOT NULL,
+            decision_json JSON NOT NULL DEFAULT '{}',
+            message_text TEXT NOT NULL DEFAULT '',
+            message_id VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL,
+            send_task_id VARCHAR(32) REFERENCES rpa_tasks(id) ON DELETE SET NULL,
+            idempotency_key VARCHAR(160) NOT NULL UNIQUE,
+            cancel_reason VARCHAR(64),
+            completed_at DATETIME,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            CONSTRAINT uq_customer_outreach_customer_strategy
+                UNIQUE (platform_account_id, customer_key, strategy_type, goods_id)
+        )"""
+    ))
+    connection.execute(text(
+        """INSERT OR IGNORE INTO customer_outreach_runs__new (
+            id, user_id, robot_id, platform_account_id, conversation_id, customer_key,
+            strategy_type, goods_id, order_id, source_message_id, status, due_at,
+            decision_json, message_text, message_id, send_task_id, idempotency_key,
+            cancel_reason, completed_at, created_at, updated_at
+        )
+        SELECT
+            id, user_id, robot_id, platform_account_id, conversation_id, customer_key,
+            strategy_type, COALESCE(goods_id, ''), order_id, source_message_id, status, due_at,
+            decision_json, message_text, message_id, send_task_id, idempotency_key,
+            cancel_reason, completed_at, created_at, updated_at
+        FROM customer_outreach_runs"""
+    ))
+    connection.execute(text("DROP TABLE customer_outreach_runs"))
+    connection.execute(text("ALTER TABLE customer_outreach_runs__new RENAME TO customer_outreach_runs"))
+
+
 def apply_compatibility_migrations(engine: Engine) -> None:
     """Upgrade databases created before Alembic was wired into startup."""
     if engine.dialect.name != "sqlite":
@@ -70,12 +138,22 @@ def apply_compatibility_migrations(engine: Engine) -> None:
         "email_templates": {
             "platform_account_id": "VARCHAR(32)",
         },
+        "customer_orders": {
+            "goods_id": "VARCHAR(128) NOT NULL DEFAULT ''",
+        },
+        "customer_products": {
+            "goods_id": "VARCHAR(128) NOT NULL DEFAULT ''",
+        },
+        "customer_outreach_runs": {
+            "goods_id": "VARCHAR(128) NOT NULL DEFAULT ''",
+        },
     }
     inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
     with engine.begin() as connection:
         added_columns: set[tuple[str, str]] = set()
         for table_name, columns in additions.items():
-            if not inspector.has_table(table_name):
+            if table_name not in existing_tables:
                 continue
             existing = {column["name"] for column in inspector.get_columns(table_name)}
             for column_name, definition in columns.items():
@@ -97,17 +175,78 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 ) = 'customer' THEN 1 ELSE 0 END"""
             ))
 
-        if inspector.has_table("ai_model_catalog"):
+        current_inspector = inspect(connection)
+        current_columns = {
+            table_name: {column["name"] for column in current_inspector.get_columns(table_name)}
+            for table_name in existing_tables
+            if table_name in current_inspector.get_table_names()
+        }
+
+        if "customer_products" in existing_tables and {
+            "goods_id", "platform_product_id",
+        }.issubset(current_columns.get("customer_products", set())):
+            connection.execute(text(
+                """UPDATE customer_products
+                SET goods_id = COALESCE(NULLIF(goods_id, ''), platform_product_id, '')
+                WHERE goods_id IS NULL OR goods_id = ''"""
+            ))
+        if "customer_orders" in existing_tables and {
+            "goods_id", "products_json",
+        }.issubset(current_columns.get("customer_orders", set())):
+            connection.execute(text(
+                """UPDATE customer_orders
+                SET goods_id = COALESCE(
+                    NULLIF(goods_id, ''),
+                    CASE
+                        WHEN json_valid(products_json) = 1
+                        THEN COALESCE(
+                            json_extract(products_json, '$[0].goods_id'),
+                            json_extract(products_json, '$[0].product_id')
+                        )
+                        ELSE ''
+                    END,
+                    ''
+                )
+                WHERE goods_id IS NULL OR goods_id = ''"""
+            ))
+        if (
+            "customer_outreach_runs" in existing_tables
+            and "customer_orders" in existing_tables
+            and {"goods_id", "order_id", "decision_json"}.issubset(
+                current_columns.get("customer_outreach_runs", set())
+            )
+            and {"id", "goods_id"}.issubset(current_columns.get("customer_orders", set()))
+        ):
+            connection.execute(text(
+                """UPDATE customer_outreach_runs
+                SET goods_id = COALESCE(
+                    NULLIF(goods_id, ''),
+                    (
+                        SELECT customer_orders.goods_id
+                        FROM customer_orders
+                        WHERE customer_orders.id = customer_outreach_runs.order_id
+                    ),
+                    CASE
+                        WHEN json_valid(decision_json) = 1
+                        THEN json_extract(decision_json, '$.goods_id')
+                        ELSE ''
+                    END,
+                    ''
+                )
+                WHERE goods_id IS NULL OR goods_id = ''"""
+            ))
+
+        if "ai_model_catalog" in existing_tables:
             connection.execute(text(
                 "DELETE FROM ai_model_catalog "
                 "WHERE model_id NOT IN ('deepseek-v4-flash', 'deepseek-v4-pro')"
             ))
-        if inspector.has_table("ai_provider_configs"):
+        if "ai_provider_configs" in existing_tables:
             connection.execute(text(
                 "UPDATE ai_provider_configs SET model = 'deepseek-v4-flash' "
                 "WHERE model = 'deepseek-chat'"
             ))
-        if inspector.has_table("robots"):
+        if "robots" in existing_tables:
             connection.execute(text(
                 "UPDATE robots "
                 "SET config_json = json_set(config_json, '$.model', 'deepseek-v4-flash') "
@@ -215,11 +354,97 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             )
         )
         connection.execute(text(
-            "DROP INDEX IF EXISTS uq_messages_conversation_platform_message"
+            "CREATE TABLE IF NOT EXISTS __message_duplicate_resolution ("
+            "source_id TEXT PRIMARY KEY, keep_id TEXT NOT NULL)"
+        ))
+        connection.execute(text("DELETE FROM __message_duplicate_resolution"))
+        connection.execute(text(
+            """INSERT INTO __message_duplicate_resolution (source_id, keep_id)
+            WITH ranked AS (
+                SELECT
+                    id,
+                    FIRST_VALUE(id) OVER (
+                        PARTITION BY conversation_id, platform_message_id
+                        ORDER BY
+                            CASE WHEN platform_sent_at IS NOT NULL THEN 0 ELSE 1 END,
+                            CASE collection_kind
+                                WHEN 'incremental' THEN 0
+                                WHEN 'legacy' THEN 1
+                                WHEN 'manual' THEN 2
+                                ELSE 3
+                            END,
+                            CASE WHEN sent_at IS NOT NULL THEN 0 ELSE 1 END,
+                            sent_at,
+                            created_at,
+                            id
+                    ) AS keep_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY conversation_id, platform_message_id
+                        ORDER BY
+                            CASE WHEN platform_sent_at IS NOT NULL THEN 0 ELSE 1 END,
+                            CASE collection_kind
+                                WHEN 'incremental' THEN 0
+                                WHEN 'legacy' THEN 1
+                                WHEN 'manual' THEN 2
+                                ELSE 3
+                            END,
+                            CASE WHEN sent_at IS NOT NULL THEN 0 ELSE 1 END,
+                            sent_at,
+                            created_at,
+                            id
+                    ) AS row_number
+                FROM messages
+                WHERE platform_message_id IS NOT NULL AND platform_message_id != ''
+            )
+            SELECT id, keep_id FROM ranked WHERE row_number > 1"""
+        ))
+        if "automation_reply_runs" in existing_tables:
+            connection.execute(text(
+                """DELETE FROM automation_reply_runs
+                WHERE source_message_id IN (SELECT source_id FROM __message_duplicate_resolution)
+                AND EXISTS (
+                    SELECT 1
+                    FROM automation_reply_runs existing
+                    WHERE existing.robot_id = automation_reply_runs.robot_id
+                    AND existing.source_message_id = (
+                        SELECT keep_id
+                        FROM __message_duplicate_resolution
+                        WHERE source_id = automation_reply_runs.source_message_id
+                    )
+                )"""
+            ))
+        for table_name, column_name in (
+            ("customer_outreach_runs", "source_message_id"),
+            ("customer_outreach_runs", "message_id"),
+            ("conversation_workflows", "source_message_id"),
+            ("email_send_tasks", "source_message_id"),
+            ("rpa_tasks", "message_id"),
+            ("automation_reply_runs", "source_message_id"),
+            ("automation_reply_runs", "reply_message_id"),
+        ):
+            if table_name not in existing_tables:
+                continue
+            connection.execute(text(
+                f"""UPDATE {table_name}
+                SET {column_name} = (
+                    SELECT keep_id
+                    FROM __message_duplicate_resolution
+                    WHERE source_id = {table_name}.{column_name}
+                )
+                WHERE {column_name} IN (SELECT source_id FROM __message_duplicate_resolution)"""
+            ))
+        connection.execute(text(
+            "DELETE FROM messages "
+            "WHERE id IN (SELECT source_id FROM __message_duplicate_resolution)"
+        ))
+        connection.execute(text("DROP TABLE IF EXISTS __message_duplicate_resolution"))
+        connection.execute(text(
+            "DROP INDEX IF EXISTS ix_messages_conversation_platform_message"
         ))
         connection.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_messages_conversation_platform_message "
-            "ON messages (conversation_id, platform_message_id)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_conversation_platform_message "
+            "ON messages (conversation_id, platform_message_id) "
+            "WHERE platform_message_id IS NOT NULL AND platform_message_id != ''"
         ))
         connection.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_conversation_sequence "
@@ -420,6 +645,27 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             )"""
         ))
         connection.execute(text(
+            """CREATE TABLE IF NOT EXISTS platform_phrase_snapshots (
+                id VARCHAR(32) PRIMARY KEY,
+                user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform_account_id VARCHAR(32) NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                local_account_id VARCHAR(64),
+                platform_code VARCHAR(32) NOT NULL DEFAULT 'pinduoduo',
+                source VARCHAR(32) NOT NULL,
+                records_json JSON NOT NULL DEFAULT '[]',
+                record_count INTEGER NOT NULL DEFAULT 0,
+                raw_count INTEGER NOT NULL DEFAULT 0,
+                content_hash VARCHAR(64) NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'collected',
+                error_message TEXT,
+                collected_at DATETIME NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_platform_phrase_snapshot_account_source
+                    UNIQUE (platform_account_id, source)
+            )"""
+        ))
+        connection.execute(text(
             """CREATE TABLE IF NOT EXISTS customer_orders (
                 id VARCHAR(32) PRIMARY KEY,
                 user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -427,6 +673,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                 customer_key VARCHAR(160) NOT NULL,
                 platform_order_id VARCHAR(128) NOT NULL,
+                goods_id VARCHAR(128) NOT NULL DEFAULT '',
                 status VARCHAR(32) NOT NULL DEFAULT 'unknown',
                 raw_status VARCHAR(128) NOT NULL DEFAULT '',
                 products_json JSON NOT NULL DEFAULT '[]',
@@ -447,6 +694,58 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             )"""
         ))
         connection.execute(text(
+            """CREATE TABLE IF NOT EXISTS customer_products (
+                id VARCHAR(32) PRIMARY KEY,
+                user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform_account_id VARCHAR(32) NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                customer_key VARCHAR(160) NOT NULL,
+                goods_id VARCHAR(128) NOT NULL DEFAULT '',
+                platform_product_id VARCHAR(128) NOT NULL,
+                title VARCHAR(1000),
+                image_url TEXT,
+                link_url TEXT,
+                price FLOAT,
+                price_label VARCHAR(64),
+                quantity INTEGER,
+                sold_quantity INTEGER,
+                sold_quantity_30d INTEGER,
+                source VARCHAR(64),
+                first_observed_at DATETIME NOT NULL,
+                last_observed_at DATETIME NOT NULL,
+                raw_payload JSON NOT NULL DEFAULT '{}',
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_customer_product_customer_product
+                    UNIQUE (platform_account_id, customer_key, platform_product_id)
+            )"""
+        ))
+        connection.execute(text(
+            """CREATE TABLE IF NOT EXISTS store_products (
+                id VARCHAR(32) PRIMARY KEY,
+                user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform_account_id VARCHAR(32) NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                goods_id VARCHAR(128) NOT NULL,
+                platform_product_id VARCHAR(128) NOT NULL,
+                title VARCHAR(1000),
+                image_url TEXT,
+                link_url TEXT,
+                price FLOAT,
+                price_label VARCHAR(64),
+                quantity INTEGER,
+                sold_quantity INTEGER,
+                sold_quantity_30d INTEGER,
+                source VARCHAR(64),
+                first_observed_at DATETIME NOT NULL,
+                last_observed_at DATETIME NOT NULL,
+                raw_payload JSON NOT NULL DEFAULT '{}',
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_store_product_account_goods
+                    UNIQUE (platform_account_id, goods_id)
+            )"""
+        ))
+        connection.execute(text(
             """CREATE TABLE IF NOT EXISTS customer_outreach_runs (
                 id VARCHAR(32) PRIMARY KEY,
                 user_id VARCHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -455,6 +754,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 conversation_id VARCHAR(32) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                 customer_key VARCHAR(160) NOT NULL,
                 strategy_type VARCHAR(64) NOT NULL,
+                goods_id VARCHAR(128) NOT NULL DEFAULT '',
                 order_id VARCHAR(32) REFERENCES customer_orders(id) ON DELETE SET NULL,
                 source_message_id VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL,
                 status VARCHAR(32) NOT NULL DEFAULT 'candidate',
@@ -469,9 +769,10 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
                 CONSTRAINT uq_customer_outreach_customer_strategy
-                    UNIQUE (platform_account_id, customer_key, strategy_type)
+                    UNIQUE (platform_account_id, customer_key, strategy_type, goods_id)
             )"""
         ))
+        _ensure_customer_outreach_goods_unique(connection)
         connection.execute(text(
             """CREATE TABLE IF NOT EXISTS message_observations (
                 id VARCHAR(32) PRIMARY KEY,
@@ -533,18 +834,35 @@ def apply_compatibility_migrations(engine: Engine) -> None:
             ("ai_model_calls", "ix_ai_model_calls_trace_id", "trace_id"),
             ("ai_model_calls", "ix_ai_model_calls_model", "model"),
             ("ai_model_calls", "ix_ai_model_calls_status", "status"),
+            ("platform_phrase_snapshots", "ix_platform_phrase_snapshots_user_id", "user_id"),
+            ("platform_phrase_snapshots", "ix_platform_phrase_snapshots_platform_account_id", "platform_account_id"),
+            ("platform_phrase_snapshots", "ix_platform_phrase_snapshots_local_account_id", "local_account_id"),
+            ("platform_phrase_snapshots", "ix_platform_phrase_snapshots_source", "source"),
+            ("platform_phrase_snapshots", "ix_platform_phrase_snapshots_content_hash", "content_hash"),
             ("customer_orders", "ix_customer_orders_user_id", "user_id"),
             ("customer_orders", "ix_customer_orders_platform_account_id", "platform_account_id"),
             ("customer_orders", "ix_customer_orders_conversation_id", "conversation_id"),
             ("customer_orders", "ix_customer_orders_customer_key", "customer_key"),
             ("customer_orders", "ix_customer_orders_platform_order_id", "platform_order_id"),
+            ("customer_orders", "ix_customer_orders_goods_id", "goods_id"),
             ("customer_orders", "ix_customer_orders_status", "status"),
+            ("customer_products", "ix_customer_products_user_id", "user_id"),
+            ("customer_products", "ix_customer_products_platform_account_id", "platform_account_id"),
+            ("customer_products", "ix_customer_products_conversation_id", "conversation_id"),
+            ("customer_products", "ix_customer_products_customer_key", "customer_key"),
+            ("customer_products", "ix_customer_products_platform_product_id", "platform_product_id"),
+            ("customer_products", "ix_customer_products_goods_id", "goods_id"),
+            ("store_products", "ix_store_products_user_id", "user_id"),
+            ("store_products", "ix_store_products_platform_account_id", "platform_account_id"),
+            ("store_products", "ix_store_products_goods_id", "goods_id"),
+            ("store_products", "ix_store_products_platform_product_id", "platform_product_id"),
             ("customer_outreach_runs", "ix_customer_outreach_user_id", "user_id"),
             ("customer_outreach_runs", "ix_customer_outreach_robot_id", "robot_id"),
             ("customer_outreach_runs", "ix_customer_outreach_platform_account_id", "platform_account_id"),
             ("customer_outreach_runs", "ix_customer_outreach_conversation_id", "conversation_id"),
             ("customer_outreach_runs", "ix_customer_outreach_customer_key", "customer_key"),
             ("customer_outreach_runs", "ix_customer_outreach_strategy_type", "strategy_type"),
+            ("customer_outreach_runs", "ix_customer_outreach_goods_id", "goods_id"),
             ("customer_outreach_runs", "ix_customer_outreach_order_id", "order_id"),
             ("customer_outreach_runs", "ix_customer_outreach_source_message_id", "source_message_id"),
             ("customer_outreach_runs", "ix_customer_outreach_status", "status"),

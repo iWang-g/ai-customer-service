@@ -35,6 +35,11 @@ class PlatformAccountUpdate(BaseModel):
     metadata_json: dict[str, Any] | None = None
 
 
+class ShopSummaryUpdate(BaseModel):
+    shop_intro: str = Field(default="", max_length=4000)
+    on_sale_products: str = Field(default="", max_length=12000)
+
+
 class PlatformAccountRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

@@ -8,6 +8,7 @@ import unicodedata
 from fastapi import HTTPException, status
 from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import Settings, get_settings
 from app.core.security import create_token, utcnow
@@ -16,11 +17,14 @@ from app.models import (
     Conversation,
     Message,
     PlatformAccount,
+    Robot,
+    RobotPlatformScope,
     RpaEvent,
     RpaNode,
     RpaTask,
     User,
 )
+from app.schemas.message import SendMessageRequest
 from app.schemas.rpa import (
     NodeHeartbeatRequest,
     NodeRegisterRequest,
@@ -31,14 +35,22 @@ from app.schemas.rpa import (
     TaskCompleteRequest,
 )
 from app.services.order_service import apply_orders_snapshot
+from app.services.product_service import apply_products_snapshot, apply_store_products_snapshot
+from app.services.avatar_cache_service import cache_customer_avatar
 from app.services.message_queue_service import append_message
+from app.services.message_service import create_send_task
 from app.services.message_observation_service import (
     SnapshotProtocolError,
     process_message_snapshot,
 )
 from app.services.pdd_message_mode import pdd_message_write_mode
+from app.services.platform_account_service import resolve_merged_platform_account_id
+from app.services.settings_service import auto_reply_enabled
 
 
+DEFAULT_ENTRY_WELCOME_TEXT = "亲亲，我是本店小助理，发送“转人工”可为您转接客服。"
+ENTRY_WELCOME_METADATA_KEY = "entry_welcome"
+ENTRY_WELCOME_CANDIDATE_EVENTS = {"conversation_snapshot", "customer_message", "message_received"}
 _OUTBOUND_MESSAGE_SOURCES = frozenset({
     "desktop",
     "ai",
@@ -113,6 +125,35 @@ def heartbeat_node(db: Session, node: RpaNode, request: NodeHeartbeatRequest) ->
     return node
 
 
+def get_or_create_desktop_ingest_node(db: Session, user: User) -> RpaNode:
+    now = utcnow()
+    node_key = f"{user.id}:desktop-ingest"
+    node = db.scalar(
+        select(RpaNode).where(and_(RpaNode.user_id == user.id, RpaNode.node_key == node_key))
+    )
+    if node is None:
+        node = RpaNode(
+            user_id=user.id,
+            node_key=node_key,
+            hostname="desktop-electron",
+            machine_name="desktop-electron",
+            supported_platforms=["pinduoduo", "wechat"],
+            app_version="desktop-ingest",
+            status="online",
+            last_heartbeat_at=now,
+            last_seen_at=now,
+        )
+        db.add(node)
+    else:
+        node.status = "online"
+        node.last_heartbeat_at = now
+        node.last_seen_at = now
+        db.add(node)
+    db.commit()
+    db.refresh(node)
+    return node
+
+
 def disconnect_node(db: Session, node: RpaNode) -> RpaNode:
     node.status = "offline"
     node.last_seen_at = utcnow()
@@ -124,6 +165,9 @@ def disconnect_node(db: Session, node: RpaNode) -> RpaNode:
 
 def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate) -> tuple[RpaEvent, list[Message], list[Conversation]]:
     settings = get_settings()
+    platform_account_id = resolve_merged_platform_account_id(db, user, request.platform_account_id)
+    if platform_account_id != request.platform_account_id:
+        request = request.model_copy(update={"platform_account_id": platform_account_id})
     duplicate_conditions = [RpaEvent.event_id == request.event_id]
     if request.dedup_key:
         duplicate_conditions.append(RpaEvent.dedup_key == request.dedup_key)
@@ -131,7 +175,15 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
         select(RpaEvent).where(and_(RpaEvent.user_id == user.id, or_(*duplicate_conditions)))
     )
     if existing:
-        return existing, [], []
+        conversations: list[Conversation] = []
+        if request.event_type == "conversation_snapshot":
+            conversation, _ = _upsert_conversation_from_event(db, user.id, request)
+            if conversation:
+                conversations.append(conversation)
+                db.commit()
+                db.refresh(existing)
+                db.refresh(conversation)
+        return existing, [], conversations
 
     platform_account = None
     if request.platform_account_id:
@@ -159,6 +211,26 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
     db.add(event)
     messages: list[Message] = []
     conversations: list[Conversation] = []
+    if request.event_type == "store_products_snapshot":
+        if platform_account is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Store product snapshot requires a platform account",
+            )
+        saved_count = apply_store_products_snapshot(
+            db,
+            platform_account,
+            request.payload_json,
+            request.received_at,
+        )
+        event.payload_json = {
+            **event.payload_json,
+            "store_product_write_mode": "store",
+            "saved_product_count": saved_count,
+        }
+        db.commit()
+        db.refresh(event)
+        return event, messages, conversations
     pdd_write_mode = (
         pdd_message_write_mode(settings)
         if request.platform_code == "pinduoduo"
@@ -204,11 +276,13 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
         db.refresh(event)
         return event, messages, conversations
 
-    conversation = _upsert_conversation_from_event(db, user.id, request)
+    conversation, _ = _upsert_conversation_from_event(db, user.id, request)
     if conversation:
         conversations.append(conversation)
         if request.event_type == "customer_orders_snapshot":
             apply_orders_snapshot(db, conversation, request.payload_json, request.received_at)
+        if request.event_type == "customer_products_snapshot":
+            apply_products_snapshot(db, conversation, request.payload_json, request.received_at)
     message, is_new_reply_source = _upsert_message_from_event(db, user.id, conversation, request)
     if conversation and message:
         _refresh_awaiting_reply(db, conversation)
@@ -225,16 +299,50 @@ def create_events_batch(
     user: User,
     node: RpaNode,
     events: list[RpaEventCreate],
-) -> tuple[list[RpaEventRead], list[tuple[RpaEventCreate, Message, str]]]:
+) -> tuple[list[RpaEventRead], list[tuple[RpaEventCreate, Message, str]], list[dict[str, Any]]]:
     created: list[RpaEventRead] = []
     reply_sources: list[tuple[RpaEventCreate, Message, str]] = []
+    affected_by_id: dict[str, dict[str, Any]] = {}
     for request in events:
-        event, messages, _ = create_event(db, user, node, request)
+        event, messages, conversations = create_event(db, user, node, request)
         created.append(RpaEventRead.model_validate(event))
         source_message = select_inbound_reply_source(db, request, messages)
         if source_message is not None:
             reply_sources.append((request, source_message, event.id))
-    return created, reply_sources
+        conversation_ids = {conversation.id for conversation in conversations}
+        conversation_ids.update(message.conversation_id for message in messages)
+        conversations_by_id = {conversation.id: conversation for conversation in conversations}
+        for conversation_id in conversation_ids:
+            conversation = conversations_by_id.get(conversation_id) or db.get(Conversation, conversation_id)
+            if conversation is None:
+                continue
+            affected = affected_by_id.setdefault(
+                conversation.id,
+                {
+                    "conversation_id": conversation.id,
+                    "platform_account_id": conversation.platform_account_id,
+                    "platform_code": conversation.platform_code,
+                    "external_conversation_id": conversation.external_conversation_id,
+                    "event_types": set(),
+                    "appended_message_count": 0,
+                    "latest_platform_message_id": None,
+                },
+            )
+            affected["event_types"].add(request.event_type)
+            conversation_messages = [
+                message for message in messages if message.conversation_id == conversation.id
+            ]
+            affected["appended_message_count"] += len(conversation_messages)
+            for message in conversation_messages:
+                if message.platform_message_id:
+                    affected["latest_platform_message_id"] = message.platform_message_id
+    affected_conversations = []
+    for item in affected_by_id.values():
+        affected_conversations.append({
+            **item,
+            "event_types": sorted(item["event_types"]),
+        })
+    return created, reply_sources, affected_conversations
 
 
 def select_inbound_reply_source(
@@ -282,11 +390,138 @@ def select_inbound_reply_source(
     return None
 
 
+def _active_robot_for_conversation(db: Session, user: User, conversation: Conversation) -> Robot | None:
+    robots = list(db.scalars(
+        select(Robot)
+        .where(Robot.user_id == user.id, Robot.enabled.is_(True), Robot.status == "online")
+        .order_by(desc(Robot.updated_at))
+    ).all())
+    for robot in robots:
+        scopes = list(db.scalars(
+            select(RobotPlatformScope).where(RobotPlatformScope.robot_id == robot.id)
+        ).all())
+        if any(
+            scope.platform_code == "all"
+            or (
+                scope.platform_code == conversation.platform_code
+                and (scope.all_accounts or scope.platform_account_id == conversation.platform_account_id)
+            )
+            for scope in scopes
+        ):
+            return robot
+    return None
+
+
+def _entry_welcome_text(robot: Robot) -> str:
+    config = robot.config_json if isinstance(robot.config_json, dict) else {}
+    text = str(config.get("entry_welcome_text") or "").strip()
+    return (text or DEFAULT_ENTRY_WELCOME_TEXT)[:1000]
+
+
+def _skip_entry_welcome(
+    db: Session,
+    conversation: Conversation,
+    state: dict[str, Any],
+    reason: str,
+) -> None:
+    metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
+    conversation.metadata_json = {
+        **metadata,
+        ENTRY_WELCOME_METADATA_KEY: {
+            **state,
+            "status": "skipped",
+            "reason": reason,
+            "updated_at": utcnow().isoformat(),
+        },
+    }
+    db.add(conversation)
+    db.commit()
+
+
+def maybe_queue_entry_welcome(
+    db: Session,
+    user: User,
+    source_message: Message,
+) -> str | None:
+    if source_message.sender_role != "customer":
+        return None
+    conversation = db.get(Conversation, source_message.conversation_id)
+    if conversation is None:
+        return None
+    metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
+    state = metadata.get(ENTRY_WELCOME_METADATA_KEY)
+    if not isinstance(state, dict) or state.get("status") != "candidate":
+        return None
+    if not auto_reply_enabled(db, user):
+        _skip_entry_welcome(db, conversation, state, "auto_reply_disabled")
+        return None
+    robot = _active_robot_for_conversation(db, user, conversation)
+    if robot is None:
+        _skip_entry_welcome(db, conversation, state, "robot_missing")
+        return None
+    config = robot.config_json if isinstance(robot.config_json, dict) else {}
+    if config.get("entry_welcome_enabled") is not True or config.get("allow_auto_send") is not True:
+        _skip_entry_welcome(db, conversation, state, "disabled")
+        return None
+    idempotency_key = f"entry-welcome:{robot.id}:{conversation.id}"
+    existing = db.scalar(
+        select(RpaTask).where(
+            RpaTask.user_id == user.id,
+            RpaTask.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        conversation.metadata_json = {
+            **metadata,
+            ENTRY_WELCOME_METADATA_KEY: {
+                **state,
+                "status": "queued",
+                "robot_id": robot.id,
+                "task_id": existing.id,
+                "source_message_id": source_message.id,
+                "updated_at": utcnow().isoformat(),
+            },
+        }
+        db.add(conversation)
+        db.commit()
+        return existing.id
+    response = create_send_task(
+        db,
+        user,
+        SendMessageRequest(
+            conversation_id=conversation.id,
+            content=_entry_welcome_text(robot),
+            platform_code=conversation.platform_code,
+        ),
+        idempotency_key=idempotency_key,
+        source="automation",
+    )
+    conversation = db.get(Conversation, conversation.id)
+    if conversation is not None:
+        current_metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
+        current_state = current_metadata.get(ENTRY_WELCOME_METADATA_KEY)
+        conversation.metadata_json = {
+            **current_metadata,
+            ENTRY_WELCOME_METADATA_KEY: {
+                **(current_state if isinstance(current_state, dict) else state),
+                "status": "queued",
+                "robot_id": robot.id,
+                "task_id": response.task_id,
+                "source_message_id": source_message.id,
+                "text": _entry_welcome_text(robot),
+                "updated_at": utcnow().isoformat(),
+            },
+        }
+        db.add(conversation)
+        db.commit()
+    return response.task_id
+
+
 def _upsert_conversation_from_event(
     db: Session,
     user_id: str,
     request: RpaEventCreate,
-) -> Conversation | None:
+) -> tuple[Conversation | None, bool]:
     payload = request.payload_json
     external_id = (
         request.conversation_external_id
@@ -298,8 +533,9 @@ def _upsert_conversation_from_event(
     if not external_id and request.event_type not in {
         "customer_message", "message_received", "agent_message", "message_sent",
         "customer_orders_snapshot",
+        "customer_products_snapshot",
     }:
-        return None
+        return None, False
     conversation = db.scalar(
         select(Conversation).where(
             and_(
@@ -311,6 +547,22 @@ def _upsert_conversation_from_event(
         )
     )
     payload_unread_count = _payload_unread_count(payload)
+    conversation_metadata = dict(payload.get("conversation_metadata") or {})
+    avatar_url = str(payload.get("avatar_url") or "").strip()
+    if avatar_url:
+        conversation_metadata["customer_avatar_url"] = avatar_url[:8192]
+        cached_avatar_url = None
+        existing_metadata = conversation.metadata_json if conversation is not None else {}
+        if isinstance(existing_metadata, dict):
+            cached_source_url = str(existing_metadata.get("customer_avatar_cached_source_url") or "")
+            cached_url = str(existing_metadata.get("customer_avatar_cached_url") or "")
+            if cached_source_url == avatar_url and cached_url:
+                cached_avatar_url = cached_url
+        if cached_avatar_url is None:
+            cached_avatar_url = cache_customer_avatar(avatar_url)
+        if cached_avatar_url:
+            conversation_metadata["customer_avatar_cached_url"] = cached_avatar_url[:8192]
+            conversation_metadata["customer_avatar_cached_source_url"] = avatar_url[:8192]
     if conversation is None:
         conversation = Conversation(
             user_id=user_id,
@@ -327,11 +579,20 @@ def _upsert_conversation_from_event(
                 else (1 if request.event_type in {"customer_message", "message_received"} else 0)
             ),
             status="active",
-            metadata_json=payload.get("conversation_metadata", {}),
+            metadata_json=conversation_metadata,
         )
+        if request.event_type in ENTRY_WELCOME_CANDIDATE_EVENTS:
+            conversation.metadata_json = {
+                **(conversation.metadata_json or {}),
+                ENTRY_WELCOME_METADATA_KEY: {
+                    "status": "candidate",
+                    "created_event_type": request.event_type,
+                    "created_at": utcnow().isoformat(),
+                },
+            }
         db.add(conversation)
         db.flush()
-        return conversation
+        return conversation, True
 
     conversation.customer_name = payload.get("customer_name") or conversation.customer_name
     conversation.title = payload.get("title") or conversation.title
@@ -356,14 +617,14 @@ def _upsert_conversation_from_event(
         conversation.unread_count = payload_unread_count
     elif request.event_type in {"customer_message", "message_received"}:
         conversation.unread_count += 1
-    if payload.get("conversation_metadata"):
+    if conversation_metadata:
         conversation.metadata_json = {
-            **conversation.metadata_json,
-            **payload["conversation_metadata"],
+            **(conversation.metadata_json or {}),
+            **conversation_metadata,
         }
     db.add(conversation)
     db.flush()
-    return conversation
+    return conversation, False
 
 
 def _payload_unread_count(payload: dict[str, Any]) -> int | None:
@@ -376,8 +637,8 @@ def _payload_unread_count(payload: dict[str, Any]) -> int | None:
 
 
 def _refresh_awaiting_reply(db: Session, conversation: Conversation) -> None:
-    latest_sender = db.scalar(
-        select(Message.sender_role)
+    latest = db.scalar(
+        select(Message)
         .where(
             Message.conversation_id == conversation.id,
             Message.message_status == "sent",
@@ -385,7 +646,19 @@ def _refresh_awaiting_reply(db: Session, conversation: Conversation) -> None:
         .order_by(desc(Message.conversation_sequence))
         .limit(1)
     )
-    conversation.awaiting_reply = latest_sender == "customer"
+    if latest is None:
+        conversation.awaiting_reply = False
+        db.add(conversation)
+        return
+    cleared_sequence = 0
+    try:
+        cleared_sequence = int((conversation.metadata_json or {}).get("awaiting_reply_cleared_sequence") or 0)
+    except (TypeError, ValueError):
+        cleared_sequence = 0
+    conversation.awaiting_reply = (
+        latest.sender_role == "customer"
+        and int(latest.conversation_sequence or 0) > cleared_sequence
+    )
     db.add(conversation)
 
 
@@ -402,6 +675,208 @@ def _refresh_conversation_summary(db: Session, conversation: Conversation) -> No
     conversation.latest_message_text = latest.content if latest else None
     conversation.latest_message_at = latest.collected_at if latest else None
     db.add(conversation)
+
+
+def _merge_task_message_with_platform_echo(
+    db: Session,
+    task: RpaTask,
+    message: Message,
+    request: TaskCompleteRequest,
+) -> tuple[Message, str | None]:
+    platform_message_id = str(request.result_json.get("platform_message_id") or "").strip()
+    if not platform_message_id:
+        return message, None
+    existing = db.scalar(
+        select(Message).where(
+            and_(
+                Message.conversation_id == message.conversation_id,
+                Message.platform_message_id == platform_message_id,
+                Message.id != message.id,
+            )
+        ).limit(1)
+    )
+    if existing is None:
+        return message, None
+
+    merged_from_message_id = message.id
+
+    queued_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    echo_payload = existing.raw_payload if isinstance(existing.raw_payload, dict) else {}
+    existing.sender_role = "agent"
+    existing.sender_name = existing.sender_name or message.sender_name
+    existing.content = existing.content or message.content
+    existing.message_status = "sent"
+    existing.sent_at = existing.sent_at or message.sent_at
+    existing.platform_sent_at = existing.platform_sent_at or message.platform_sent_at
+    existing.observed_at = existing.observed_at or message.observed_at
+    existing.collected_at = existing.collected_at or message.collected_at
+    existing.raw_payload = {
+        **queued_payload,
+        **echo_payload,
+        "merged_outbound_task_message": {
+            "message_id": message.id,
+            "source": message.source,
+            "message_status": message.message_status,
+            "task_id": task.id,
+            "task_status": request.status,
+        },
+    }
+
+    db.query(RpaTask).filter(RpaTask.message_id == message.id).update(
+        {RpaTask.message_id: existing.id},
+        synchronize_session=False,
+    )
+    db.query(AutomationReplyRun).filter(AutomationReplyRun.reply_message_id == message.id).update(
+        {AutomationReplyRun.reply_message_id: existing.id},
+        synchronize_session=False,
+    )
+    task.message_id = existing.id
+    db.add(task)
+    db.add(existing)
+    db.delete(message)
+    db.flush()
+    return existing, merged_from_message_id
+
+
+def _upsert_reply_bundle_image_message(
+    db: Session,
+    task: RpaTask,
+    payload: dict[str, Any],
+    follow_up: dict[str, Any],
+    request: TaskCompleteRequest,
+    *,
+    image_confirmed: bool,
+    image_confirmation_pending: bool,
+) -> tuple[Message, str | None]:
+    media_key = f"reply-bundle-image:{task.id}"
+    platform_message_id = str(request.result_json.get("image_platform_message_id") or "").strip()
+    image_url = str(request.result_json.get("image_url") or follow_up.get("url") or "")
+    raw_payload = {
+        "media_type": "image",
+        "message_type": "image",
+        "image_url": image_url,
+        "parent_task_id": task.id,
+        "idempotency_key": media_key,
+        "platform_confirmation_pending": image_confirmation_pending,
+        **({"pre_msg_id": str(request.result_json.get("image_pre_msg_id"))} if request.result_json.get("image_pre_msg_id") else {}),
+        **({"platform_ts": str(request.result_json.get("image_ts"))} if request.result_json.get("image_ts") else {}),
+    }
+    message_status = "sent" if image_confirmed else "confirmation_pending"
+    existing: Message | None = None
+    if platform_message_id:
+        existing = db.scalar(
+            select(Message).where(
+                and_(
+                    Message.conversation_id == task.conversation_id,
+                    Message.platform_message_id == platform_message_id,
+                )
+            ).limit(1)
+        )
+    payload_follow_up_message_id = ""
+    if isinstance(task.payload_json, dict):
+        payload_follow_up_message_id = str(task.payload_json.get("follow_up_message_id") or "").strip()
+    duplicate_image = db.scalar(
+        select(Message).where(
+            Message.conversation_id == task.conversation_id,
+            Message.raw_payload["idempotency_key"].as_string() == media_key,
+        )
+    )
+    if duplicate_image is None and payload_follow_up_message_id:
+        candidate = db.get(Message, payload_follow_up_message_id)
+        if candidate and candidate.conversation_id == task.conversation_id:
+            duplicate_image = candidate
+    if existing is None:
+        existing = duplicate_image
+    if existing is not None:
+        merged_from_message_id = (
+            duplicate_image.id
+            if duplicate_image is not None and existing.id != duplicate_image.id
+            else None
+        )
+        previous_payload = existing.raw_payload if isinstance(existing.raw_payload, dict) else {}
+        existing.sender_role = "agent"
+        existing.sender_name = existing.sender_name or payload.get("sender_name")
+        existing.content = existing.content or "[鍥剧墖]"
+        existing.message_status = "sent" if image_confirmed else existing.message_status or message_status
+        if platform_message_id and not existing.platform_message_id:
+            existing.platform_message_id = platform_message_id
+        existing.raw_payload = {**previous_payload, **raw_payload}
+        if merged_from_message_id:
+            db.delete(duplicate_image)
+        db.add(existing)
+        db.flush()
+        return existing, merged_from_message_id
+
+    now = utcnow()
+    image_message = Message(
+        conversation_id=task.conversation_id,
+        user_id=task.user_id,
+        platform_code=task.platform_code,
+        platform_message_id=platform_message_id or None,
+        sender_role="agent",
+        sender_name=payload.get("sender_name"),
+        content="[鍥剧墖]",
+        message_status=message_status,
+        source="ai",
+        raw_payload=raw_payload,
+        observed_at=now,
+        sent_at=now,
+    )
+    append_message(db, image_message, collected_at=now)
+    db.flush()
+    return image_message, None
+
+
+def _complete_reply_bundle_products(
+    db: Session,
+    task: RpaTask,
+    request: TaskCompleteRequest,
+) -> tuple[list[str], list[str]]:
+    payload = task.payload_json if isinstance(task.payload_json, dict) else {}
+    message_ids = payload.get("follow_up_product_message_ids")
+    if not isinstance(message_ids, list):
+        return [], []
+    products = payload.get("follow_up_products")
+    products = products if isinstance(products, list) else []
+    results = request.result_json.get("product_results")
+    results = results if isinstance(results, list) else []
+    sent_ids: list[str] = []
+    failed_ids: list[str] = []
+    for index, message_id in enumerate(message_ids[:2]):
+        message = db.get(Message, str(message_id))
+        if not message or message.conversation_id != task.conversation_id:
+            continue
+        product = products[index] if index < len(products) and isinstance(products[index], dict) else {}
+        result = results[index] if index < len(results) and isinstance(results[index], dict) else {}
+        sent = request.status != "failed" and result.get("status") == "sent"
+        raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+        message.message_status = "sent" if sent else "failed"
+        message.raw_payload = {
+            **raw_payload,
+            "product_send_pending": False,
+            "product_send_status": "sent" if sent else "failed",
+            "product_send_error": None if sent else str(
+                result.get("error") or request.error_message or "商品发送失败"
+            )[:500],
+            "goods_id": str(result.get("goods_id") or product.get("goods_id") or raw_payload.get("goods_id") or ""),
+            "platform_product_id": str(
+                result.get("product_id")
+                or product.get("product_id")
+                or raw_payload.get("platform_product_id")
+                or ""
+            ),
+        }
+        db.add(message)
+        (sent_ids if sent else failed_ids).append(message.id)
+    if failed_ids:
+        conversation = db.get(Conversation, task.conversation_id)
+        if conversation and payload.get("source") == "automation":
+            conversation.human_required = True
+            conversation.human_required_reason = "auto_reply_product_send_failed"
+            conversation.human_required_word = None
+            conversation.human_required_at = utcnow()
+            db.add(conversation)
+    return sent_ids, failed_ids
 
 
 def _as_utc_naive(value: datetime) -> datetime:
@@ -812,10 +1287,75 @@ def acknowledge_task(db: Session, task: RpaTask) -> RpaTask:
     return task
 
 
+def _set_auto_transfer_state(conversation: Conversation, state: dict[str, Any]) -> None:
+    metadata = dict(conversation.metadata_json or {})
+    metadata["auto_transfer"] = {
+        **(metadata.get("auto_transfer") if isinstance(metadata.get("auto_transfer"), dict) else {}),
+        **state,
+        "updated_at": utcnow().isoformat(),
+    }
+    conversation.metadata_json = metadata
+
+
+def _queue_transfer_task_after_send(db: Session, task: RpaTask) -> None:
+    payload = task.payload_json if isinstance(task.payload_json, dict) else {}
+    transfer = payload.get("after_send_transfer_conversation")
+    if not isinstance(transfer, dict):
+        return
+    idempotency_key = str(transfer.get("idempotency_key") or "").strip()[:160]
+    if not idempotency_key:
+        return
+    existing = db.scalar(
+        select(RpaTask).where(
+            RpaTask.user_id == task.user_id,
+            RpaTask.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        return
+    conversation = db.get(Conversation, task.conversation_id) if task.conversation_id else None
+    if conversation is None:
+        return
+    transfer_task = RpaTask(
+        user_id=task.user_id,
+        platform_account_id=conversation.platform_account_id,
+        conversation_id=conversation.id,
+        task_type="transfer_conversation",
+        idempotency_key=idempotency_key,
+        platform_code=conversation.platform_code,
+        payload_json={
+            "conversation_id": conversation.id,
+            "platform_account_id": conversation.platform_account_id,
+            "external_conversation_id": conversation.external_conversation_id,
+            "customer_name": conversation.customer_name or "",
+            "source": "automation_transfer",
+            "source_message_id": str(transfer.get("source_message_id") or ""),
+            "robot_id": str(transfer.get("robot_id") or ""),
+            "trigger_reason": str(transfer.get("trigger_reason") or ""),
+            "trans_reason": str(transfer.get("trans_reason") or "无原因直接转移"),
+            "ack_task_id": task.id,
+        },
+        status="queued",
+        priority=max(task.priority, 10),
+    )
+    db.add(transfer_task)
+    db.flush()
+    _set_auto_transfer_state(conversation, {
+        "status": "transferring",
+        "transfer_task_id": transfer_task.id,
+        "ack_task_id": task.id,
+        "source_message_id": str(transfer.get("source_message_id") or ""),
+        "robot_id": str(transfer.get("robot_id") or ""),
+        "reason": str(transfer.get("trigger_reason") or ""),
+    })
+    db.add(conversation)
+
+
 def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> RpaTask:
     was_completed = task.status == "completed"
+    result_json = dict(request.result_json or {})
     task.status = request.status
-    task.result_json = request.result_json
+    task.result_json = result_json
     task.error_message = request.error_message
     task.completed_at = utcnow()
     if task.idempotency_key and task.idempotency_key.startswith("auto-timeout:"):
@@ -874,6 +1414,15 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
         message = db.get(Message, task.message_id)
         if message:
             text_sent = bool(request.result_json.get("text_sent"))
+            message, merged_from_message_id = _merge_task_message_with_platform_echo(
+                db,
+                task,
+                message,
+                request,
+            )
+            if merged_from_message_id:
+                result_json["merged_from_message_id"] = merged_from_message_id
+                task.result_json = result_json
             message.message_status = "sent" if request.status == "completed" or text_sent else "failed"
             if request.result_json.get("platform_message_id"):
                 message.platform_message_id = request.result_json["platform_message_id"]
@@ -883,10 +1432,39 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
                 conversation = db.get(Conversation, task.conversation_id)
                 if conversation:
                     _refresh_awaiting_reply(db, conversation)
+                    if not was_completed and task.task_type == "send_message":
+                        _queue_transfer_task_after_send(db, task)
             else:
                 conversation = db.get(Conversation, task.conversation_id)
                 if conversation:
                     _refresh_conversation_summary(db, conversation)
+    if task.task_type == "transfer_conversation":
+        conversation = db.get(Conversation, task.conversation_id) if task.conversation_id else None
+        if conversation:
+            if request.status == "completed":
+                _set_auto_transfer_state(conversation, {
+                    "status": "transferred",
+                    "transfer_task_id": task.id,
+                    "completed_at": utcnow().isoformat(),
+                    "target_cs_id": str(result_json.get("target_cs_id") or ""),
+                    "target_cs_username": str(result_json.get("target_cs_username") or ""),
+                })
+                conversation.human_required = False
+                conversation.human_required_reason = None
+                conversation.human_required_word = None
+                conversation.human_required_at = None
+            else:
+                _set_auto_transfer_state(conversation, {
+                    "status": "failed",
+                    "transfer_task_id": task.id,
+                    "failed_at": utcnow().isoformat(),
+                    "error": request.error_message or result_json.get("error") or "",
+                })
+                conversation.human_required = True
+                conversation.human_required_reason = "transfer_conversation_failed"
+                conversation.human_required_word = None
+                conversation.human_required_at = utcnow()
+            db.add(conversation)
     image_confirmed = (
         request.status == "completed"
         and request.result_json.get("image_sent") is True
@@ -903,41 +1481,44 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
         payload = task.payload_json if isinstance(task.payload_json, dict) else {}
         follow_up = payload.get("follow_up")
         if isinstance(follow_up, dict) and follow_up.get("type") == "image" and follow_up.get("url"):
-            media_key = f"reply-bundle-image:{task.id}"
-            duplicate_image = db.scalar(
-                select(Message).where(
-                    Message.conversation_id == task.conversation_id,
-                    Message.source == "ai",
-                    Message.raw_payload["idempotency_key"].as_string() == media_key,
-                )
+            image_message, image_merged_from_message_id = _upsert_reply_bundle_image_message(
+                db,
+                task,
+                payload,
+                follow_up,
+                request,
+                image_confirmed=image_confirmed,
+                image_confirmation_pending=image_confirmation_pending,
             )
-            if duplicate_image is None:
-                now = utcnow()
-                image_message = Message(
-                    conversation_id=task.conversation_id,
-                    user_id=task.user_id,
-                    platform_code=task.platform_code,
-                    sender_role="agent",
-                    sender_name=payload.get("sender_name"),
-                    content="[图片]",
-                    message_status="sent" if image_confirmed else "confirmation_pending",
-                    source="ai",
-                    raw_payload={
-                        "media_type": "image",
-                        "image_url": str(follow_up["url"]),
-                        "parent_task_id": task.id,
-                        "idempotency_key": media_key,
-                        "platform_confirmation_pending": image_confirmation_pending,
-                    },
-                    observed_at=now,
-                    sent_at=now,
-                )
-                append_message(db, image_message, collected_at=now)
-                conversation = db.get(Conversation, task.conversation_id)
-                if conversation:
-                    conversation.latest_message_text = "[图片]"
-                    conversation.latest_message_at = now
-                    db.add(conversation)
+            result_json["image_message_id"] = image_message.id
+            if image_merged_from_message_id:
+                result_json["image_merged_from_message_id"] = image_merged_from_message_id
+            task.result_json = result_json
+            conversation = db.get(Conversation, task.conversation_id)
+            if conversation:
+                conversation.latest_message_text = image_message.content
+                conversation.latest_message_at = image_message.sent_at
+                db.add(conversation)
+    if (
+        request.status == "failed"
+        and not was_completed
+        and task.task_type == "send_message"
+        and isinstance(task.payload_json, dict)
+    ):
+        if task.payload_json.get("source") == "automation" or task.idempotency_key and task.idempotency_key.startswith("auto-reply:"):
+            conversation = db.get(Conversation, task.conversation_id) if task.conversation_id else None
+            if conversation:
+                conversation.human_required = True
+                conversation.human_required_reason = "auto_reply_send_failed"
+                conversation.human_required_word = None
+                conversation.human_required_at = utcnow()
+                db.add(conversation)
+        follow_up_message_id = str(task.payload_json.get("follow_up_message_id") or "").strip()
+        follow_up_message = db.get(Message, follow_up_message_id) if follow_up_message_id else None
+        if follow_up_message and follow_up_message.conversation_id == task.conversation_id:
+            follow_up_message.message_status = "failed"
+            db.add(follow_up_message)
+        _complete_reply_bundle_products(db, task, request)
     if (
         request.result_json.get("create_follow_up_task") is True
         and request.status == "completed"
@@ -996,6 +1577,17 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
                     status="queued",
                     priority=task.priority,
                 ))
+    if task.task_type == "send_message" and isinstance(task.payload_json, dict):
+        product_sent_ids, product_failed_ids = _complete_reply_bundle_products(db, task, request)
+        if product_sent_ids or product_failed_ids:
+            result_json["product_message_ids"] = product_sent_ids
+            result_json["product_failed_message_ids"] = product_failed_ids
+            task.result_json = result_json
+            conversation = db.get(Conversation, task.conversation_id)
+            if conversation:
+                _refresh_conversation_summary(db, conversation)
+    task.result_json = dict(result_json)
+    flag_modified(task, "result_json")
     db.add(task)
     db.commit()
     db.refresh(task)

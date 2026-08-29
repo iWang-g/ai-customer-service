@@ -27,6 +27,7 @@ from app.services.message_service import (
     get_conversation_message_sync_issue,
     list_conversations,
     list_messages,
+    platform_message_exists,
     rebuild_conversation_message_queue,
     reset_pinduoduo_conversation_test_data,
     soft_delete_conversation,
@@ -179,6 +180,38 @@ class MessageServiceTests(unittest.TestCase):
         self.assertIn("sending now", [item.content for item in response.items])
         self.assertEqual(response.meta.total, len(response.items))
 
+    def test_platform_message_exists_checks_conversation_scope(self) -> None:
+        message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            platform_message_id="8799786063155001",
+            sender_role="customer",
+            content="hello",
+        )
+        self.db.add(message)
+        self.db.commit()
+
+        found = platform_message_exists(
+            self.db,
+            self.user,
+            platform_account_id=self.platform_account.id,
+            conversation_external_id=self.conversation.external_conversation_id,
+            platform_message_id="8799786063155001",
+        )
+        missing = platform_message_exists(
+            self.db,
+            self.user,
+            platform_account_id=self.platform_account.id,
+            conversation_external_id=self.conversation.external_conversation_id,
+            platform_message_id="8799786063155002",
+        )
+
+        self.assertTrue(found.exists)
+        self.assertEqual(found.conversation_id, self.conversation.id)
+        self.assertEqual(found.message_id, message.id)
+        self.assertFalse(missing.exists)
+
     def test_record_sent_message_preserves_client_message_id(self) -> None:
         from app.schemas.message import RecordSentMessageRequest
         from app.services.message_service import record_sent_message
@@ -197,6 +230,41 @@ class MessageServiceTests(unittest.TestCase):
             response.message.raw_payload["client_message_id"],
             "optimistic:client-1",
         )
+
+    def test_record_sent_message_reuses_existing_platform_message_id(self) -> None:
+        from app.schemas.message import RecordSentMessageRequest
+        from app.services.message_service import record_sent_message
+
+        first = record_sent_message(
+            self.db,
+            self.user,
+            RecordSentMessageRequest(
+                conversation_id=self.conversation.id,
+                content="sent via api",
+                platform_message_id="1787031727088",
+                client_message_id="optimistic:client-1",
+                platform_sent_at=datetime(2026, 8, 20, 10, 2, 7, tzinfo=timezone.utc),
+                raw_payload={"pre_msg_id": "1786933622874", "platform_ts": "1787031727"},
+            ),
+        )
+        second = record_sent_message(
+            self.db,
+            self.user,
+            RecordSentMessageRequest(
+                conversation_id=self.conversation.id,
+                content="sent via api updated",
+                platform_message_id="1787031727088",
+                client_message_id="optimistic:client-2",
+                raw_payload={"latest_observation_id": "pdd-api-list-1"},
+            ),
+        )
+
+        self.assertEqual(second.message.id, first.message.id)
+        self.assertEqual(second.message.content, "sent via api updated")
+        self.assertEqual(second.message.raw_payload["client_message_id"], "optimistic:client-2")
+        self.assertEqual(second.message.raw_payload["pre_msg_id"], "1786933622874")
+        self.assertEqual(second.message.raw_payload["latest_observation_id"], "pdd-api-list-1")
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(Message)), 1)
 
     def test_record_sent_image_preserves_media_type(self) -> None:
         from app.schemas.message import RecordSentMessageRequest

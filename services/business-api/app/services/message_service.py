@@ -15,6 +15,7 @@ from app.models import (
     Conversation,
     ConversationWorkflow,
     CustomerOrder,
+    CustomerProduct,
     CustomerOutreachRun,
     EmailSendTask,
     Message,
@@ -34,6 +35,7 @@ from app.schemas.conversation import (
 from app.schemas.message import (
     MessageListResponse,
     MessageRead,
+    PlatformMessageExistsResponse,
     RecordSentMessageRequest,
     RecordSentMessageResponse,
     SendMessageRequest,
@@ -50,15 +52,25 @@ from app.services.outbound_safety import prohibited_outbound_reason
 
 
 PLACEHOLDER_SHOP_NAMES = {
-    "待识别店铺名称",
-    "拼多多",
-    "拼多多商家后台",
-    "拼多多商家管理后台",
-    "拼多多客服平台",
-    "商家后台",
-    "客服平台",
+    "\u5f85\u8bc6\u522b\u5e97\u94fa\u540d\u79f0",
+    "\u62fc\u591a\u591a",
+    "\u62fc\u591a\u591a\u5546\u5bb6\u540e\u53f0",
+    "\u62fc\u591a\u591a\u5546\u5bb6\u7ba1\u7406\u540e\u53f0",
+    "\u62fc\u591a\u591a\u5ba2\u670d\u5e73\u53f0",
+    "\u5546\u5bb6\u540e\u53f0",
+    "\u5ba2\u670d\u5e73\u53f0",
 }
-NUMBERED_PDD_SHOP_NAME = re.compile(r"^拼多多店铺\s*\d+$")
+NUMBERED_PDD_SHOP_NAME = re.compile(r"^\u62fc\u591a\u591a\u5e97\u94fa\s*\d+$")
+
+
+def _pdd_platform_message_order_key(message: Message) -> tuple[int, int | str, int]:
+    platform_message_id = str(message.platform_message_id or "").strip()
+    fallback_sequence = int(message.conversation_sequence or 0)
+    if platform_message_id.isdigit():
+        return (0, int(platform_message_id), fallback_sequence)
+    if platform_message_id:
+        return (1, platform_message_id, fallback_sequence)
+    return (2, fallback_sequence, fallback_sequence)
 
 
 def _valid_shop_name(value: str | None) -> str | None:
@@ -68,7 +80,15 @@ def _valid_shop_name(value: str | None) -> str | None:
     return name
 
 
-def _conversation_read(conversation: Conversation) -> ConversationRead:
+def _metadata_text(metadata: dict, key: str) -> str | None:
+    value = metadata.get(key)
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _conversation_read(conversation: Conversation, db: Session | None = None) -> ConversationRead:
     account = conversation.platform_account
     platform_name = (
         account.platform_name
@@ -78,19 +98,59 @@ def _conversation_read(conversation: Conversation) -> ConversationRead:
     shop_name = None
     if account:
         shop_name = _valid_shop_name(account.account_alias) or _valid_shop_name(account.account_name)
+    account_metadata = account.metadata_json if account and isinstance(account.metadata_json, dict) else {}
+    shop_logo_url = (
+        _metadata_text(account_metadata, "logo_cached_url")
+        or _metadata_text(account_metadata, "logo_url")
+    )
+    shop_service_username = _metadata_text(account_metadata, "cs_username")
+    shop_is_mall_owner = account_metadata.get("is_mall_owner") is True
+    metadata = conversation.metadata_json or {}
     if not shop_name:
-        metadata_shop_name = conversation.metadata_json.get("shop_name")
+        metadata_shop_name = metadata.get("shop_name")
         shop_name = _valid_shop_name(metadata_shop_name if isinstance(metadata_shop_name, str) else None)
-    raw_issue = (conversation.metadata_json or {}).get("message_sync_issue")
+    raw_issue = metadata.get("message_sync_issue")
     message_sync_issue = None
     if isinstance(raw_issue, dict) and raw_issue.get("status") == "active":
         try:
             message_sync_issue = ConversationSyncIssueRead.model_validate(raw_issue)
         except ValueError:
             message_sync_issue = None
+    latest_customer_message_at = None
+    if db is not None:
+        latest_customer_message_at = db.scalar(
+            select(Message.platform_sent_at)
+            .where(
+                Message.conversation_id == conversation.id,
+                Message.sender_role == "customer",
+                Message.message_status == "sent",
+            )
+            .order_by(desc(Message.conversation_sequence))
+            .limit(1)
+        )
+        if latest_customer_message_at is None:
+            latest_customer_message_at = db.scalar(
+                select(Message.sent_at)
+                .where(
+                    Message.conversation_id == conversation.id,
+                    Message.sender_role == "customer",
+                    Message.message_status == "sent",
+                )
+                .order_by(desc(Message.conversation_sequence))
+                .limit(1)
+            )
     return ConversationRead.model_validate(conversation).model_copy(update={
         "platform_name": platform_name,
         "shop_name": shop_name,
+        "shop_logo_url": shop_logo_url,
+        "shop_service_username": shop_service_username,
+        "shop_is_mall_owner": shop_is_mall_owner,
+        "latest_customer_message_at": latest_customer_message_at,
+        "avatar_url": (
+            _metadata_text(metadata, "customer_avatar_cached_url")
+            or _metadata_text(metadata, "customer_avatar_url")
+            or _metadata_text(metadata, "avatar_url")
+        ),
         "message_sync_issue": message_sync_issue,
     })
 
@@ -128,7 +188,7 @@ def list_conversations(
         ).all()
     )
     return ConversationListResponse(
-        items=[_conversation_read(item) for item in items],
+        items=[_conversation_read(item, db) for item in items],
         meta=PageMeta(total=total, limit=limit, offset=offset),
     )
 
@@ -141,7 +201,7 @@ def get_conversation(db: Session, user: User, conversation_id: str) -> Conversat
     )
     if not conversation:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    return _conversation_read(conversation)
+    return _conversation_read(conversation, db)
 
 
 def clear_human_required(db: Session, user: User, conversation_id: str) -> ConversationRead:
@@ -159,7 +219,27 @@ def clear_human_required(db: Session, user: User, conversation_id: str) -> Conve
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
-    return _conversation_read(conversation)
+    return _conversation_read(conversation, db)
+
+
+def clear_awaiting_reply(db: Session, user: User, conversation_id: str) -> ConversationRead:
+    conversation = db.scalar(
+        select(Conversation)
+        .options(selectinload(Conversation.platform_account))
+        .where(and_(Conversation.id == conversation_id, Conversation.user_id == user.id))
+    )
+    if not conversation:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    metadata = dict(conversation.metadata_json or {})
+    metadata["awaiting_reply_cleared_sequence"] = int(conversation.last_message_sequence or 0)
+    metadata["awaiting_reply_cleared_at"] = utcnow().isoformat()
+    conversation.metadata_json = metadata
+    conversation.awaiting_reply = False
+    conversation.unread_count = 0
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return _conversation_read(conversation, db)
 
 
 _ACTIVE_CONVERSATION_TASK_STATUSES = {
@@ -187,7 +267,7 @@ def _ensure_conversation_can_be_cleared(db: Session, conversation: Conversation)
     if active_task_count or active_reply_count:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="当前会话有消息正在处理，请稍后操作",
+            detail="Conversation has active processing tasks. Please try again later.",
         )
 
 
@@ -213,6 +293,7 @@ def _delete_conversation_pipeline_rows(
     delete_conversation_rows(CustomerOutreachRun, "customer_outreach_runs")
     if include_orders:
         delete_conversation_rows(CustomerOrder, "customer_orders")
+        delete_conversation_rows(CustomerProduct, "customer_products")
     delete_conversation_rows(RpaTask, "rpa_tasks")
     delete_conversation_rows(MessageObservation, "message_observations")
     delete_conversation_rows(Message, "messages")
@@ -321,7 +402,7 @@ def dismiss_conversation_message_sync_issue(
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
-    return _conversation_read(conversation)
+    return _conversation_read(conversation, db)
 
 
 def rebuild_conversation_message_queue(
@@ -411,7 +492,7 @@ def rebuild_conversation_message_queue(
     db.commit()
     db.refresh(conversation)
     return (
-        _conversation_read(conversation),
+        _conversation_read(conversation, db),
         [MessageRead.model_validate(item) for item in recovery_messages],
         deleted_counts,
     )
@@ -449,7 +530,7 @@ def clear_conversation_history(db: Session, user: User, conversation_id: str) ->
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
-    return _conversation_read(conversation)
+    return _conversation_read(conversation, db)
 
 
 def soft_delete_conversation(db: Session, user: User, conversation_id: str) -> ConversationRead:
@@ -475,7 +556,7 @@ def soft_delete_conversation(db: Session, user: User, conversation_id: str) -> C
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
-    return _conversation_read(conversation)
+    return _conversation_read(conversation, db)
 
 
 def reset_pinduoduo_conversation_test_data(
@@ -533,11 +614,13 @@ def reset_pinduoduo_conversation_test_data(
     conversation.status = "active"
     metadata = dict(conversation.metadata_json or {})
     metadata.pop("message_sync_issue", None)
+    metadata.pop("customer_orders", None)
+    metadata.pop("customer_products", None)
     conversation.metadata_json = metadata
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
-    return _conversation_read(conversation), deleted_counts
+    return _conversation_read(conversation, db), deleted_counts
 
 
 def list_messages(
@@ -565,6 +648,17 @@ def list_messages(
         .where(visible_messages)
     )
     total = db.scalar(count_stmt) or 0
+    if conversation.platform_code == "pinduoduo":
+        ordered = sorted(
+            db.scalars(select(Message).where(visible_messages)).all(),
+            key=_pdd_platform_message_order_key,
+        )
+        end = max(total - offset, 0)
+        start = max(end - limit, 0)
+        return MessageListResponse(
+            items=[MessageRead.model_validate(item) for item in ordered[start:end]],
+            meta=PageMeta(total=total, limit=limit, offset=offset),
+        )
     # Page backwards from the permanent queue tail, then restore chat order.
     stmt = (
         select(Message)
@@ -580,12 +674,45 @@ def list_messages(
     )
 
 
+def platform_message_exists(
+    db: Session,
+    user: User,
+    *,
+    platform_account_id: str,
+    conversation_external_id: str,
+    platform_message_id: str,
+) -> PlatformMessageExistsResponse:
+    conversation = db.scalar(
+        select(Conversation).where(
+            Conversation.user_id == user.id,
+            Conversation.platform_account_id == platform_account_id,
+            Conversation.external_conversation_id == conversation_external_id,
+            Conversation.deleted_at.is_(None),
+        )
+    )
+    if not conversation:
+        return PlatformMessageExistsResponse(exists=False)
+    message = db.scalar(
+        select(Message).where(
+            Message.user_id == user.id,
+            Message.conversation_id == conversation.id,
+            Message.platform_message_id == platform_message_id,
+        )
+    )
+    return PlatformMessageExistsResponse(
+        exists=message is not None,
+        conversation_id=conversation.id,
+        message_id=message.id if message else None,
+    )
+
+
 def create_send_task(
     db: Session,
     user: User,
     request: SendMessageRequest,
     *,
     follow_up: dict[str, object] | None = None,
+    follow_up_products: list[dict[str, object]] | None = None,
     idempotency_key: str | None = None,
     source: str = "desktop",
     task_status: str = "queued",
@@ -595,14 +722,33 @@ def create_send_task(
         if prohibited_reason:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"自动发送内容包含平台禁止的链接或联系方式: {prohibited_reason}",
+                detail=f"Outbound content contains prohibited platform contact/link content: {prohibited_reason}",
             )
     conversation = db.get(Conversation, request.conversation_id)
     if not conversation or conversation.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if idempotency_key:
+        existing_task = db.scalar(select(RpaTask).where(
+            RpaTask.user_id == user.id,
+            RpaTask.idempotency_key == idempotency_key,
+        ))
+        if existing_task and existing_task.message_id:
+            existing_message = db.get(Message, existing_task.message_id)
+            if existing_message:
+                return SendMessageResponse(
+                    message=MessageRead.model_validate(existing_message),
+                    task_id=existing_task.id,
+                    task_status=existing_task.status,
+                    follow_up_message=None,
+                    follow_up_messages=[],
+                )
 
     platform_code = request.platform_code or conversation.platform_code
     now = utcnow()
+    raw_payload = {
+        **({"quote_msg_id": request.quote_message_id} if request.quote_message_id else {}),
+        **({"structured_payload": {"quote_msg_id": request.quote_message_id}} if request.quote_message_id else {}),
+    }
     message = Message(
         conversation_id=conversation.id,
         user_id=user.id,
@@ -612,11 +758,94 @@ def create_send_task(
         content=request.content,
         message_status="queued",
         source=source,
+        raw_payload=raw_payload,
         observed_at=now,
         sent_at=now,
     )
     append_message(db, message, collected_at=now)
     db.flush()
+    follow_up_message: Message | None = None
+    follow_up_messages: list[Message] = []
+    follow_up_product_messages: list[Message] = []
+    follow_up_payload = follow_up if isinstance(follow_up, dict) else None
+    if (
+        source != "desktop"
+        and follow_up_payload
+        and follow_up_payload.get("type") == "image"
+        and follow_up_payload.get("url")
+    ):
+        follow_up_message = Message(
+            conversation_id=conversation.id,
+            user_id=user.id,
+            platform_code=platform_code,
+            sender_role="agent",
+            sender_name=request.sender_name or user.display_name,
+            content="[å¾ç]",
+            message_status="queued",
+            source=source,
+            raw_payload={
+                "media_type": "image",
+                "message_type": "image",
+                "image_url": str(follow_up_payload["url"]),
+                "idempotency_key": "pending",
+                "parent_message_id": message.id,
+                "platform_confirmation_pending": False,
+            },
+            observed_at=now,
+            sent_at=now,
+        )
+        append_message(db, follow_up_message, collected_at=now)
+        db.flush()
+        follow_up_messages.append(follow_up_message)
+    product_payloads = [
+        item for item in (follow_up_products or [])[:2]
+        if isinstance(item, dict)
+        and str(item.get("goods_id") or "").strip()
+        and str(item.get("product_id") or item.get("platform_product_id") or "").strip()
+    ]
+    for index, product in enumerate(product_payloads):
+        goods_id = str(product.get("goods_id") or "").strip()[:128]
+        product_id = str(product.get("product_id") or product.get("platform_product_id") or "").strip()[:128]
+        product_message = Message(
+            conversation_id=conversation.id,
+            user_id=user.id,
+            platform_code=platform_code,
+            sender_role="agent",
+            sender_name=request.sender_name or user.display_name,
+            content=str(product.get("title") or "[商品]")[:1000],
+            message_status="queued",
+            source=source,
+            raw_payload={
+                "message_type": "product",
+                "display_mode": "card",
+                "goods_id": goods_id,
+                "product_id": product_id,
+                "platform_product_id": product_id,
+                "title": product.get("title"),
+                "image_url": product.get("image_url"),
+                "link_url": product.get("link_url"),
+                "price": product.get("price"),
+                "price_label": product.get("price_label"),
+                "structured_payload": {
+                    "goods_id": goods_id,
+                    "product_id": product_id,
+                    "title": product.get("title"),
+                    "image_url": product.get("image_url"),
+                    "link_url": product.get("link_url"),
+                    "price": product.get("price"),
+                    "price_label": product.get("price_label"),
+                },
+                "parent_message_id": message.id,
+                "product_index": index,
+                "product_send_pending": True,
+            },
+            observed_at=now,
+            sent_at=now,
+        )
+        append_message(db, product_message, collected_at=now)
+        db.flush()
+        follow_up_messages.append(product_message)
+        follow_up_product_messages.append(product_message)
     task = RpaTask(
         user_id=user.id,
         platform_account_id=conversation.platform_account_id,
@@ -633,14 +862,34 @@ def create_send_task(
             "message_id": message.id,
             "content": request.content,
             "sender_name": request.sender_name or user.display_name,
+            "source": source,
+            **({"follow_up_message_id": follow_up_message.id} if follow_up_message else {}),
+            **({
+                "follow_up_message_ids": [item.id for item in follow_up_messages]
+            } if follow_up_messages else {}),
+            **({
+                "follow_up_product_message_ids": [item.id for item in follow_up_product_messages]
+            } if follow_up_product_messages else {}),
+            **({"quote_message_id": request.quote_message_id} if request.quote_message_id else {}),
             **({"follow_up": follow_up} if follow_up else {}),
+            **({"follow_up_products": product_payloads} if product_payloads else {}),
         },
         status=task_status,
         priority=0,
     )
     db.add(task)
+    db.flush()
+    if follow_up_message is not None:
+        follow_up_message.raw_payload = {
+            **(follow_up_message.raw_payload or {}),
+            "parent_task_id": task.id,
+            "idempotency_key": f"reply-bundle-image:{task.id}",
+        }
+        db.add(follow_up_message)
 
-    conversation.latest_message_text = request.content
+    conversation.latest_message_text = (
+        follow_up_messages[-1].content if follow_up_messages else request.content
+    )
     conversation.latest_message_at = now
     conversation.status = "active"
     db.add(conversation)
@@ -662,14 +911,22 @@ def create_send_task(
             message=MessageRead.model_validate(existing_message),
             task_id=existing_task.id,
             task_status=existing_task.status,
+            follow_up_message=None,
+            follow_up_messages=[],
         )
     db.refresh(message)
     db.refresh(task)
+    if follow_up_message is not None:
+        db.refresh(follow_up_message)
+    for item in follow_up_messages:
+        db.refresh(item)
 
     return SendMessageResponse(
         message=MessageRead.model_validate(message),
         task_id=task.id,
         task_status=task.status,
+        follow_up_message=MessageRead.model_validate(follow_up_message) if follow_up_message else None,
+        follow_up_messages=[MessageRead.model_validate(item) for item in follow_up_messages],
     )
 
 
@@ -683,6 +940,44 @@ def record_sent_message(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
     now = utcnow()
+    platform_sent_at = request.platform_sent_at or now
+    extra_payload = request.raw_payload if isinstance(request.raw_payload, dict) else {}
+    raw_payload = {
+        **({"client_message_id": request.client_message_id} if request.client_message_id else {}),
+        **({"media_type": "image", "message_type": "image"} if request.media_type == "image" else {}),
+        **extra_payload,
+    }
+    if request.platform_message_id:
+        existing = db.scalar(
+            select(Message).where(
+                Message.conversation_id == conversation.id,
+                Message.platform_message_id == request.platform_message_id,
+            )
+        )
+        if existing:
+            previous_payload = existing.raw_payload if isinstance(existing.raw_payload, dict) else {}
+            existing.sender_role = "agent"
+            existing.sender_name = request.sender_name or existing.sender_name or user.display_name
+            existing.content = request.content
+            existing.message_status = "sent"
+            existing.source = "desktop"
+            existing.raw_payload = {
+                **previous_payload,
+                **raw_payload,
+            }
+            existing.platform_sent_at = existing.platform_sent_at or platform_sent_at
+            existing.observed_at = existing.observed_at or now
+            existing.sent_at = existing.sent_at or platform_sent_at
+            conversation.latest_message_text = request.content
+            conversation.latest_message_at = platform_sent_at
+            conversation.status = "active"
+            conversation.awaiting_reply = False
+            db.add(existing)
+            db.add(conversation)
+            db.commit()
+            db.refresh(existing)
+            return RecordSentMessageResponse(message=MessageRead.model_validate(existing))
+
     message = Message(
         conversation_id=conversation.id,
         user_id=user.id,
@@ -693,17 +988,14 @@ def record_sent_message(
         content=request.content,
         message_status="sent",
         source="desktop",
-        raw_payload={
-            **({"client_message_id": request.client_message_id} if request.client_message_id else {}),
-            **({"media_type": "image", "message_type": "image"} if request.media_type == "image" else {}),
-        },
-        platform_sent_at=now,
+        raw_payload=raw_payload,
+        platform_sent_at=platform_sent_at,
         observed_at=now,
-        sent_at=now,
+        sent_at=platform_sent_at,
     )
     append_message(db, message, collected_at=now)
     conversation.latest_message_text = request.content
-    conversation.latest_message_at = now
+    conversation.latest_message_at = platform_sent_at
     conversation.status = "active"
     conversation.awaiting_reply = False
     db.add(conversation)

@@ -360,6 +360,8 @@ need_doc_search: 仅 retrieve_product 为 true
 need_email: boolean，仅 email_link_request 可为 true
 workflow: 简短英文标识
 next_action: send_direct_reply | search_product_documents | defer_email_workflow | send_handoff_reply
+wants_product_recommendation: boolean，只有客户明确想看/推荐/询问店内是否有某类商品时才为 true
+product_recommendation_query: wants_product_recommendation 为 true 时填写客户想找的商品范围或关键词，否则为空
 missing_slots: 字符串数组
 template_id: 可选，仅可返回下方可用邮件模板中的 id，不能编造
 template_key: 可选，仅可返回下方可用邮件模板中的 template_key，不能编造
@@ -367,6 +369,9 @@ risk_flags: 字符串数组
 reason: 一句简短理由
 只有问候、致谢、简单确认、结束语、情绪回应等不涉及业务事实的消息才允许 direct。
 产品规格、价格、库存、适配、安装、物流、售后、退款、保修等事实问题必须 retrieve_product，禁止凭模型自身知识回答。
+wants_product_recommendation 只用于判断是否需要额外发送商品卡；商品标题中的普通词命中不能作为推荐意图。
+例如“推荐几款”“有什么推荐吗”“有没有崩铁流萤抱枕”“有没有明日方舟角色的”应为 true。
+例如“双面图案一样吗”“尺寸多大”“有没有货”“什么时候发货”“能优惠吗”属于咨询问题，应为 false。
 判断不确定时必须 retrieve_product。客户请求不适合在平台聊天中直接发送、需要通过邮箱承接、或符合邮件触发场景时使用 email_link_request。
 如果配置了邮件触发场景，客户消息符合任一场景时必须使用 email_link_request；不要把这些场景当普通产品咨询处理。
 如果未配置邮件触发场景，仅在客户明确要求通过邮箱接收资料，或索要不适合在平台聊天中直接发送的外部内容时使用 email_link_request。
@@ -392,6 +397,7 @@ reason: 一句简短理由
         "生成回复时不得涉及上述用户配置的违禁内容。\n"
         f"客户订单信息（仅此处可作为订单事实来源）：{json.dumps(request.customer_orders, ensure_ascii=False)}\n"
         f"平台会话上下文（商品卡片、来源卡片等，仅作指代和商品背景）：{json.dumps(request.platform_context, ensure_ascii=False)}\n"
+        f"店铺资料摘要（仅作为店铺商品范围和经营方向参考，不可据此编造具体商品事实）：{json.dumps(request.shop_product_summary, ensure_ascii=False)}\n"
         f"邮件触发场景（用户配置，符合时走 email_link_request）：{_email_trigger_scenarios(request) or '未配置'}\n"
         f"可用邮件模板元数据（只可从中选择 template_id/template_key）：{templates_text}\n"
         f"最近对话（按时间正序）：\n{conversation_prompt(request)}\n"
@@ -595,6 +601,7 @@ def _generation_prompts(
         f"客户：{request.customer_name or '未知'}\n"
         f"客户订单信息（仅此处可作为订单事实来源）：{json.dumps(request.customer_orders, ensure_ascii=False)}\n"
         f"平台会话上下文（商品卡片、来源卡片等，仅作指代和商品背景）：{json.dumps(request.platform_context, ensure_ascii=False)}\n"
+        f"店铺资料摘要（用于判断客户是否在询问店内商品或推荐商品）：{json.dumps(request.shop_product_summary, ensure_ascii=False)}\n"
         f"最近对话（按时间正序）：\n{conversation_prompt(request)}\n"
         f"结构化意图：{intent.model_dump_json()}\n"
         f"执行计划：{action_plan.model_dump_json()}\n"

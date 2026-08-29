@@ -89,6 +89,7 @@ class SnapshotMessage(BaseModel):
     image_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
     media_resource_id: str | None = Field(default=None, max_length=512)
     platform_message_id: str | None = Field(default=None, max_length=128)
+    platform_sent_at: datetime | int | float | str | None = None
     display_mode: Literal["bubble", "card", "separator", "notice", "hidden"] = "bubble"
     automation_mode: Literal["trigger", "context", "ignore"] = "trigger"
     structured_payload: dict[str, Any] | None = None

@@ -142,7 +142,7 @@ class OrderServiceTests(unittest.TestCase):
             {
                 "collection_status": "success",
                 "customer_key": "customer:key",
-                "orders": [{"platform_order_id": "order-all", "status": "signed"}],
+                "orders": [{"platform_order_id": "order-all", "status": "signed", "raw_status": "已签收"}],
             },
             datetime.now(timezone.utc),
         )
@@ -151,6 +151,36 @@ class OrderServiceTests(unittest.TestCase):
         run = self.db.scalar(select(CustomerOutreachRun))
         self.assertIsNotNone(run)
         self.assertEqual(run.strategy_type, "post_receipt_care")
+
+    def test_post_receipt_is_distinct_per_goods_id(self) -> None:
+        apply_orders_snapshot(
+            self.db,
+            self.conversation,
+            {
+                "collection_status": "success",
+                "customer_key": "customer:key",
+                "orders": [
+                    {
+                        "platform_order_id": "order-goods-1",
+                        "status": "signed",
+                        "raw_status": "已签收",
+                        "products": [{"goods_id": "goods-1", "product_id": "goods-1"}],
+                    },
+                    {
+                        "platform_order_id": "order-goods-2",
+                        "status": "signed",
+                        "raw_status": "已签收",
+                        "products": [{"goods_id": "goods-2", "product_id": "goods-2"}],
+                    },
+                ],
+            },
+            datetime.now(timezone.utc),
+        )
+        self.db.commit()
+
+        runs = self.db.scalars(select(CustomerOutreachRun)).all()
+        self.assertEqual(len(runs), 2)
+        self.assertEqual({run.goods_id for run in runs}, {"goods-1", "goods-2"})
 
     def test_follow_up_requires_only_explicitly_empty_orders(self) -> None:
         apply_orders_snapshot(
@@ -250,7 +280,7 @@ class OrderServiceTests(unittest.TestCase):
             {
                 "collection_status": "success",
                 "customer_key": "customer:key",
-                "orders": [{"platform_order_id": "order-immediate", "status": "signed"}],
+                "orders": [{"platform_order_id": "order-immediate", "status": "signed", "raw_status": "已签收"}],
             },
             before,
         )
@@ -263,7 +293,7 @@ class OrderServiceTests(unittest.TestCase):
         payload = {
             "collection_status": "success",
             "customer_key": "customer:key",
-            "orders": [{"platform_order_id": "order-retry", "status": "signed"}],
+            "orders": [{"platform_order_id": "order-retry", "status": "signed", "raw_status": "已签收"}],
         }
         apply_orders_snapshot(self.db, self.conversation, payload, datetime.now(timezone.utc))
         self.db.commit()
@@ -387,6 +417,7 @@ class OrderServiceTests(unittest.TestCase):
                 "orders": [{
                     "platform_order_id": "order-signed",
                     "status": "signed",
+                    "raw_status": "已签收",
                     "after_sale": {"text": "退货包运费 未赠送"},
                 }],
             },
@@ -407,6 +438,7 @@ class OrderServiceTests(unittest.TestCase):
                 "orders": [{
                     "platform_order_id": "order-signed",
                     "status": "signed",
+                    "raw_status": "已签收",
                     "after_sale": {"text": "退货包运费 未赠送"},
                 }],
             },
@@ -424,7 +456,7 @@ class OrderServiceTests(unittest.TestCase):
             {
                 "collection_status": "success",
                 "customer_key": "customer:key",
-                "orders": [{"platform_order_id": "order-refund", "status": "signed"}],
+                "orders": [{"platform_order_id": "order-refund", "status": "signed", "raw_status": "已签收"}],
             },
             observed,
         )
@@ -440,14 +472,14 @@ class OrderServiceTests(unittest.TestCase):
             {
                 "collection_status": "success",
                 "customer_key": "customer:key",
-                "orders": [{"platform_order_id": "order-refund", "status": "refunding"}],
+                "orders": [{"platform_order_id": "order-refund", "status": "refunding", "raw_status": "退款中"}],
             },
             observed + timedelta(minutes=1),
         )
         self.db.commit()
 
         self.assertEqual(run.status, "cancelled")
-        self.assertEqual(run.cancel_reason, "refund_or_after_sale")
+        self.assertEqual(run.cancel_reason, "order_status_unknown")
 
     def test_missing_target_order_cannot_authorize_post_receipt_send(self) -> None:
         order = CustomerOrder(

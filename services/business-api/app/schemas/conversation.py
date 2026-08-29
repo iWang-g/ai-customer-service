@@ -29,8 +29,13 @@ class ConversationRead(BaseModel):
     platform_code: str
     platform_name: str | None = None
     shop_name: str | None = None
+    shop_logo_url: str | None = None
+    shop_service_username: str | None = None
+    shop_is_mall_owner: bool = False
+    latest_customer_message_at: datetime | None = None
     external_conversation_id: str | None = None
     customer_name: str | None = None
+    avatar_url: str | None = None
     title: str | None = None
     latest_message_text: str | None = None
     latest_message_at: datetime | None = None

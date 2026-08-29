@@ -43,11 +43,18 @@ class MessageListResponse(BaseModel):
     meta: PageMeta
 
 
+class PlatformMessageExistsResponse(BaseModel):
+    exists: bool
+    conversation_id: str | None = None
+    message_id: str | None = None
+
+
 class SendMessageRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     content: str = Field(min_length=1)
     platform_code: str | None = None
     sender_name: str | None = None
+    quote_message_id: str | None = Field(default=None, max_length=128)
 
 
 class SendMessageResponse(BaseModel):
@@ -56,6 +63,8 @@ class SendMessageResponse(BaseModel):
     task_status: Literal[
         "waiting_timeout", "queued", "dispatched", "acknowledged", "completed", "failed", "confirmation_pending"
     ]
+    follow_up_message: MessageRead | None = None
+    follow_up_messages: list[MessageRead] = Field(default_factory=list)
 
 
 class RecordSentMessageRequest(BaseModel):
@@ -66,6 +75,8 @@ class RecordSentMessageRequest(BaseModel):
     platform_code: str | None = None
     sender_name: str | None = None
     media_type: Literal["text", "image"] = "text"
+    platform_sent_at: datetime | None = None
+    raw_payload: dict[str, Any] | None = None
 
 
 class RecordSentMessageResponse(BaseModel):

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy import create_engine, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.migrations import apply_compatibility_migrations
@@ -59,29 +60,34 @@ class MessageQueueServiceTests(unittest.TestCase):
         self.assertIsNotNone(first.collected_at)
         self.assertEqual(self.conversation.last_message_sequence, 2)
 
-    def test_platform_message_id_is_supporting_evidence_not_unique_identity(self) -> None:
-        for content in ("same-id-first", "same-id-second"):
-            append_message(
-                self.db,
-                Message(
-                    conversation_id=self.conversation.id,
-                    user_id=self.user.id,
-                    platform_code="pinduoduo",
-                    platform_message_id="unstable-platform-id",
-                    sender_role="customer",
-                    content=content,
-                ),
-            )
+    def test_platform_message_id_is_unique_within_conversation(self) -> None:
+        append_message(
+            self.db,
+            Message(
+                conversation_id=self.conversation.id,
+                user_id=self.user.id,
+                platform_code="pinduoduo",
+                platform_message_id="stable-platform-id",
+                sender_role="customer",
+                content="same-id-first",
+            ),
+        )
         self.db.commit()
 
-        rows = list(
-            self.db.scalars(
-                select(Message)
-                .where(Message.conversation_id == self.conversation.id)
-                .order_by(Message.conversation_sequence)
-            ).all()
+        append_message(
+            self.db,
+            Message(
+                conversation_id=self.conversation.id,
+                user_id=self.user.id,
+                platform_code="pinduoduo",
+                platform_message_id="stable-platform-id",
+                sender_role="customer",
+                content="same-id-second",
+            ),
         )
-        self.assertEqual([row.content for row in rows], ["same-id-first", "same-id-second"])
+        with self.assertRaises(IntegrityError):
+            self.db.commit()
+        self.db.rollback()
 
 
 class MessageQueueMigrationTests(unittest.TestCase):
@@ -168,6 +174,100 @@ class MessageQueueMigrationTests(unittest.TestCase):
         self.assertEqual([row.conversation_sequence for row in migrated], [1, 2])
         self.assertTrue(all(row.collected_at is not None for row in migrated))
         self.assertEqual(tail, 2)
+        engine.dispose()
+
+    def test_platform_message_unique_index_migration_deduplicates_old_rows(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        db = Session(engine)
+        user = User(username="unique-migration", display_name="Unique Migration", password_hash="not-used")
+        db.add(user)
+        db.flush()
+        conversation = Conversation(
+            user_id=user.id,
+            platform_code="pinduoduo",
+            external_conversation_id="unique-customer",
+        )
+        db.add(conversation)
+        db.flush()
+        user_id = user.id
+        conversation_id = conversation.id
+        db.close()
+
+        with engine.begin() as connection:
+            connection.execute(text("DROP INDEX IF EXISTS uq_messages_conversation_platform_message"))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_messages_conversation_platform_message "
+                "ON messages (conversation_id, platform_message_id)"
+            ))
+            connection.execute(
+                text(
+                    """INSERT INTO messages (
+                        id, conversation_id, user_id, platform_code, platform_message_id,
+                        sender_role, content, message_status, source, raw_payload,
+                        sent_at, created_at, updated_at, collection_kind, automation_eligible
+                    ) VALUES (
+                        :id, :conversation_id, :user_id, 'pinduoduo', 'same-platform-id',
+                        'customer', :content, 'sent', 'rpa', '{}',
+                        :sent_at, :sent_at, :sent_at, :collection_kind, 1
+                    )"""
+                ),
+                [
+                    {
+                        "id": "duplicate-message-bootstrap",
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                        "content": "bootstrap copy",
+                        "sent_at": "2026-08-20 11:42:00",
+                        "collection_kind": "bootstrap",
+                    },
+                    {
+                        "id": "duplicate-message-incremental",
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                        "content": "incremental copy",
+                        "sent_at": "2026-08-20 10:20:00",
+                        "collection_kind": "incremental",
+                    },
+                ],
+            )
+
+        apply_compatibility_migrations(engine)
+        apply_compatibility_migrations(engine)
+
+        with engine.connect() as connection:
+            rows = connection.execute(text(
+                "SELECT id, content FROM messages WHERE platform_message_id = 'same-platform-id'"
+            )).all()
+            indexes = {
+                row.name: row
+                for row in connection.execute(text("PRAGMA index_list(messages)")).all()
+            }
+            duplicate_insert_failed = False
+            try:
+                connection.execute(
+                    text(
+                        """INSERT INTO messages (
+                            id, conversation_id, user_id, platform_code, platform_message_id,
+                            sender_role, content, message_status, source, raw_payload,
+                            sent_at, created_at, updated_at, collection_kind, automation_eligible
+                        ) VALUES (
+                            'duplicate-message-new', :conversation_id, :user_id, 'pinduoduo',
+                            'same-platform-id', 'customer', 'new copy', 'sent', 'rpa', '{}',
+                            '2026-08-20 12:00:00', '2026-08-20 12:00:00',
+                            '2026-08-20 12:00:00', 'incremental', 1
+                        )"""
+                    ),
+                    {"conversation_id": conversation_id, "user_id": user_id},
+                )
+            except IntegrityError:
+                duplicate_insert_failed = True
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].id, "duplicate-message-incremental")
+        self.assertIn("uq_messages_conversation_platform_message", indexes)
+        self.assertTrue(indexes["uq_messages_conversation_platform_message"].unique)
+        self.assertTrue(duplicate_insert_failed)
         engine.dispose()
 
     def test_parallel_append_allocates_unique_sequences(self) -> None:

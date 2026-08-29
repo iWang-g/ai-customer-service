@@ -13,7 +13,9 @@ from app.schemas.conversation import (
 )
 from app.schemas.message import MessageListResponse
 from app.schemas.order import CustomerOrdersResponse
+from app.schemas.product import CustomerProductsResponse
 from app.services.message_service import (
+    clear_awaiting_reply,
     clear_human_required,
     clear_conversation_history,
     dismiss_conversation_message_sync_issue,
@@ -26,6 +28,7 @@ from app.services.message_service import (
     soft_delete_conversation,
 )
 from app.services.order_service import customer_orders_response
+from app.services.product_service import customer_products_response
 from app.services.realtime import realtime_manager
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -123,6 +126,20 @@ async def clear_conversation_human_required(
     return ConversationDetailResponse(conversation=conversation)
 
 
+@router.post("/{conversation_id}/clear-awaiting-reply", response_model=ConversationDetailResponse)
+async def clear_conversation_awaiting_reply(
+    conversation_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> ConversationDetailResponse:
+    conversation = clear_awaiting_reply(db, user, conversation_id)
+    await realtime_manager.broadcast(
+        user.id,
+        {"type": "conversation.updated", "conversation": conversation.model_dump(mode="json")},
+    )
+    return ConversationDetailResponse(conversation=conversation)
+
+
 @router.post("/{conversation_id}/reset-test-data", response_model=ConversationTestResetResponse)
 async def reset_conversation_test_data(
     conversation_id: str,
@@ -190,3 +207,12 @@ def conversation_orders(
     db: Session = Depends(get_db_session),
 ) -> CustomerOrdersResponse:
     return customer_orders_response(db, user, conversation_id)
+
+
+@router.get("/{conversation_id}/products", response_model=CustomerProductsResponse)
+def conversation_products(
+    conversation_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> CustomerProductsResponse:
+    return customer_products_response(db, user, conversation_id)

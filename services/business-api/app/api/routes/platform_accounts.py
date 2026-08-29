@@ -8,6 +8,7 @@ from app.schemas.platform_account import (
     PlatformAccountListResponse,
     PlatformAccountRead,
     PlatformAccountUpdate,
+    ShopSummaryUpdate,
 )
 from app.services.platform_account_service import (
     create_or_sync_platform_account,
@@ -15,6 +16,8 @@ from app.services.platform_account_service import (
     get_platform_account,
     list_platform_accounts,
     update_platform_account,
+    generate_shop_summary,
+    update_shop_summary,
 )
 
 router = APIRouter(prefix="/platform-accounts", tags=["platform-accounts"])
@@ -58,6 +61,27 @@ def patch_account(
     db: Session = Depends(get_db_session),
 ) -> PlatformAccountRead:
     return PlatformAccountRead.model_validate(update_platform_account(db, user, account_id, request))
+
+
+@router.post("/{account_id}/shop-summary/generate", response_model=PlatformAccountRead)
+async def generate_account_shop_summary(
+    account_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> PlatformAccountRead:
+    return PlatformAccountRead.model_validate(await generate_shop_summary(db, user, account_id))
+
+
+@router.patch("/{account_id}/shop-summary", response_model=PlatformAccountRead)
+def patch_account_shop_summary(
+    account_id: str,
+    request: ShopSummaryUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> PlatformAccountRead:
+    return PlatformAccountRead.model_validate(
+        update_shop_summary(db, user, account_id, request)
+    )
 
 
 @router.delete("/{account_id}", status_code=status.HTTP_204_NO_CONTENT)

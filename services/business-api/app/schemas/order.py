@@ -14,6 +14,7 @@ class CustomerOrderRead(BaseModel):
 
     id: str
     platform_order_id: str
+    goods_id: str = ""
     status: str
     raw_status: str
     products_json: list[dict[str, Any]] = Field(default_factory=list)
@@ -29,6 +30,7 @@ class CustomerOrderRead(BaseModel):
 
 class OutreachStatusRead(BaseModel):
     strategy_type: str
+    goods_id: str = ""
     status: str
     due_at: datetime
     cancel_reason: str | None = None

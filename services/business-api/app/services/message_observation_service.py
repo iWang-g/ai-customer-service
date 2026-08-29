@@ -124,10 +124,97 @@ def _snapshot_metrics(messages: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _platform_message_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _platform_message_id_sort_key(value: Any) -> tuple[int, int | str]:
+    message_id = _platform_message_id(value)
+    if message_id.isdigit():
+        return (0, int(message_id))
+    return (1, message_id)
+
+
+def _is_pdd_api_chat_list_snapshot(
+    observation: MessageObservation,
+    messages: list[dict[str, Any]],
+) -> bool:
+    raw_payload = observation.raw_payload if isinstance(observation.raw_payload, dict) else {}
+    source_snapshot_id = str(raw_payload.get("source_snapshot_id") or "")
+    if observation.platform_code != "pinduoduo" or not source_snapshot_id.startswith("pdd-api-list-"):
+        return False
+    return bool(messages) and all(_platform_message_id(item.get("platform_message_id")) for item in messages)
+
+
 def _as_utc_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _message_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc_naive(value)
+    if isinstance(value, int | float):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).replace(tzinfo=None)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return _message_datetime(int(text))
+        try:
+            return _as_utc_naive(datetime.fromisoformat(text.replace("Z", "+00:00")))
+        except ValueError:
+            return None
+    return None
+
+
+def _message_sort_datetime(message: Message | dict[str, Any]) -> datetime | None:
+    if isinstance(message, Message):
+        return message.platform_sent_at or message.sent_at or message.observed_at or message.collected_at
+    return (
+        _message_datetime(message.get("platform_sent_at"))
+        or _message_datetime(message.get("sent_at"))
+        or _message_datetime(message.get("observed_at"))
+        or _message_datetime(message.get("collected_at"))
+    )
+
+
+def _message_automation_mode(message: Message | dict[str, Any]) -> str:
+    if isinstance(message, Message):
+        raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+        return str(raw_payload.get("automation_mode") or "trigger")
+    return str(message.get("automation_mode") or "trigger")
+
+
+def _refresh_conversation_latest_from_messages(
+    conversation: Conversation,
+    messages: list[Message | dict[str, Any]],
+    fallback_at: datetime,
+) -> None:
+    conversational_messages = [
+        item for item in messages
+        if _message_automation_mode(item) in {"trigger", "context"}
+    ]
+    if not conversational_messages:
+        return
+    latest = max(
+        conversational_messages,
+        key=lambda item: (
+            _message_sort_datetime(item) or fallback_at,
+            _platform_message_id_sort_key(
+                item.platform_message_id if isinstance(item, Message) else item.get("platform_message_id")
+            ),
+        ),
+    )
+    conversation.latest_message_text = (
+        latest.content if isinstance(latest, Message) else str(latest.get("content") or "")
+    )
+    conversation.latest_message_at = _message_sort_datetime(latest) or fallback_at
 
 
 def _assemble_batches(observation: MessageObservation) -> list[dict[str, Any]] | None:
@@ -248,6 +335,8 @@ def _snapshot_message(
 ) -> Message:
     sender_role = str(item.get("sender_role") or "").strip()
     content = str(item.get("content") or "")
+    platform_sent_at = _message_datetime(item.get("platform_sent_at"))
+    sent_at = platform_sent_at or observation.collected_at
     return Message(
         conversation_id=conversation.id,
         user_id=user.id,
@@ -262,7 +351,8 @@ def _snapshot_message(
             "observation_id": observation.observation_id,
             "source_snapshot_id": (observation.raw_payload or {}).get("source_snapshot_id"),
         },
-        sent_at=observation.collected_at,
+        sent_at=sent_at,
+        platform_sent_at=platform_sent_at,
         observed_at=observation.collected_at,
         snapshot_id=(observation.raw_payload or {}).get("source_snapshot_id"),
         time_label=item.get("time_label") or None,
@@ -376,13 +466,11 @@ def _apply_formal_snapshot(
     )
     if new_messages:
         tail = new_messages[-1]
-        conversational_tail = next((
-            item for item in reversed(new_messages)
-            if (item.raw_payload or {}).get("automation_mode") in {"trigger", "context"}
-        ), None)
-        if conversational_tail is not None:
-            conversation.latest_message_text = conversational_tail.content
-        conversation.latest_message_at = observation.collected_at
+        _refresh_conversation_latest_from_messages(
+            conversation,
+            new_messages,
+            observation.collected_at,
+        )
         conversation.unread_count = 1 if observation.unread else 0
         trigger_tail = next((
             item for item in reversed(new_messages)
@@ -403,7 +491,239 @@ def _apply_formal_snapshot(
         ):
             conversation.deleted_at = None
         conversation.status = "active"
+    db.add(conversation)
+    return new_messages
+
+
+def _update_existing_from_api_snapshot(
+    db: Session,
+    existing: Message,
+    observation: MessageObservation,
+    item: dict[str, Any],
+) -> None:
+    previous_payload = existing.raw_payload if isinstance(existing.raw_payload, dict) else {}
+    had_platform_sent_at = existing.platform_sent_at is not None
+    platform_sent_at = _message_datetime(item.get("platform_sent_at"))
+    existing.sender_role = str(item.get("sender_role") or existing.sender_role)
+    existing.content = str(item.get("content") or existing.content)
+    existing.message_status = "sent"
+    existing.source = "rpa"
+    existing.raw_payload = {
+        **previous_payload,
+        **item,
+        "latest_observation_id": observation.observation_id,
+        "source_snapshot_id": (observation.raw_payload or {}).get("source_snapshot_id"),
+    }
+    if existing.first_observation_id is None:
+        existing.first_observation_id = observation.observation_id
+        existing.first_dom_sequence = item.get("dom_sequence")
+    if existing.snapshot_id is None:
+        existing.snapshot_id = (observation.raw_payload or {}).get("source_snapshot_id")
+    if existing.snapshot_sequence is None:
+        existing.snapshot_sequence = item.get("dom_sequence")
+    if platform_sent_at is not None:
+        existing.platform_sent_at = existing.platform_sent_at or platform_sent_at
+        if not had_platform_sent_at:
+            existing.sent_at = platform_sent_at
+    if not existing.time_label and item.get("time_label"):
+        existing.time_label = str(item.get("time_label"))
+    if existing.has_explicit_time is None and item.get("has_explicit_time") is not None:
+        existing.has_explicit_time = bool(item.get("has_explicit_time"))
+    existing.collected_at = existing.collected_at or observation.collected_at
+    existing.observed_at = observation.collected_at
+    db.add(existing)
+
+
+def _product_identity(message: Message | dict[str, Any]) -> str:
+    raw_payload = (
+        message.raw_payload
+        if isinstance(message, Message)
+        else message.get("structured_payload")
+    )
+    structured_payload = raw_payload if isinstance(raw_payload, dict) else {}
+    direct_payload = (
+        message.raw_payload
+        if isinstance(message, Message)
+        else message
+    )
+    return _platform_message_id(
+        structured_payload.get("goods_id")
+        or structured_payload.get("product_id")
+        or direct_payload.get("goods_id")
+        or direct_payload.get("product_id")
+        or direct_payload.get("platform_product_id")
+    )
+
+
+def _is_provisional_product_message(message: Message) -> bool:
+    if message.sender_role != "agent" or message.platform_message_id:
+        return False
+    raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    if raw_payload.get("message_type") != "product":
+        return False
+    if message.source not in {"automation", "ai"}:
+        return False
+    return bool(_product_identity(message))
+
+
+def _reconcile_product_echo(
+    db: Session,
+    candidates_by_product: dict[str, list[Message]],
+    observation: MessageObservation,
+    item: dict[str, Any],
+) -> Message | None:
+    if (
+        str(item.get("message_type") or "") != "product"
+        or str(item.get("sender_role") or "") != "agent"
+    ):
+        return None
+    product_id = _product_identity(item)
+    if not product_id:
+        return None
+    candidates = candidates_by_product.get(product_id) or []
+    if not candidates:
+        return None
+    existing = candidates.pop(0)
+    previous_payload = existing.raw_payload if isinstance(existing.raw_payload, dict) else {}
+    existing.platform_message_id = item.get("platform_message_id") or existing.platform_message_id
+    existing.sender_role = str(item.get("sender_role") or existing.sender_role)
+    existing.content = str(item.get("content") or existing.content)
+    existing.message_status = "sent"
+    existing.source = "rpa"
+    existing.raw_payload = {
+        **previous_payload,
+        **item,
+        "automation_origin": previous_payload.get("automation_origin") or "product_recommendation",
+        "platform_echo": {
+            "observation_id": observation.observation_id,
+            "platform_message_id": item.get("platform_message_id"),
+            "observed_at": observation.collected_at.isoformat(),
+            "snapshot_sequence": item.get("dom_sequence"),
+        },
+    }
+    platform_sent_at = _message_datetime(item.get("platform_sent_at"))
+    if platform_sent_at is not None:
+        existing.platform_sent_at = existing.platform_sent_at or platform_sent_at
+        existing.sent_at = existing.sent_at or platform_sent_at
+    existing.collected_at = existing.collected_at or observation.collected_at
+    existing.observed_at = observation.collected_at
+    db.add(existing)
+    return existing
+
+
+def _apply_platform_id_ordered_snapshot(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    observation: MessageObservation,
+    messages: list[dict[str, Any]],
+) -> list[Message]:
+    ordered_messages = sorted(
+        messages,
+        key=lambda item: (
+            _platform_message_id_sort_key(item.get("platform_message_id")),
+            int(item.get("dom_sequence") or 0),
+        ),
+    )
+    platform_ids = [_platform_message_id(item.get("platform_message_id")) for item in ordered_messages]
+    existing_messages = list(db.scalars(
+        select(Message).where(
+            Message.conversation_id == conversation.id,
+            Message.platform_message_id.in_(platform_ids),
+        )
+    ).all())
+    existing_by_platform_id: dict[str, Message] = {}
+    for message in existing_messages:
+        platform_message_id = _platform_message_id(message.platform_message_id)
+        if not platform_message_id or platform_message_id in existing_by_platform_id:
+            continue
+        existing_by_platform_id[platform_message_id] = message
+    provisional_products: dict[str, list[Message]] = {}
+    if ordered_messages:
+        provisional_messages = db.scalars(
+            select(Message).where(
+                Message.conversation_id == conversation.id,
+                Message.platform_message_id.is_(None),
+                Message.sender_role == "agent",
+                Message.source.in_(("automation", "ai")),
+            ).order_by(Message.conversation_sequence.asc())
+        ).all()
+        for provisional in provisional_messages:
+            if not _is_provisional_product_message(provisional):
+                continue
+            provisional_products.setdefault(_product_identity(provisional), []).append(provisional)
+    has_platform_anchor = bool(existing_by_platform_id)
+    collection_kind = "incremental" if has_platform_anchor else "bootstrap"
+    new_messages: list[Message] = []
+    updated_count = 0
+    reconciled_product_count = 0
+    for item in ordered_messages:
+        platform_message_id = _platform_message_id(item.get("platform_message_id"))
+        existing = existing_by_platform_id.get(platform_message_id)
+        if existing:
+            _update_existing_from_api_snapshot(db, existing, observation, item)
+            updated_count += 1
+            continue
+        reconciled = _reconcile_product_echo(
+            db,
+            provisional_products,
+            observation,
+            item,
+        )
+        if reconciled is not None:
+            reconciled_product_count += 1
+            continue
+        new_messages.append(_snapshot_message(
+            user,
+            conversation,
+            observation,
+            item,
+            collection_kind=collection_kind,
+        ))
+    append_messages(
+        db,
+        new_messages,
+        collected_at=observation.collected_at,
+        collection_kind=collection_kind,
+    )
+    if ordered_messages:
+        _refresh_conversation_latest_from_messages(
+            conversation,
+            ordered_messages,
+            observation.collected_at,
+        )
+        trigger_tail = next((
+            item for item in reversed(ordered_messages)
+            if item.get("automation_mode", "trigger") == "trigger"
+        ), None)
+        conversation.awaiting_reply = bool(
+            trigger_tail is not None and trigger_tail.get("sender_role") == "customer"
+        )
+        if (
+            new_messages
+            and collection_kind == "incremental"
+            and any(message.sender_role == "customer" for message in new_messages)
+            and observation.collected_at
+            and (
+                conversation.deleted_at is None
+                or _as_utc_naive(observation.collected_at) > _as_utc_naive(conversation.deleted_at)
+            )
+        ):
+            conversation.deleted_at = None
+        conversation.unread_count = 1 if observation.unread else 0
+        conversation.status = "active"
         db.add(conversation)
+    observation.diagnostics_json = {
+        **(observation.diagnostics_json or {}),
+        "platform_id_ordered": True,
+        "platform_id_updated_count": updated_count,
+        "platform_id_new_count": len(new_messages),
+        "platform_id_product_reconciled_count": reconciled_product_count,
+        "platform_id_first": platform_ids[0] if platform_ids else None,
+        "platform_id_last": platform_ids[-1] if platform_ids else None,
+        "platform_id_anchor_found": has_platform_anchor,
+        "collection_kind": collection_kind,
+    }
     return new_messages
 
 
@@ -535,9 +855,38 @@ def _process_message_snapshot_locked(
         hash_contract = accepted_contracts.get(observation.payload_hash)
         if hash_contract is None:
             raise SnapshotProtocolError("assembled snapshot payload_hash does not match")
+        snapshot_metrics = _snapshot_metrics(messages)
+        if _is_pdd_api_chat_list_snapshot(observation, messages):
+            appended_messages = (
+                _apply_platform_id_ordered_snapshot(
+                    db,
+                    user,
+                    conversation,
+                    observation,
+                    messages,
+                )
+                if write_messages
+                else []
+            )
+            observation.alignment_status = "platform_id_ordered"
+            observation.alignment_method = "platform_message_id"
+            observation.overlap_size = 0
+            observation.projected_append_count = len(appended_messages)
+            observation.appended_count = len(appended_messages)
+            observation.diagnostics_json = {
+                **(observation.diagnostics_json or {}),
+                "payload_hash_contract": hash_contract,
+                "snapshot_metrics": snapshot_metrics,
+                "message_order_source": "platform_message_id",
+            }
+            observation.processed_at = utcnow()
+            observation.error_message = None
+            _resolve_message_sync_issue(conversation, observation.processed_at)
+            db.add(conversation)
+            db.add(observation)
+            return SnapshotProcessResult(observation, appended_messages, conversation)
         history = _history_tail(db, conversation.id)
         result = align_message_sequences(history, messages)
-        snapshot_metrics = _snapshot_metrics(messages)
         observation.alignment_status = result.status
         observation.alignment_method = result.method
         observation.overlap_size = result.overlap_size

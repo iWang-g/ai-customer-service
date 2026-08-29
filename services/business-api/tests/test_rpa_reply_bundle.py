@@ -15,6 +15,7 @@ class RpaReplyBundleTests(unittest.TestCase):
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)
         self.db = Session(self.engine, autoflush=False)
+        self.follow_up_url = "http://127.0.0.1/image.png"
         self.user = User(
             username="reply-bundle",
             display_name="Reply Bundle Test",
@@ -60,7 +61,7 @@ class RpaReplyBundleTests(unittest.TestCase):
             platform_code="pinduoduo",
             payload_json={
                 "content": "Text answer",
-                "follow_up": {"type": "image", "url": "http://127.0.0.1/image.png"},
+                "follow_up": {"type": "image", "url": self.follow_up_url},
             },
         )
         self.db.add(self.task)
@@ -114,6 +115,56 @@ class RpaReplyBundleTests(unittest.TestCase):
         )
         self.assertEqual(image_message_count, 1)
 
+    def test_completed_bundle_reuses_precreated_image_message(self) -> None:
+        image_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="[图片]",
+            message_status="queued",
+            source="automation",
+            raw_payload={
+                "media_type": "image",
+                "message_type": "image",
+                "image_url": self.follow_up_url,
+                "parent_task_id": self.task.id,
+                "idempotency_key": f"reply-bundle-image:{self.task.id}",
+            },
+            conversation_sequence=3,
+        )
+        self.db.add(image_message)
+        self.task.payload_json = {
+            **self.task.payload_json,
+            "follow_up_message_id": image_message.id,
+        }
+        self.db.add(self.task)
+        self.db.commit()
+
+        complete_task(
+            self.db,
+            self.task,
+            TaskCompleteRequest(
+                status="completed",
+                result_json={
+                    "text_sent": True,
+                    "image_sent": True,
+                    "image_platform_message_id": "image-platform-precreated",
+                    "image_url": "https://chat-img.pddugc.com/sent-image.jpeg",
+                },
+            ),
+        )
+
+        self.db.refresh(image_message)
+        self.db.refresh(self.task)
+        self.assertEqual(image_message.message_status, "sent")
+        self.assertEqual(image_message.platform_message_id, "image-platform-precreated")
+        self.assertEqual(self.task.result_json["image_message_id"], image_message.id)
+        self.assertEqual(
+            image_message.raw_payload["image_url"],
+            "https://chat-img.pddugc.com/sent-image.jpeg",
+        )
+
     def test_partial_bundle_failure_keeps_successful_text_sent(self) -> None:
         complete_task(
             self.db,
@@ -137,6 +188,150 @@ class RpaReplyBundleTests(unittest.TestCase):
         self.assertEqual(image_message_count, 0)
         self.db.refresh(self.conversation)
         self.assertFalse(self.conversation.awaiting_reply)
+
+    def test_completion_merges_platform_echo_and_reports_original_message_id(self) -> None:
+        echo = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            platform_message_id="platform-echo-1",
+            sender_role="agent",
+            content="Text answer",
+            message_status="sent",
+            source="rpa",
+            conversation_sequence=3,
+        )
+        self.db.add(echo)
+        self.db.commit()
+
+        complete_task(
+            self.db,
+            self.task,
+            TaskCompleteRequest(
+                status="completed",
+                result_json={
+                    "text_sent": True,
+                    "platform_message_id": "platform-echo-1",
+                },
+            ),
+        )
+
+        self.db.refresh(self.task)
+        self.assertEqual(self.task.message_id, echo.id)
+        self.assertEqual(self.task.result_json["merged_from_message_id"], self.message.id)
+        self.assertIsNone(self.db.get(Message, self.message.id))
+        self.assertEqual(self.db.get(Message, echo.id).message_status, "sent")
+
+    def test_completed_bundle_image_uses_platform_message_id(self) -> None:
+        complete_task(
+            self.db,
+            self.task,
+            TaskCompleteRequest(
+                status="completed",
+                result_json={
+                    "text_sent": True,
+                    "image_sent": True,
+                    "image_platform_message_id": "image-platform-1",
+                    "image_pre_msg_id": "text-platform-1",
+                    "image_ts": "1787385346",
+                    "image_url": "https://chat-img.pddugc.com/sent-image.jpeg",
+                },
+            ),
+        )
+
+        image_message = self.db.scalar(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.raw_payload["idempotency_key"].as_string()
+                == f"reply-bundle-image:{self.task.id}",
+            )
+        )
+        self.assertIsNotNone(image_message)
+        assert image_message is not None
+        self.assertEqual(image_message.platform_message_id, "image-platform-1")
+        self.assertEqual(image_message.message_status, "sent")
+        self.assertEqual(
+            image_message.raw_payload["image_url"],
+            "https://chat-img.pddugc.com/sent-image.jpeg",
+        )
+        self.assertEqual(image_message.raw_payload["pre_msg_id"], "text-platform-1")
+        self.assertEqual(image_message.raw_payload["platform_ts"], "1787385346")
+
+    def test_completed_bundle_image_reuses_existing_platform_echo(self) -> None:
+        queued_image = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="[图片]",
+            message_status="queued",
+            source="automation",
+            raw_payload={
+                "media_type": "image",
+                "message_type": "image",
+                "image_url": self.follow_up_url,
+                "parent_task_id": self.task.id,
+                "idempotency_key": f"reply-bundle-image:{self.task.id}",
+            },
+            conversation_sequence=3,
+        )
+        echo = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            platform_message_id="image-platform-echo",
+            sender_role="agent",
+            content="[image]",
+            message_status="sent",
+            source="rpa",
+            raw_payload={
+                "media_type": "image",
+                "message_type": "image",
+                "image_url": "https://chat-img.pddugc.com/echo-image.jpeg",
+            },
+            conversation_sequence=4,
+        )
+        self.db.add(queued_image)
+        self.db.add(echo)
+        self.task.payload_json = {
+            **self.task.payload_json,
+            "follow_up_message_id": queued_image.id,
+        }
+        self.db.add(self.task)
+        self.db.commit()
+
+        complete_task(
+            self.db,
+            self.task,
+            TaskCompleteRequest(
+                status="completed",
+                result_json={
+                    "text_sent": True,
+                    "image_sent": True,
+                    "image_platform_message_id": "image-platform-echo",
+                    "image_url": "https://chat-img.pddugc.com/sent-image.jpeg",
+                },
+            ),
+        )
+
+        image_messages = list(self.db.scalars(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.raw_payload["media_type"].as_string() == "image",
+            )
+        ).all())
+        self.assertEqual(len(image_messages), 1)
+        self.assertEqual(image_messages[0].id, echo.id)
+        self.assertEqual(image_messages[0].source, "rpa")
+        self.assertEqual(image_messages[0].platform_message_id, "image-platform-echo")
+        self.db.refresh(self.task)
+        self.assertEqual(self.task.result_json["image_message_id"], echo.id)
+        self.assertEqual(self.task.result_json["image_merged_from_message_id"], queued_image.id)
+        self.assertIsNone(self.db.get(Message, queued_image.id))
+        self.assertEqual(
+            image_messages[0].raw_payload["idempotency_key"],
+            f"reply-bundle-image:{self.task.id}",
+        )
 
     def test_pending_image_confirmation_creates_visible_image_without_retry(self) -> None:
         complete_task(

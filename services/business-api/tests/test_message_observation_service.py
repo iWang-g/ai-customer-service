@@ -15,6 +15,7 @@ from app.models import (
     Message,
     MessageObservation,
     PlatformAccount,
+    RpaEvent,
     RpaNode,
     RpaTask,
     User,
@@ -132,6 +133,7 @@ class MessageObservationServiceTests(unittest.TestCase):
         message_count: int | None = None,
         payload_hash: str | None = None,
         account_id: str | None = None,
+        source_snapshot_id: str = "desktop-snapshot-1",
     ) -> RpaEventCreate:
         batch_messages = self.messages() if messages is None else messages
         full_messages = self.messages()
@@ -151,7 +153,7 @@ class MessageObservationServiceTests(unittest.TestCase):
                 "batch_count": batch_count,
                 "message_offset": message_offset,
                 "messages": batch_messages,
-                "source_snapshot_id": "desktop-snapshot-1",
+                "source_snapshot_id": source_snapshot_id,
             },
         )
 
@@ -203,6 +205,171 @@ class MessageObservationServiceTests(unittest.TestCase):
         self.assertEqual(issue["observation_id"], "unaligned-unread")
         self.assertTrue(issue["requires_attention"])
         self.assertEqual(issue["consecutive_failure_count"], 1)
+
+    def test_pdd_api_chat_list_snapshot_uses_platform_message_id_order(self) -> None:
+        messages = [
+            {
+                "dom_sequence": 0,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "旧消息",
+                "platform_message_id": "8715744365612001",
+            },
+            {
+                "dom_sequence": 1,
+                "sender_role": "agent",
+                "message_type": "text",
+                "content": "客服回复",
+                "platform_message_id": "8715744365612002",
+            },
+            {
+                "dom_sequence": 2,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "新问题",
+                "platform_message_id": "8715744365612003",
+            },
+        ]
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "api-chat-list",
+                messages=messages,
+                message_count=len(messages),
+                payload_hash=snapshot_payload_hash(messages),
+                source_snapshot_id="pdd-api-list-test",
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "platform_id_ordered")
+        self.assertEqual(result.observation.alignment_method, "platform_message_id")
+        self.assertEqual(result.observation.appended_count, 3)
+        self.db.refresh(self.conversation)
+        self.assertNotIn("message_sync_issue", self.conversation.metadata_json or {})
+        persisted = list(self.db.scalars(
+            select(Message)
+            .where(Message.conversation_id == self.conversation.id)
+            .order_by(Message.conversation_sequence)
+        ))
+        self.assertEqual(
+            [message.platform_message_id for message in persisted[-3:]],
+            ["8715744365612001", "8715744365612002", "8715744365612003"],
+        )
+
+    def test_pdd_api_chat_list_snapshot_updates_existing_platform_message(self) -> None:
+        messages = [
+            {
+                "dom_sequence": 0,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "你好-接口补全",
+                "platform_message_id": "old-1",
+                "platform_sent_at": "2026-08-06T14:19:00Z",
+            },
+            {
+                "dom_sequence": 1,
+                "sender_role": "customer",
+                "message_type": "text",
+                "content": "新消息",
+                "platform_message_id": "8715744365612003",
+                "platform_sent_at": "2026-08-06T14:20:00Z",
+            },
+        ]
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "api-chat-list-upsert",
+                messages=messages,
+                message_count=len(messages),
+                payload_hash=snapshot_payload_hash(messages),
+                source_snapshot_id="pdd-api-list-upsert",
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.observation.alignment_status, "platform_id_ordered")
+        self.assertEqual(result.observation.appended_count, 1)
+        matches = list(self.db.scalars(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.platform_message_id == "old-1",
+            )
+        ).all())
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].content, "你好-接口补全")
+        self.assertEqual(matches[0].platform_sent_at, datetime(2026, 8, 6, 14, 19, 0))
+        self.assertEqual(matches[0].sent_at, datetime(2026, 8, 6, 14, 19, 0))
+
+    def test_pdd_api_chat_list_reconciles_automation_product_echo(self) -> None:
+        provisional = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="agent",
+            content="商品标题",
+            message_status="sent",
+            source="automation",
+            raw_payload={
+                "message_type": "product",
+                "display_mode": "card",
+                "goods_id": "990617092925",
+                "product_id": "990617092925",
+                "platform_product_id": "990617092925",
+                "title": "商品标题",
+                "product_send_pending": False,
+            },
+        )
+        self.db.add(provisional)
+        self.db.flush()
+        provisional_id = provisional.id
+        self.db.commit()
+
+        product = {
+            "dom_sequence": 0,
+            "sender_role": "agent",
+            "message_type": "product",
+            "content": "商品标题",
+            "platform_message_id": "1787622454957",
+            "display_mode": "card",
+            "structured_payload": {
+                "product_id": "990617092925",
+                "title": "商品标题",
+                "image_url": "https://img.invalid/product.jpg",
+                "price": 4.2,
+            },
+        }
+        result = process_message_snapshot(
+            self.db,
+            self.user,
+            self.node,
+            self.request(
+                "product-echo-reconcile",
+                messages=[product],
+                message_count=1,
+                payload_hash=snapshot_payload_hash([product]),
+                source_snapshot_id="pdd-api-list-product-echo",
+            ),
+            write_messages=True,
+        )
+        self.db.commit()
+
+        self.assertEqual(result.appended_messages, [])
+        messages = list(self.db.scalars(
+            select(Message).where(
+                Message.conversation_id == self.conversation.id,
+                Message.raw_payload["message_type"].as_string() == "product",
+            )
+        ).all())
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].id, provisional_id)
+        self.assertEqual(messages[0].platform_message_id, "1787622454957")
 
     def test_second_read_unaligned_snapshot_marks_conversation_for_attention(self) -> None:
         for index in range(2):
@@ -984,9 +1151,11 @@ class MessageObservationServiceTests(unittest.TestCase):
     def test_disabled_rpa_event_entrypoint_does_not_process_snapshot(self) -> None:
         request = self.request("rpa-entrypoint")
         message_count_before = self.db.scalar(select(func.count()).select_from(Message))
-        event, reply_sources, changed_conversations = create_event(
-            self.db, self.user, self.node, request
-        )
+        settings = Settings(_env_file=None, PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED=False)
+        with patch("app.services.rpa_service.get_settings", return_value=settings):
+            event, reply_sources, changed_conversations = create_event(
+                self.db, self.user, self.node, request
+            )
 
         self.assertEqual(event.status, "processed")
         self.assertEqual(reply_sources, [])
@@ -998,6 +1167,87 @@ class MessageObservationServiceTests(unittest.TestCase):
             )
         )
         self.assertIsNone(observation)
+
+    def test_duplicate_conversation_snapshot_repairs_missing_conversation(self) -> None:
+        request = RpaEventCreate(
+            event_id="conversation-snapshot-replay",
+            dedup_key="conversation-snapshot-replay-key",
+            event_type="conversation_snapshot",
+            platform_code="pinduoduo",
+            platform_account_id=self.account.id,
+            conversation_external_id="replay-external-id",
+            payload_json={
+                "customer_name": "Replay Customer",
+                "title": "Replay Customer",
+                "content": "latest replay message",
+                "unread_count": 0,
+            },
+        )
+        event, _, changed = create_event(self.db, self.user, self.node, request)
+        self.assertEqual(event.status, "processed")
+        self.assertEqual(len(changed), 1)
+        conversation = changed[0]
+        self.db.delete(conversation)
+        self.db.commit()
+
+        replay_event, _, replay_changed = create_event(self.db, self.user, self.node, request)
+
+        self.assertEqual(replay_event.id, event.id)
+        self.assertEqual(len(replay_changed), 1)
+        self.assertEqual(replay_changed[0].external_conversation_id, "replay-external-id")
+        self.assertEqual(replay_changed[0].customer_name, "Replay Customer")
+        self.assertEqual(
+            self.db.scalar(
+                select(func.count()).select_from(RpaEvent).where(
+                    RpaEvent.event_id == "conversation-snapshot-replay"
+                )
+            ),
+            1,
+        )
+
+    def test_event_for_merged_platform_account_is_rewritten_to_target_account(self) -> None:
+        target_account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            platform_name="拼多多",
+            local_account_id="merged-local",
+            external_account_id="688523141",
+            account_name="小王小店9527",
+            account_alias="小王小店9527",
+            is_active=True,
+            login_status="online",
+        )
+        self.db.add(target_account)
+        self.db.flush()
+        self.account.local_account_id = None
+        self.account.external_account_id = None
+        self.account.is_active = False
+        self.account.login_status = "offline"
+        self.account.metadata_json = {
+            **(self.account.metadata_json or {}),
+            "merged_into_platform_account_id": target_account.id,
+        }
+        self.db.add(self.account)
+        self.db.commit()
+        request = RpaEventCreate(
+            event_id="merged-account-event",
+            dedup_key="merged-account-event-key",
+            event_type="conversation_snapshot",
+            platform_code="pinduoduo",
+            platform_account_id=self.account.id,
+            conversation_external_id="8715744365612",
+            payload_json={
+                "customer_name": "Customer",
+                "title": "Customer",
+                "content": "latest message",
+            },
+        )
+
+        event, _, changed = create_event(self.db, self.user, self.node, request)
+
+        self.assertEqual(event.platform_account_id, target_account.id)
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0].platform_account_id, target_account.id)
 
     def test_snapshot_shop_mode_writes_snapshot_and_suppresses_legacy_events(self) -> None:
         self.account.metadata_json = {"pdd_message_snapshot_write_enabled": True}

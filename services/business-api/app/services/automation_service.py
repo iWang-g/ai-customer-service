@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import re
 from datetime import datetime
 from time import monotonic
 from typing import Any
@@ -38,6 +39,7 @@ from app.services.email_service import get_config
 from app.services.message_service import create_send_task
 from app.services.order_service import order_prompt_context
 from app.services.order_service import maybe_create_order_follow_up
+from app.services.product_service import match_store_products
 from app.services.model_call_service import persist_model_calls
 from app.services.outbound_safety import prohibited_outbound_reason
 from app.services.robot_service import _knowledge_access_token, serialize_robot
@@ -50,9 +52,21 @@ MAX_CONTEXT_LENGTH = 50
 DEFAULT_TIMEOUT_SECONDS = 10
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 60
+INBOUND_REPLY_DEBOUNCE_SECONDS = 3.0
+ORDER_CONTEXT_REFRESH_TIMEOUT_SECONDS = 6.0
+ORDER_CONTEXT_REFRESH_POLL_SECONDS = 0.4
 MAX_SENSITIVE_WORDS = 200
 MAX_SENSITIVE_WORD_LENGTH = 64
+AUTO_REPLY_MESSAGE_TYPES = {"text", "product", "order"}
+_pending_inbound_reply_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+DEFAULT_HUMAN_REQUIRED_REPLY_TEXT = "亲，已收到这条消息，我这边先标记给人工客服查看。"
 DEFAULT_SENSITIVE_WORD_REPLY_TEXT = "亲亲，已收到您的消息，正在为您核实，请稍等~"
+DEFAULT_PRODUCT_CARD_ACK_TEXT = "亲亲，关于这款商品有什么想要了解的吗"
+DEFAULT_TRANSFER_CONFIRM_TEXT = "亲亲，为及时给您解答，是否需要转接给其他客服"
+DEFAULT_TRANSFER_ACK_TEXT = "好的，稍等一下"
+TRANSFER_REASON_TEXT = "无原因直接转移"
+AUTO_TRANSFER_METADATA_KEY = "auto_transfer"
+HUMAN_HANDOFF_STRATEGY_TRANSFER = "transfer_conversation"
 
 
 def _active_robot(db: Session, user: User, conversation: Conversation) -> Robot | None:
@@ -97,6 +111,18 @@ def _auto_send_allowed(robot: Robot | None, *, requested: bool) -> bool:
     return bool(requested and _robot_config(robot).get("allow_auto_send", False))
 
 
+def _product_recommendation_config(robot: Robot | None) -> tuple[bool, str]:
+    config = _robot_config(robot)
+    enabled = config.get("product_recommend_enabled") is True
+    text = str(config.get("product_recommend_text") or "").strip()
+    return enabled, text
+
+
+def _product_card_ack_text(robot: Robot | None) -> str:
+    text = str(_robot_config(robot).get("product_card_ack_text") or "").strip()
+    return text or DEFAULT_PRODUCT_CARD_ACK_TEXT
+
+
 def _timeout_config(robot: Robot | None) -> tuple[bool, int, str]:
     config = _robot_config(robot)
     enabled = config.get("timeout_enabled", False) is True
@@ -137,6 +163,29 @@ def _sensitive_word_reply_text(robot: Robot | None) -> str:
     return text or DEFAULT_SENSITIVE_WORD_REPLY_TEXT
 
 
+def _human_required_reply_text(robot: Robot | None, reason: str) -> str:
+    config = _robot_config(robot)
+    reason_key = {
+        "image_message": "image_message_reply_text",
+        "unsupported_message": "unsupported_message_reply_text",
+    }.get(reason)
+    if reason_key:
+        text = str(config.get(reason_key) or "").strip()
+        if text:
+            return text
+    text = str(config.get("human_required_reply_text") or "").strip()
+    return text or DEFAULT_HUMAN_REQUIRED_REPLY_TEXT
+
+
+def _quote_platform_message_id(message: Message | None) -> str | None:
+    if message is None:
+        return None
+    if _message_type(message) not in {"text", "image"}:
+        return None
+    value = str(getattr(message, "platform_message_id", None) or "").strip()
+    return value[:128] if value else None
+
+
 def _mark_human_required(
     conversation: Conversation,
     *,
@@ -168,6 +217,95 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _order_summary_observed_at(conversation: Conversation) -> str:
+    summary = (conversation.metadata_json or {}).get("customer_orders")
+    if not isinstance(summary, dict):
+        return ""
+    return str(summary.get("observed_at") or "")
+
+
+def _can_refresh_order_context(conversation: Conversation) -> bool:
+    external_id = str(conversation.external_conversation_id or "").strip()
+    return bool(
+        conversation.platform_code == "pinduoduo"
+        and conversation.platform_account_id
+        and external_id
+        and not external_id.startswith("name:")
+    )
+
+
+async def _refresh_order_context_before_reply(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    source_message: Message,
+    *,
+    enabled: bool,
+    timeout_seconds: float = ORDER_CONTEXT_REFRESH_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    if not enabled:
+        return {"attempted": False, "reason": "auto_send_disabled"}
+    if not _can_refresh_order_context(conversation):
+        return {"attempted": False, "reason": "conversation_not_refreshable"}
+    previous_observed_at = _order_summary_observed_at(conversation)
+    idempotency_key = f"auto-reply-order-refresh:{conversation.id}:{source_message.id}"
+    task = db.scalar(select(RpaTask).where(RpaTask.idempotency_key == idempotency_key))
+    if task is None:
+        task = RpaTask(
+            user_id=user.id,
+            platform_account_id=conversation.platform_account_id,
+            conversation_id=conversation.id,
+            task_type="refresh_customer_orders",
+            idempotency_key=idempotency_key,
+            platform_code=conversation.platform_code,
+            payload_json={
+                "platform_account_id": conversation.platform_account_id,
+                "external_conversation_id": conversation.external_conversation_id,
+                "customer_name": conversation.customer_name or "",
+                "source": "auto_reply_pre_context",
+                "source_message_id": source_message.id,
+            },
+            status="queued",
+            priority=30,
+        )
+        try:
+            db.add(task)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            task = db.scalar(select(RpaTask).where(RpaTask.idempotency_key == idempotency_key))
+    deadline = monotonic() + max(0.1, timeout_seconds)
+    while monotonic() < deadline:
+        await asyncio.sleep(ORDER_CONTEXT_REFRESH_POLL_SECONDS)
+        db.expire_all()
+        refreshed = db.get(Conversation, conversation.id)
+        if refreshed is not None:
+            conversation.metadata_json = refreshed.metadata_json
+        observed_at = _order_summary_observed_at(conversation)
+        if observed_at and observed_at != previous_observed_at:
+            return {
+                "attempted": True,
+                "status": "collected",
+                "task_id": task.id if task else None,
+                "observed_at": observed_at,
+            }
+        if task is not None:
+            current_task = db.get(RpaTask, task.id)
+            if current_task and current_task.status == "failed":
+                return {
+                    "attempted": True,
+                    "status": "failed",
+                    "task_id": current_task.id,
+                    "error": current_task.error_message,
+                }
+    return {
+        "attempted": True,
+        "status": "timeout",
+        "task_id": task.id if task else None,
+        "previous_observed_at": previous_observed_at or None,
+    }
+
+
 def _fallback_marks_human_required(robot: Robot | None) -> bool:
     config = _robot_config(robot)
     if "fallback_mark_human_required" in config:
@@ -175,9 +313,173 @@ def _fallback_marks_human_required(robot: Robot | None) -> bool:
     return config.get("fallback_transfer_to_human") is True
 
 
+def _human_handoff_strategy(robot: Robot | None) -> str:
+    value = str(_robot_config(robot).get("human_handoff_strategy") or "").strip()
+    return HUMAN_HANDOFF_STRATEGY_TRANSFER if value == HUMAN_HANDOFF_STRATEGY_TRANSFER else "mark_only"
+
+
+def _transfer_conversation_enabled(robot: Robot | None, conversation: Conversation, *, auto_send_allowed: bool) -> bool:
+    external_id = str(conversation.external_conversation_id or "").strip()
+    return bool(
+        auto_send_allowed
+        and _human_handoff_strategy(robot) == HUMAN_HANDOFF_STRATEGY_TRANSFER
+        and conversation.platform_code == "pinduoduo"
+        and conversation.platform_account_id
+        and external_id
+        and not external_id.startswith("name:")
+    )
+
+
+def _transfer_confirm_text(robot: Robot | None) -> str:
+    text = str(_robot_config(robot).get("transfer_confirm_text") or "").strip()
+    return text or DEFAULT_TRANSFER_CONFIRM_TEXT
+
+
+def _transfer_ack_text(robot: Robot | None) -> str:
+    text = str(_robot_config(robot).get("transfer_ack_text") or "").strip()
+    return text or DEFAULT_TRANSFER_ACK_TEXT
+
+
+def _auto_transfer_state(conversation: Conversation) -> dict[str, Any]:
+    metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
+    state = metadata.get(AUTO_TRANSFER_METADATA_KEY)
+    return state if isinstance(state, dict) else {}
+
+
+def _set_auto_transfer_state(conversation: Conversation, state: dict[str, Any]) -> None:
+    metadata = dict(conversation.metadata_json or {})
+    metadata[AUTO_TRANSFER_METADATA_KEY] = {
+        **state,
+        "updated_at": utcnow().isoformat(),
+    }
+    conversation.metadata_json = metadata
+
+
+def _clear_auto_transfer_state(conversation: Conversation) -> None:
+    metadata = dict(conversation.metadata_json or {})
+    metadata.pop(AUTO_TRANSFER_METADATA_KEY, None)
+    conversation.metadata_json = metadata
+
+
+def _customer_confirms_transfer(message: str) -> bool:
+    normalized = re.sub(r"[\s，。！？、,.!?~～]+", "", str(message or "")).casefold()
+    if not normalized:
+        return False
+    if any(word in normalized for word in ("不用", "不要", "不需要", "否", "算了")):
+        return False
+    return any(
+        normalized == word
+        or normalized.startswith(word)
+        for word in (
+            "是",
+            "要",
+            "需要",
+            "可以",
+            "好",
+            "好的",
+            "行",
+            "嗯",
+            "转",
+            "转吧",
+            "帮我转",
+            "麻烦转",
+            "ok",
+            "yes",
+        )
+    )
+
+
+def _transfer_prompt_result(
+    source_message_id: str,
+    *,
+    text: str,
+    workflow: str,
+    next_action: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "decision": "auto_send",
+        "text": text,
+        "media": [],
+        "intent": {
+            "intent": "human_handoff",
+            "confidence": 1.0,
+            "need_customer_reply": workflow == "transfer_confirmation",
+            "need_doc_search": False,
+            "workflow": workflow,
+            "next_action": next_action,
+            "reply_route": "human_handoff",
+            "direct_reply_text": text,
+            "risk_flags": ["human_required", reason],
+            "reason": reason,
+        },
+        "action_plan": {
+            "workflow": workflow,
+            "next_action": next_action,
+            "need_doc_search": False,
+            "email_service_required": False,
+            "required_actions": ["send_platform_text"],
+            "blocked_actions": ["qa_match", "generate_reply"],
+        },
+        "confidence": 1.0,
+        "risk_flags": ["human_required", reason],
+        "qa_match": {"matched": False, "status": "skipped", "match_type": workflow},
+        "retrieval": [],
+        "model_calls": {"intent": "business-rule", "generation": "skipped"},
+        "provider": "business-rule",
+        "trace_id": f"{workflow}-{source_message_id}",
+        "task_ids": [],
+    }
+
+
+def _transfer_suppressed_result(source_message_id: str, status_value: str) -> dict[str, Any]:
+    return {
+        "decision": "no_reply",
+        "text": "",
+        "media": [],
+        "confidence": 1.0,
+        "intent": {
+            "intent": "human_handoff",
+            "confidence": 1.0,
+            "need_customer_reply": False,
+            "need_doc_search": False,
+            "workflow": "transfer_conversation",
+            "next_action": "wait_transfer_completion",
+        },
+        "action_plan": {
+            "workflow": "transfer_conversation",
+            "next_action": "wait_transfer_completion",
+            "required_actions": [],
+            "blocked_actions": ["qa_match", "generate_reply", "send_platform_text"],
+        },
+        "qa_match": {"matched": False, "status": "skipped", "match_type": "transfer_conversation"},
+        "retrieval": [],
+        "model_calls": {"intent": "skipped-transfer-state", "generation": "skipped"},
+        "provider": "business-rule",
+        "trace_id": f"transfer-suppressed-{source_message_id}",
+        "transfer_status": status_value,
+        "task_ids": [],
+    }
+
+
 def _is_fallback_reply(result: dict[str, Any]) -> bool:
     action_plan = result.get("action_plan")
     return bool(isinstance(action_plan, dict) and action_plan.get("workflow") == "fallback_reply")
+
+
+def _wants_product_recommendation(result: dict[str, Any]) -> bool:
+    intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
+    action_plan = result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}
+    return (
+        intent.get("wants_product_recommendation") is True
+        or action_plan.get("next_action") == "send_product_recommendation"
+    )
+
+
+def _product_recommendation_query(result: dict[str, Any], fallback: str) -> str:
+    intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
+    query = str(intent.get("product_recommendation_query") or "").strip()
+    return query or fallback
 
 
 def _sensitive_word_result(
@@ -225,6 +527,47 @@ def _sensitive_word_result(
         },
         "provider": "sensitive-word-rule" if matched else "human-required-rule",
         "trace_id": f"{'sensitive' if matched else 'human-required'}-{source_message_id}",
+        "task_ids": [],
+    }
+
+
+def _product_card_ack_result(
+    source_message_id: str,
+    text: str,
+) -> dict[str, Any]:
+    return {
+        "decision": "auto_send",
+        "text": text,
+        "media": [],
+        "product_card_ack": True,
+        "confidence": 1.0,
+        "intent": {
+            "intent": "product_card_ack",
+            "confidence": 1.0,
+            "need_customer_reply": True,
+            "need_doc_search": False,
+            "workflow": "product_card_ack",
+            "next_action": "send_product_card_ack",
+        },
+        "action_plan": {
+            "workflow": "product_card_ack",
+            "next_action": "send_product_card_ack",
+            "need_doc_search": False,
+            "required_actions": ["send_platform_text"],
+            "blocked_actions": ["qa_match", "generate_reply", "send_platform_product"],
+        },
+        "qa_match": {
+            "matched": False,
+            "status": "skipped",
+            "match_type": "product_card_ack",
+        },
+        "retrieval": [],
+        "model_calls": {
+            "intent": "skipped-product-card",
+            "generation": "skipped",
+        },
+        "provider": "product-card-rule",
+        "trace_id": f"product-card-ack-{source_message_id}",
         "task_ids": [],
     }
 
@@ -282,6 +625,14 @@ def _queue_reply_task(
         (item for item in media if isinstance(item, dict) and item.get("type") == "image" and item.get("url")),
         None,
     )
+    recommendation = result.get("product_recommendation")
+    follow_up_products = (
+        recommendation.get("products")
+        if isinstance(recommendation, dict) and recommendation.get("enabled") is True
+        else []
+    )
+    if not isinstance(follow_up_products, list):
+        follow_up_products = []
     timeout_task = db.scalar(
         select(RpaTask).where(
             RpaTask.idempotency_key == f"auto-timeout:{robot.id}:{source_message.id}"
@@ -298,12 +649,14 @@ def _queue_reply_task(
             conversation_id=conversation.id,
             content=str(result["text"]),
             platform_code=conversation.platform_code,
+            quote_message_id=str(result.get("quote_message_id") or "")[:128] or None,
         ),
         follow_up=(
             {"type": "image", "url": str(image_media["url"])}
             if image_media
             else None
         ),
+        follow_up_products=follow_up_products,
         idempotency_key=f"auto-reply:{robot.id}:{source_message.id}:text",
         source="automation",
         task_status="waiting_timeout" if should_wait_for_timeout else "queued",
@@ -314,10 +667,197 @@ def _queue_reply_task(
             **(task.payload_json or {}),
             "automation_source_message_id": source_message.id,
             "automation_trigger_sequence": source_message.conversation_sequence,
+            "follow_up_product_count": len(follow_up_products),
         }
         db.add(task)
         db.commit()
     return response.task_id
+
+
+def _queue_human_required_notice_task(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    *,
+    reason: str,
+    idempotency_suffix: str,
+    auto_send_allowed: bool,
+) -> str | None:
+    if not auto_send_allowed:
+        return None
+    text = _human_required_reply_text(robot, reason).strip()
+    if not text:
+        return None
+    response = create_send_task(
+        db,
+        user,
+        SendMessageRequest(
+            conversation_id=conversation.id,
+            content=text,
+            platform_code=conversation.platform_code,
+            quote_message_id=_quote_platform_message_id(source_message),
+        ),
+        idempotency_key=f"auto-human-required:{robot.id}:{source_message.id}:{idempotency_suffix}",
+        source="automation",
+    )
+    return response.task_id
+
+
+def _queue_sensitive_word_notice_task(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    *,
+    auto_send_allowed: bool,
+) -> str | None:
+    if not auto_send_allowed:
+        return None
+    text = _sensitive_word_reply_text(robot).strip()
+    if not text:
+        return None
+    response = create_send_task(
+        db,
+        user,
+        SendMessageRequest(
+            conversation_id=conversation.id,
+            content=text,
+            platform_code=conversation.platform_code,
+            quote_message_id=_quote_platform_message_id(source_message),
+        ),
+        idempotency_key=f"auto-sensitive-word:{robot.id}:{source_message.id}:text",
+        source="automation",
+    )
+    return response.task_id
+
+
+def _attach_transfer_after_send(
+    db: Session,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    task_id: str,
+    *,
+    reason: str,
+) -> None:
+    task = db.get(RpaTask, task_id)
+    if task is None:
+        return
+    transfer_payload = {
+        "robot_id": robot.id,
+        "source_message_id": source_message.id,
+        "conversation_id": conversation.id,
+        "platform_account_id": conversation.platform_account_id,
+        "external_conversation_id": conversation.external_conversation_id,
+        "customer_name": conversation.customer_name or "",
+        "trans_reason": TRANSFER_REASON_TEXT,
+        "trigger_reason": reason,
+        "idempotency_key": f"auto-transfer:{robot.id}:{source_message.id}",
+    }
+    task.payload_json = {
+        **(task.payload_json or {}),
+        "after_send_transfer_conversation": transfer_payload,
+    }
+    _set_auto_transfer_state(conversation, {
+        "status": "ack_queued",
+        "reason": reason,
+        "source_message_id": source_message.id,
+        "robot_id": robot.id,
+        "ack_task_id": task.id,
+        "trans_reason": TRANSFER_REASON_TEXT,
+    })
+    db.add(task)
+    db.add(conversation)
+    db.commit()
+
+
+def _queue_transfer_confirmation_task(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    *,
+    reason: str,
+    word: str | None = None,
+) -> dict[str, Any]:
+    text = _transfer_confirm_text(robot)
+    result = _transfer_prompt_result(
+        source_message.id,
+        text=text,
+        workflow="transfer_confirmation",
+        next_action="ask_transfer_confirmation",
+        reason=reason,
+    )
+    response = create_send_task(
+        db,
+        user,
+        SendMessageRequest(
+            conversation_id=conversation.id,
+            content=text,
+            platform_code=conversation.platform_code,
+            quote_message_id=_quote_platform_message_id(source_message),
+        ),
+        idempotency_key=f"auto-transfer-confirm:{robot.id}:{source_message.id}:{reason}",
+        source="automation",
+    )
+    _set_auto_transfer_state(conversation, {
+        "status": "confirming",
+        "reason": reason,
+        "word": word,
+        "source_message_id": source_message.id,
+        "robot_id": robot.id,
+        "confirmation_task_id": response.task_id,
+        "trans_reason": TRANSFER_REASON_TEXT,
+    })
+    db.add(conversation)
+    db.commit()
+    result["task_ids"] = [response.task_id]
+    return result
+
+
+def _queue_transfer_ack_task(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    text = _transfer_ack_text(robot)
+    result = _transfer_prompt_result(
+        source_message.id,
+        text=text,
+        workflow="transfer_ack",
+        next_action="send_transfer_ack",
+        reason=reason,
+    )
+    response = create_send_task(
+        db,
+        user,
+        SendMessageRequest(
+            conversation_id=conversation.id,
+            content=text,
+            platform_code=conversation.platform_code,
+            quote_message_id=_quote_platform_message_id(source_message),
+        ),
+        idempotency_key=f"auto-transfer-ack:{robot.id}:{source_message.id}",
+        source="automation",
+    )
+    _attach_transfer_after_send(
+        db,
+        conversation,
+        robot,
+        source_message,
+        response.task_id,
+        reason=reason,
+    )
+    result["task_ids"] = [response.task_id]
+    return result
 
 
 async def _queue_reply_task_ordered(
@@ -475,7 +1015,12 @@ def _release_timeout_gated_reply(db: Session, robot_id: str, source_message_id: 
     return formal_task
 
 
-def _message_history(rows: list[Message]) -> list[dict[str, str]]:
+def _message_history(
+    rows: list[Message],
+    *,
+    exclude_message_ids: set[str] | None = None,
+) -> list[dict[str, str]]:
+    excluded = exclude_message_ids or set()
     return [
         {
             "role": "user" if item.sender_role == "customer" else "assistant",
@@ -483,6 +1028,8 @@ def _message_history(rows: list[Message]) -> list[dict[str, str]]:
         }
         for item in reversed(rows)
         if (
+            getattr(item, "id", None) not in excluded
+            and
             getattr(item, "message_status", "sent") != "failed"
             and item.sender_role in {"customer", "agent", "assistant", "bot"}
             and (getattr(item, "raw_payload", {}) or {}).get("automation_mode", "trigger") == "trigger"
@@ -491,9 +1038,9 @@ def _message_history(rows: list[Message]) -> list[dict[str, str]]:
     ]
 
 
-def _snapshot_customer_batch_size(db: Session, source_message: Message) -> int:
+def _customer_trigger_batch_tail(db: Session, source_message: Message) -> list[Message]:
     if source_message.collection_kind != "incremental" or not source_message.first_observation_id:
-        return 1
+        return [source_message]
     batch_tail = db.scalars(
         select(Message).where(
             Message.conversation_id == source_message.conversation_id,
@@ -502,15 +1049,47 @@ def _snapshot_customer_batch_size(db: Session, source_message: Message) -> int:
             Message.message_status != "failed",
         ).order_by(desc(Message.conversation_sequence))
     ).all()
-    count = 0
+    messages: list[Message] = []
     for item in batch_tail:
         automation_mode = (item.raw_payload or {}).get("automation_mode", "trigger")
         if automation_mode != "trigger":
             continue
         if item.sender_role != "customer":
             break
-        count += 1
-    return max(1, count)
+        messages.append(item)
+    return list(reversed(messages)) or [source_message]
+
+
+def _message_type(message: Message) -> str:
+    raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    message_type = str(raw_payload.get("message_type") or raw_payload.get("media_type") or "").strip()
+    if message_type == "image" or raw_payload.get("image_url"):
+        return "image"
+    return message_type or "text"
+
+
+def _unsupported_reply_reason(message: Message) -> str | None:
+    message_type = _message_type(message)
+    if message_type in AUTO_REPLY_MESSAGE_TYPES:
+        return None
+    if message_type == "image":
+        return "image_message"
+    return "unsupported_message"
+
+
+def _snapshot_customer_batch_size(db: Session, source_message: Message) -> int:
+    return len(_customer_trigger_batch_tail(db, source_message))
+
+
+def _current_customer_message(batch_messages: list[Message]) -> str:
+    usable = [item.content.strip() for item in batch_messages if item.content.strip()]
+    if len(usable) <= 1:
+        return usable[0] if usable else ""
+    lines = [
+        f"客户本次连续发送了 {len(usable)} 条消息，请在一条回复中同时回答，不要遗漏：",
+    ]
+    lines.extend(f"{index}. {content}" for index, content in enumerate(usable, start=1))
+    return "\n".join(lines)
 
 
 def _history_with_latest(
@@ -567,6 +1146,7 @@ async def _decide_reply(
     email_config: Any | None = None,
     customer_orders: dict[str, Any] | None = None,
     platform_context: list[dict[str, Any]] | None = None,
+    shop_product_summary: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     config = _robot_config(robot)
     payload = {
@@ -578,6 +1158,7 @@ async def _decide_reply(
         "customer_name": customer_name,
         "customer_orders": customer_orders or {"collection_status": "not_collected"},
         "platform_context": platform_context or [],
+        "shop_product_summary": shop_product_summary or {},
         "qa_base_ids": robot_read.qa_knowledge_base_ids,
         "product_base_ids": robot_read.product_knowledge_base_ids,
         "tone_base_id": robot_read.tone_knowledge_base_id or "",
@@ -629,16 +1210,38 @@ async def _execute_bound_reply(
     timeout_ordering_lock: asyncio.Lock | None = None,
 ) -> dict[str, Any]:
     robot_read = serialize_robot(db, robot)
-    message = source_message.content
-    if not message.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No customer message available")
+    batch_messages = _customer_trigger_batch_tail(db, source_message)
+    unsupported_matches = [
+        (item, reason)
+        for item in batch_messages
+        for reason in [_unsupported_reply_reason(item)]
+        if reason
+    ]
+    unsupported_ids = {item.id for item, _ in unsupported_matches}
+    sensitive_matches = [
+        (item, matched)
+        for item in batch_messages
+        for matched in [_matched_sensitive_word(robot, item.content)]
+        if item.id not in unsupported_ids and matched
+    ]
+    sensitive_ids = {item.id for item, _ in sensitive_matches}
+    reply_batch_messages = [
+        item for item in batch_messages
+        if item.id not in unsupported_ids and item.id not in sensitive_ids
+    ]
+    is_product_card_only_batch = bool(reply_batch_messages) and all(
+        _message_type(item) == "product" for item in reply_batch_messages
+    ) and not unsupported_matches and not sensitive_matches
+    pending_human_required: tuple[str, str | None] | None = None
+    if sensitive_matches:
+        pending_human_required = ("sensitive_word", sensitive_matches[0][1])
+    elif unsupported_matches:
+        pending_human_required = (unsupported_matches[0][1], None)
 
-    matched_sensitive_word = _matched_sensitive_word(robot, message)
-    if matched_sensitive_word:
-        result = _sensitive_word_result(
+    if is_product_card_only_batch:
+        result = _product_card_ack_result(
             source_message.id,
-            matched_sensitive_word,
-            _sensitive_word_reply_text(robot),
+            _product_card_ack_text(robot),
         )
         task_id = await _queue_reply_task_ordered(
             db,
@@ -651,10 +1254,73 @@ async def _execute_bound_reply(
             timeout_deadline=timeout_deadline,
             ordering_lock=timeout_ordering_lock,
         )
+        result["task_ids"] = [task_id] if task_id else []
+        logger.info(
+            "product card only message acknowledged conversation_id=%s robot_id=%s "
+            "source_message_id=%s task_id=%s",
+            conversation.id,
+            robot.id,
+            source_message.id,
+            task_id,
+        )
+        return result
+
+    message = _current_customer_message(reply_batch_messages)
+    auto_send_allowed = _auto_send_allowed(robot, requested=request.allow_auto_send)
+    pre_reply_task_ids: list[str] = []
+    transfer_state = _auto_transfer_state(conversation)
+    transfer_status = str(transfer_state.get("status") or "")
+    if transfer_status in {"ack_queued", "transferring", "transferred"}:
+        return _transfer_suppressed_result(source_message.id, transfer_status)
+    if (
+        transfer_status == "confirming"
+        and _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed)
+    ):
+        if _customer_confirms_transfer(source_message.content):
+            return _queue_transfer_ack_task(
+                db,
+                user,
+                conversation,
+                robot,
+                source_message,
+                reason=str(transfer_state.get("reason") or "transfer_confirmation"),
+            )
+        _clear_auto_transfer_state(conversation)
+        db.add(conversation)
+        db.commit()
+
+    if sensitive_matches and not reply_batch_messages:
+        if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
+            return _queue_transfer_confirmation_task(
+                db,
+                user,
+                conversation,
+                robot,
+                sensitive_matches[0][0],
+                reason="sensitive_word",
+                word=sensitive_matches[0][1],
+            )
+        result = _sensitive_word_result(
+            source_message.id,
+            sensitive_matches[0][1],
+            _sensitive_word_reply_text(robot),
+        )
+        result["quote_message_id"] = _quote_platform_message_id(sensitive_matches[0][0])
+        task_id = await _queue_reply_task_ordered(
+            db,
+            user,
+            conversation,
+            robot,
+            source_message,
+            result,
+            auto_send_allowed=auto_send_allowed,
+            timeout_deadline=timeout_deadline,
+            ordering_lock=timeout_ordering_lock,
+        )
         _mark_human_required(
             conversation,
             reason="sensitive_word",
-            word=matched_sensitive_word,
+            word=sensitive_matches[0][1],
         )
         _mark_reply_run_human_required(result, reason="sensitive_word")
         db.add(conversation)
@@ -663,15 +1329,110 @@ async def _execute_bound_reply(
             "automation reply blocked by sensitive word conversation_id=%s robot_id=%s word=%s",
             conversation.id,
             robot.id,
-            matched_sensitive_word,
+            sensitive_matches[0][1],
         )
         result["task_ids"] = [task_id] if task_id else []
         return result
 
+    if not reply_batch_messages:
+        reason, word = pending_human_required or ("unsupported_message", None)
+        if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
+            return _queue_transfer_confirmation_task(
+                db,
+                user,
+                conversation,
+                robot,
+                unsupported_matches[0][0] if unsupported_matches else source_message,
+                reason=reason,
+                word=word,
+            )
+        _mark_human_required(conversation, reason=reason, word=word)
+        notice_task_id = _queue_human_required_notice_task(
+            db,
+            user,
+            conversation,
+            robot,
+            unsupported_matches[0][0] if unsupported_matches else source_message,
+            reason=reason,
+            idempotency_suffix=reason,
+            auto_send_allowed=auto_send_allowed,
+        )
+        result = {
+            "decision": "no_reply",
+            "text": "",
+            "media": [],
+            "confidence": 1.0,
+            "intent": {
+                "intent": "human_handoff",
+                "confidence": 1.0,
+                "need_customer_reply": False,
+                "need_doc_search": False,
+                "workflow": reason,
+                "next_action": "mark_needs_human",
+            },
+            "qa_match": None,
+            "retrieval": [],
+            "model_calls": {
+                "intent": "skipped-unsupported-message",
+                "generation": "skipped",
+            },
+            "provider": "business-rule",
+            "trace_id": f"{reason}-{source_message.id}",
+            "task_ids": [notice_task_id] if notice_task_id else [],
+        }
+        _mark_reply_run_human_required(result, reason=reason)
+        db.add(conversation)
+        db.commit()
+        return result
+
+    if not message.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No customer message available")
+
+    if pending_human_required is not None:
+        reason, word = pending_human_required
+        if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
+            return _queue_transfer_confirmation_task(
+                db,
+                user,
+                conversation,
+                robot,
+                sensitive_matches[0][0] if sensitive_matches else unsupported_matches[0][0],
+                reason=reason,
+                word=word,
+            )
+        _mark_human_required(conversation, reason=reason, word=word)
+        db.add(conversation)
+        db.commit()
+        if sensitive_matches:
+            notice_task_id = _queue_sensitive_word_notice_task(
+                db,
+                user,
+                conversation,
+                robot,
+                sensitive_matches[0][0],
+                auto_send_allowed=auto_send_allowed,
+            )
+            if notice_task_id:
+                pre_reply_task_ids.append(notice_task_id)
+        elif unsupported_matches:
+            notice_task_id = _queue_human_required_notice_task(
+                db,
+                user,
+                conversation,
+                robot,
+                unsupported_matches[0][0],
+                reason=reason,
+                idempotency_suffix=reason,
+                auto_send_allowed=auto_send_allowed,
+            )
+            if notice_task_id:
+                pre_reply_task_ids.append(notice_task_id)
+
     context_length = max(
         _context_length(robot),
-        _snapshot_customer_batch_size(db, source_message) - 1,
+        len(reply_batch_messages or batch_messages) - 1,
     )
+    excluded_batch_ids = {item.id for item in batch_messages if item.id}
     history_rows = list(
         db.scalars(
             select(Message)
@@ -686,17 +1447,32 @@ async def _execute_bound_reply(
             .limit(max(context_length * 3 + 10, context_length + 1))
         ).all()
     )
-    history = _history_with_latest(_message_history(history_rows), message, context_length)
-    settings = get_settings()
-    auto_send_allowed = _auto_send_allowed(
-        robot,
-        requested=request.allow_auto_send,
+    history = _history_with_latest(
+        _message_history(history_rows, exclude_message_ids=excluded_batch_ids),
+        message,
+        context_length,
     )
+    settings = get_settings()
     ai_config = db.query(AiProviderConfig).filter(AiProviderConfig.user_id == user.id).first()
     email_template_rows = enabled_templates(db, user)
     email_config = get_config(db, user)
+    order_context_refresh = await _refresh_order_context_before_reply(
+        db,
+        user,
+        conversation,
+        source_message,
+        enabled=auto_send_allowed,
+    )
     customer_orders = order_prompt_context(db, conversation)
     platform_context = _platform_context(history_rows)
+    account_metadata = (
+        conversation.platform_account.metadata_json
+        if conversation.platform_account is not None
+        and isinstance(conversation.platform_account.metadata_json, dict)
+        else {}
+    )
+    shop_summary = account_metadata.get("shop_summary") if isinstance(account_metadata, dict) else {}
+    shop_product_summary = shop_summary if isinstance(shop_summary, dict) else {}
     email_workflow_config = {
         "ask_email_text": email_config.ask_email_text,
         "success_text": email_config.success_text,
@@ -745,6 +1521,10 @@ async def _execute_bound_reply(
             email_config=email_config,
             customer_orders=customer_orders,
             platform_context=platform_context,
+            shop_product_summary={
+                "shop_intro": str(shop_product_summary.get("shop_intro") or ""),
+                "on_sale_products": str(shop_product_summary.get("on_sale_products") or ""),
+            },
         )
         result["reply_generation_duration_ms"] = max(
             0, round((monotonic() - generation_started) * 1000)
@@ -774,7 +1554,65 @@ async def _execute_bound_reply(
                     config=email_workflow_config,
                 )
 
-    task_ids: list[str] = []
+    result["order_context_refresh"] = order_context_refresh
+    product_recommend_enabled, product_recommend_text = _product_recommendation_config(robot)
+    qa_match = result.get("qa_match") if isinstance(result.get("qa_match"), dict) else {}
+    should_recommend_products = (
+        auto_send_allowed
+        and product_recommend_enabled
+        and _wants_product_recommendation(result)
+        and not bool(result.get("product_card_ack"))
+        and not bool(qa_match.get("matched"))
+        and result.get("decision") == "auto_send"
+        and bool(str(result.get("text") or "").strip())
+    )
+    if should_recommend_products:
+        matched_products = match_store_products(
+            db,
+            conversation,
+            _product_recommendation_query(result, message),
+            limit=2,
+        )
+        if matched_products:
+            if product_recommend_text:
+                result["text"] = product_recommend_text
+            result["action_plan"] = {
+                **(result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}),
+                "workflow": "product_recommendation",
+                "next_action": "send_product_recommendation",
+            }
+            result["product_recommendation"] = {
+                "enabled": True,
+                "text": product_recommend_text,
+                "products": matched_products,
+            }
+    elif not isinstance(result.get("product_recommendation"), dict):
+        result["product_recommendation"] = {
+            "enabled": False,
+            "text": product_recommend_text,
+            "products": [],
+        }
+    if pending_human_required is not None:
+        reason, _ = pending_human_required
+        _mark_reply_run_human_required(result, reason=reason)
+
+    if (
+        _is_fallback_reply(result)
+        and _fallback_marks_human_required(robot)
+        and _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed)
+    ):
+        transfer_result = _queue_transfer_confirmation_task(
+            db,
+            user,
+            conversation,
+            robot,
+            source_message,
+            reason="fallback_reply",
+        )
+        transfer_result["order_context_refresh"] = order_context_refresh
+        return transfer_result
+
+    task_ids: list[str] = [*pre_reply_task_ids]
     task_id = await _queue_reply_task_ordered(
         db,
         user,
@@ -792,10 +1630,24 @@ async def _execute_bound_reply(
         if action_plan.get("workflow") == "human_review":
             result_risks = result.get("risk_flags") if isinstance(result.get("risk_flags"), list) else []
             reason = "missing_email_template" if "missing_bound_email_template" in result_risks else "human_handoff"
-            _mark_human_required(conversation, reason=reason)
-            _mark_reply_run_human_required(result, reason=reason)
-            db.add(conversation)
-            db.commit()
+            if (
+                reason == "human_handoff"
+                and _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed)
+            ):
+                _attach_transfer_after_send(
+                    db,
+                    conversation,
+                    robot,
+                    source_message,
+                    task_id,
+                    reason=reason,
+                )
+                result["transfer_conversation_after_send"] = True
+            else:
+                _mark_human_required(conversation, reason=reason)
+                _mark_reply_run_human_required(result, reason=reason)
+                db.add(conversation)
+                db.commit()
         if _is_fallback_reply(result) and _fallback_marks_human_required(robot):
             _mark_human_required(conversation, reason="fallback_reply")
             _mark_reply_run_human_required(result, reason="fallback_reply")
@@ -883,25 +1735,6 @@ async def run_reply(
             status_code=status.HTTP_409_CONFLICT,
             detail="No online robot is assigned to this platform account",
         )
-    if conversation.human_required:
-        result = _sensitive_word_result(
-            source_message.id,
-            reply_text=_sensitive_word_reply_text(robot),
-        )
-        task_id = await _queue_reply_task_ordered(
-            db,
-            user,
-            conversation,
-            robot,
-            source_message,
-            result,
-            auto_send_allowed=_auto_send_allowed(robot, requested=request.allow_auto_send),
-            timeout_deadline=timeout_deadline,
-            ordering_lock=timeout_ordering_lock,
-        )
-        result["task_ids"] = [task_id] if task_id else []
-        return result
-
     reply_run = AutomationReplyRun(
         user_id=user.id,
         conversation_id=conversation.id,
@@ -947,11 +1780,15 @@ async def run_reply(
     except Exception as exc:
         db.rollback()
         persisted_run = db.get(AutomationReplyRun, reply_run.id)
+        failed_conversation = db.get(Conversation, conversation.id)
+        if failed_conversation:
+            _mark_human_required(failed_conversation, reason="auto_reply_failed")
+            db.add(failed_conversation)
         if persisted_run:
             persisted_run.status = "failed"
             persisted_run.error_message = str(exc)[:2000]
             persisted_run.completed_at = utcnow()
-            db.commit()
+        db.commit()
         await realtime_manager.broadcast(
             user.id,
             {
@@ -1003,6 +1840,21 @@ async def run_reply(
             if persisted_run.reply_message_id
             else None
         )
+        follow_up_message = None
+        follow_up_messages: list[Message] = []
+        if task_id:
+            send_task = db.get(RpaTask, task_id)
+            task_payload = send_task.payload_json if send_task and isinstance(send_task.payload_json, dict) else {}
+            follow_up_message_id = str(task_payload.get("follow_up_message_id") or "")
+            follow_up_message = db.get(Message, follow_up_message_id) if follow_up_message_id else None
+            follow_up_message_ids = task_payload.get("follow_up_message_ids")
+            if isinstance(follow_up_message_ids, list):
+                follow_up_messages = [
+                    item for item in (db.get(Message, str(message_id)) for message_id in follow_up_message_ids)
+                    if item is not None and item.conversation_id == conversation.id
+                ]
+            elif follow_up_message is not None:
+                follow_up_messages = [follow_up_message]
 
         await realtime_manager.broadcast(
             user.id,
@@ -1013,6 +1865,13 @@ async def run_reply(
                 "message": MessageRead.model_validate(reply_message).model_dump(mode="json")
                 if reply_message
                 else None,
+                "follow_up_message": MessageRead.model_validate(follow_up_message).model_dump(mode="json")
+                if follow_up_message
+                else None,
+                "follow_up_messages": [
+                    MessageRead.model_validate(item).model_dump(mode="json")
+                    for item in follow_up_messages
+                ],
                 "task_id": task_id,
                 "model": next(
                     (
@@ -1049,6 +1908,7 @@ async def run_test_reply(db: Session, user: User, request: TestReplyRequest) -> 
         customer_name=request.customer_name, robot=robot,
         robot_read=robot_read, ai_config=ai_config, auto_send_allowed=False,
         email_templates=template_metadata(enabled_templates(db, user)),
+        shop_product_summary={"shop_intro": "", "on_sale_products": ""},
     )
     intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
     action_plan = result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}
@@ -1061,6 +1921,45 @@ async def run_test_reply(db: Session, user: User, request: TestReplyRequest) -> 
     result["decision"] = "suggest" if result.get("decision") == "auto_send" else result.get("decision", "suggest")
     result["task_ids"] = []
     return result
+
+
+def schedule_debounced_inbound_reply(
+    user_id: str,
+    conversation_id: str,
+    source_message_id: str,
+    source_event_id: str | None = None,
+    *,
+    delay_seconds: float = INBOUND_REPLY_DEBOUNCE_SECONDS,
+) -> None:
+    key = (user_id, conversation_id)
+    previous = _pending_inbound_reply_tasks.get(key)
+    if previous and not previous.done():
+        previous.cancel()
+
+    async def run_later() -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+            await process_inbound_reply(
+                user_id,
+                conversation_id,
+                source_message_id,
+                source_event_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "debounced inbound reply failed user_id=%s conversation_id=%s source_message_id=%s",
+                user_id,
+                conversation_id,
+                source_message_id,
+            )
+        finally:
+            if _pending_inbound_reply_tasks.get(key) is task:
+                _pending_inbound_reply_tasks.pop(key, None)
+
+    task = asyncio.create_task(run_later())
+    _pending_inbound_reply_tasks[key] = task
 
 
 async def process_inbound_reply(
@@ -1083,11 +1982,6 @@ async def process_inbound_reply(
             )
         )
         if not conversation:
-            return None
-        if conversation.human_required_reason in {
-            "order_follow_up_outreach",
-            "post_receipt_care_outreach",
-        }:
             return None
         robot = _active_robot(db, user, conversation)
         if not robot:

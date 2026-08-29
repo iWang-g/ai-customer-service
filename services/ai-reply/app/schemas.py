@@ -21,6 +21,19 @@ class ReplyRequest(BaseModel):
     allow_auto_send: bool = False
     provider_config: dict[str, Any] | None = None
     reply_config: dict[str, Any] = Field(default_factory=dict)
+    shop_product_summary: dict[str, str] = Field(default_factory=dict)
+
+
+class ShopSummaryRequest(BaseModel):
+    shop_name: str = Field(default="", max_length=128)
+    products: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    provider_config: dict[str, Any] | None = None
+
+
+class ShopSummaryResponse(BaseModel):
+    shop_intro: str
+    on_sale_products: str
+    provider: str
 
 
 IntentName = Literal[
@@ -45,6 +58,8 @@ class IntentDecision(BaseModel):
     need_email: bool = False
     workflow: str = "answer_question"
     next_action: str = "generate_reply"
+    wants_product_recommendation: bool = False
+    product_recommendation_query: str = Field(default="", max_length=500)
     missing_slots: list[str] = Field(default_factory=list)
     template_id: str = ""
     template_key: str = ""

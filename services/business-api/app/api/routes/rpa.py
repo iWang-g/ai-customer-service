@@ -1,5 +1,3 @@
-import asyncio
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
@@ -27,14 +25,16 @@ from app.services.rpa_service import (
     create_event,
     create_events_batch,
     disconnect_node,
+    get_or_create_desktop_ingest_node,
     get_pending_tasks,
     heartbeat_node,
+    maybe_queue_entry_welcome,
     register_node,
     select_inbound_reply_source,
 )
 from app.services.platform_account_service import sync_platform_accounts_for_node
 from app.services.realtime import realtime_manager
-from app.services.automation_service import process_inbound_reply
+from app.services.automation_service import schedule_debounced_inbound_reply
 from app.services.settings_service import auto_reply_enabled
 
 router = APIRouter(prefix="/rpa", tags=["rpa"])
@@ -49,17 +49,16 @@ def _schedule_inbound_reply(
 ) -> None:
     if request.event_type not in {"customer_message", "message_received", "message_snapshot"}:
         return
-    if not auto_reply_enabled(db, user):
-        return
     if source_message.sender_role != "customer":
         return
-    asyncio.create_task(
-        process_inbound_reply(
-            user.id,
-            source_message.conversation_id,
-            source_message.id,
-            source_event_id,
-        )
+    maybe_queue_entry_welcome(db, user, source_message)
+    if not auto_reply_enabled(db, user):
+        return
+    schedule_debounced_inbound_reply(
+        user.id,
+        source_message.conversation_id,
+        source_message.id,
+        source_event_id,
     )
 
 
@@ -152,12 +151,43 @@ async def ingest_batch(
     user = db.get(User, node.user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    events, reply_sources = create_events_batch(db, user, node, request.events)
+    events, reply_sources, affected_conversations = create_events_batch(db, user, node, request.events)
     for item, source_message, source_event_id in reply_sources:
         _schedule_inbound_reply(db, user, item, source_message, source_event_id)
     await realtime_manager.broadcast(
         user.id,
-        {"type": "rpa.events.batch", "events": [item.model_dump(mode="json") for item in events]},
+        {
+            "type": "rpa.events.batch",
+            "events": [item.model_dump(mode="json") for item in events],
+            "affected_conversations": affected_conversations,
+            "appended_message_count": sum(
+                item.get("appended_message_count", 0) for item in affected_conversations
+            ),
+        },
+    )
+    return events
+
+
+@router.post("/events/desktop-batch", response_model=list[RpaEventRead])
+async def ingest_desktop_batch(
+    request: RpaEventBatchCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> list[RpaEventRead]:
+    node = get_or_create_desktop_ingest_node(db, user)
+    events, reply_sources, affected_conversations = create_events_batch(db, user, node, request.events)
+    for item, source_message, source_event_id in reply_sources:
+        _schedule_inbound_reply(db, user, item, source_message, source_event_id)
+    await realtime_manager.broadcast(
+        user.id,
+        {
+            "type": "rpa.events.batch",
+            "events": [item.model_dump(mode="json") for item in events],
+            "affected_conversations": affected_conversations,
+            "appended_message_count": sum(
+                item.get("appended_message_count", 0) for item in affected_conversations
+            ),
+        },
     )
     return events
 

@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import text
 from sqlalchemy.orm import Mapped, relationship, mapped_column
 
 from app.models.base import Base, TimestampMixin, generate_id, utcnow
@@ -47,7 +48,16 @@ class User(Base, TimestampMixin):
     automation_reply_runs: Mapped[list["AutomationReplyRun"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    platform_phrase_snapshots: Mapped[list["PlatformPhraseSnapshot"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     customer_orders: Mapped[list["CustomerOrder"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    customer_products: Mapped[list["CustomerProduct"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    store_products: Mapped[list["StoreProduct"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
     customer_outreach_runs: Mapped[list["CustomerOutreachRun"]] = relationship(
@@ -268,9 +278,42 @@ class PlatformAccount(Base, TimestampMixin):
     tasks: Mapped[list["RpaTask"]] = relationship(back_populates="platform_account")
     robot_scopes: Mapped[list["RobotPlatformScope"]] = relationship(back_populates="platform_account")
     customer_orders: Mapped[list["CustomerOrder"]] = relationship(back_populates="platform_account")
+    customer_products: Mapped[list["CustomerProduct"]] = relationship(back_populates="platform_account")
+    store_products: Mapped[list["StoreProduct"]] = relationship(back_populates="platform_account")
+    phrase_snapshots: Mapped[list["PlatformPhraseSnapshot"]] = relationship(back_populates="platform_account")
     customer_outreach_runs: Mapped[list["CustomerOutreachRun"]] = relationship(
         back_populates="platform_account"
     )
+
+
+class PlatformPhraseSnapshot(Base, TimestampMixin):
+    __tablename__ = "platform_phrase_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform_account_id",
+            "source",
+            name="uq_platform_phrase_snapshot_account_source",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    platform_account_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_accounts.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    local_account_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    platform_code: Mapped[str] = mapped_column(String(32), default="pinduoduo", nullable=False)
+    source: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    records_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    record_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    raw_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="collected", nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="platform_phrase_snapshots")
+    platform_account: Mapped["PlatformAccount"] = relationship(back_populates="phrase_snapshots")
 
 
 class Conversation(Base, TimestampMixin):
@@ -313,6 +356,9 @@ class Conversation(Base, TimestampMixin):
         back_populates="conversation", cascade="all, delete-orphan"
     )
     customer_orders: Mapped[list["CustomerOrder"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+    customer_products: Mapped[list["CustomerProduct"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
     customer_outreach_runs: Mapped[list["CustomerOutreachRun"]] = relationship(
@@ -366,9 +412,11 @@ class Message(Base, TimestampMixin):
     __tablename__ = "messages"
     __table_args__ = (
         Index(
-            "ix_messages_conversation_platform_message",
+            "uq_messages_conversation_platform_message",
             "conversation_id",
             "platform_message_id",
+            unique=True,
+            sqlite_where=text("platform_message_id IS NOT NULL AND platform_message_id != ''"),
         ),
         UniqueConstraint(
             "conversation_id",
@@ -433,6 +481,7 @@ class CustomerOrder(Base, TimestampMixin):
     )
     customer_key: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
     platform_order_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    goods_id: Mapped[str] = mapped_column(String(128), index=True, default="", nullable=False)
     status: Mapped[str] = mapped_column(String(32), index=True, default="unknown", nullable=False)
     raw_status: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     products_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
@@ -452,11 +501,97 @@ class CustomerOrder(Base, TimestampMixin):
     conversation: Mapped["Conversation"] = relationship(back_populates="customer_orders")
 
 
+class CustomerProduct(Base, TimestampMixin):
+    __tablename__ = "customer_products"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform_account_id",
+            "customer_key",
+            "platform_product_id",
+            name="uq_customer_product_customer_product",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    platform_account_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_accounts.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    customer_key: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
+    goods_id: Mapped[str] = mapped_column(String(128), index=True, default="", nullable=False)
+    platform_product_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    link_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sold_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sold_quantity_30d: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="customer_products")
+    platform_account: Mapped["PlatformAccount"] = relationship(back_populates="customer_products")
+    conversation: Mapped["Conversation"] = relationship(back_populates="customer_products")
+
+    @property
+    def product_id(self) -> str:
+        return self.platform_product_id
+
+
+class StoreProduct(Base, TimestampMixin):
+    __tablename__ = "store_products"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform_account_id",
+            "goods_id",
+            name="uq_store_product_account_goods",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=generate_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    platform_account_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_accounts.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    goods_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    platform_product_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    link_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sold_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sold_quantity_30d: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="store_products")
+    platform_account: Mapped["PlatformAccount"] = relationship(back_populates="store_products")
+
+    @property
+    def product_id(self) -> str:
+        return self.platform_product_id
+
+
 class CustomerOutreachRun(Base, TimestampMixin):
     __tablename__ = "customer_outreach_runs"
     __table_args__ = (
         UniqueConstraint(
-            "platform_account_id", "customer_key", "strategy_type",
+            "platform_account_id", "customer_key", "strategy_type", "goods_id",
             name="uq_customer_outreach_customer_strategy",
         ),
     )
@@ -476,6 +611,7 @@ class CustomerOutreachRun(Base, TimestampMixin):
     )
     customer_key: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
     strategy_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    goods_id: Mapped[str] = mapped_column(String(128), index=True, default="", nullable=False)
     order_id: Mapped[str | None] = mapped_column(
         ForeignKey("customer_orders.id", ondelete="SET NULL"), index=True, nullable=True
     )

@@ -74,6 +74,47 @@ def _customer_key(conversation: Conversation, payload: dict[str, Any]) -> str:
     return f"name:{conversation.customer_name or conversation.id}"[:160]
 
 
+def _clean_id(value: Any) -> str:
+    text = str(value or "").strip()
+    return text[:128]
+
+
+def _goods_id_from_products(products: Any) -> str:
+    if not isinstance(products, list):
+        return ""
+    for item in products:
+        if not isinstance(item, dict):
+            continue
+        goods_id = _clean_id(item.get("goods_id") or item.get("product_id") or item.get("platform_product_id"))
+        if goods_id:
+            return goods_id
+    return ""
+
+
+def _message_goods_id(message: Message) -> str:
+    raw_payload = getattr(message, "raw_payload", None)
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
+    for key in ("goods_id", "product_id", "platform_product_id"):
+        goods_id = _clean_id(payload.get(key))
+        if goods_id:
+            return goods_id
+    structured = payload.get("structured_payload")
+    if isinstance(structured, dict):
+        for key in ("goods_id", "product_id", "platform_product_id"):
+            goods_id = _clean_id(structured.get(key))
+            if goods_id:
+                return goods_id
+    timeline = payload.get("timeline")
+    if isinstance(timeline, dict):
+        data = timeline.get("data")
+        if isinstance(data, dict):
+            for key in ("goods_id", "product_id", "platform_product_id"):
+                goods_id = _clean_id(data.get(key))
+                if goods_id:
+                    return goods_id
+    return ""
+
+
 def _active_robot(db: Session, conversation: Conversation) -> Robot | None:
     return db.scalar(
         select(Robot)
@@ -118,19 +159,23 @@ def _create_outreach(
     due_at: datetime,
     message_text: str,
     decision: dict[str, Any],
+    goods_id: str = "",
     order_id: str | None = None,
     source_message_id: str | None = None,
 ) -> CustomerOutreachRun | None:
+    goods_id = _clean_id(goods_id)
     existing = db.scalar(select(CustomerOutreachRun).where(
         CustomerOutreachRun.platform_account_id == conversation.platform_account_id,
         CustomerOutreachRun.customer_key == customer_key,
         CustomerOutreachRun.strategy_type == strategy_type,
+        CustomerOutreachRun.goods_id == goods_id,
     ))
     if existing is not None:
         if existing.status not in RETRYABLE_OUTREACH_STATUSES:
             return None
         existing.robot_id = robot.id
         existing.conversation_id = conversation.id
+        existing.goods_id = goods_id
         existing.order_id = order_id
         existing.source_message_id = source_message_id
         existing.status = "scheduled"
@@ -145,7 +190,7 @@ def _create_outreach(
         db.flush()
         return existing
     outreach_key = sha256(
-        f"{conversation.platform_account_id}:{customer_key}:{strategy_type}".encode("utf-8")
+        f"{conversation.platform_account_id}:{customer_key}:{strategy_type}:{goods_id}".encode("utf-8")
     ).hexdigest()[:48]
     run = CustomerOutreachRun(
         user_id=conversation.user_id,
@@ -154,6 +199,7 @@ def _create_outreach(
         conversation_id=conversation.id,
         customer_key=customer_key,
         strategy_type=strategy_type,
+        goods_id=goods_id,
         order_id=order_id,
         source_message_id=source_message_id,
         status="scheduled",
@@ -182,7 +228,7 @@ def maybe_create_order_follow_up(
     if config.get("order_follow_up_enabled") is not True:
         return None
     text = str(config.get("order_follow_up_text") or "").strip()
-    if not text or conversation.human_required:
+    if not text:
         return None
     summary = (conversation.metadata_json or {}).get("customer_orders")
     if not isinstance(summary, dict) or summary.get("collection_status") != "empty":
@@ -194,6 +240,7 @@ def maybe_create_order_follow_up(
         robot=robot,
         strategy_type="order_follow_up",
         customer_key=customer_key,
+        goods_id=_message_goods_id(source_message),
         due_at=utcnow(),
         message_text=text,
         source_message_id=source_message.id,
@@ -218,9 +265,7 @@ def _maybe_create_post_receipt(
     if config.get("post_receipt_care_enabled") is not True:
         return None
     text = str(config.get("post_receipt_care_text") or "").strip()
-    if not text or conversation.human_required:
-        return None
-    if _order_has_after_sale(order):
+    if not text:
         return None
     max_order_age_days = _config_int(config, "post_receipt_care_max_order_age_days", 30, 1, 90)
     if order.ordered_at and order.ordered_at < utcnow() - timedelta(days=max_order_age_days):
@@ -231,12 +276,14 @@ def _maybe_create_post_receipt(
         robot=robot,
         strategy_type="post_receipt_care",
         customer_key=order.customer_key,
+        goods_id=order.goods_id,
         order_id=order.id,
         due_at=utcnow(),
         message_text=text,
         decision={
             "trigger": "order_first_observed_signed",
             "platform_order_id": order.platform_order_id,
+            "goods_id": order.goods_id,
             "mark_human_required_after_send": config.get(
                 "post_receipt_care_mark_human_required"
             ) is True,
@@ -285,6 +332,7 @@ def apply_orders_snapshot(
                 )
             order.conversation_id = conversation.id
             order.customer_key = customer_key
+            order.goods_id = _clean_id(item.get("goods_id")) or _goods_id_from_products(item.get("products"))
             order.status = normalized_status
             order.raw_status = str(item.get("raw_status") or "").strip()[:128]
             order.products_json = item.get("products") if isinstance(item.get("products"), list) else []
@@ -303,7 +351,7 @@ def apply_orders_snapshot(
             order.raw_payload = item
             db.add(order)
             db.flush()
-            if normalized_status in {"signed", "completed"}:
+            if _order_status_allows_post_receipt_care(order):
                 _maybe_create_post_receipt(db, conversation, order)
             observed_order_ids.add(platform_order_id)
             saved_count += 1
@@ -356,18 +404,8 @@ def _cancel(run: CustomerOutreachRun, reason: str) -> None:
     run.cancel_reason = reason
 
 
-def _order_has_after_sale(order: CustomerOrder) -> bool:
-    if order.status in {"refunding", "refunded", "cancelled"}:
-        return True
-    text = str((order.after_sale_json or {}).get("text") or "").strip()
-    if not text:
-        return False
-    # “退货包运费” is a normal platform benefit, not an active after-sale case.
-    text = text.replace("退货包运费", "")
-    return any(
-        marker in text
-        for marker in ("退款中", "退款成功", "已退款", "退货中", "退货退款", "售后中", "申请售后")
-    )
+def _order_status_allows_post_receipt_care(order: CustomerOrder) -> bool:
+    return str(order.raw_status or "").strip() == "\u5df2\u7b7e\u6536"
 
 
 def _resolve_rechecking_outreach(
@@ -391,9 +429,6 @@ def _resolve_rechecking_outreach(
         )
         if not robot or config.get(enabled_key) is not True:
             _cancel(run, "strategy_disabled")
-            continue
-        if conversation.human_required:
-            _cancel(run, "human_required")
             continue
         if run.strategy_type == "order_follow_up" and _has_pending_formal_reply(db, run):
             run.status = "scheduled"
@@ -427,10 +462,7 @@ def _resolve_rechecking_outreach(
                 else:
                     _cancel(run, "order_not_observed")
                 continue
-            if _order_has_after_sale(order):
-                _cancel(run, "refund_or_after_sale")
-                continue
-            if order.status not in {"signed", "completed"}:
+            if not _order_status_allows_post_receipt_care(order):
                 _cancel(run, "order_status_unknown")
                 continue
         _queue_outreach_send(db, conversation, run)
@@ -659,6 +691,7 @@ def order_prompt_context(db: Session, conversation: Conversation) -> dict[str, A
     normalized = [
         {
             "platform_order_id": item.platform_order_id,
+            "goods_id": item.goods_id,
             "status": item.status,
             "raw_status": item.raw_status,
             "ordered_at": item.ordered_at.isoformat() if item.ordered_at else None,
