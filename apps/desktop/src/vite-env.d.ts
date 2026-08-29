@@ -7,6 +7,13 @@ interface PddWorkspaceAccount {
   createdAt: string;
   lastOpenedAt: string | null;
   platformAccountId: string | null;
+  externalAccountId?: string | null;
+  platformAccountName?: string | null;
+  platformAccountLogoUrl: string | null;
+  platformAccountServiceUsername?: string | null;
+  platformAccountCsId?: string | null;
+  platformAccountCsUid?: string | null;
+  platformAccountIsMallOwner?: boolean;
   loginStatus: 'unknown' | 'login_required' | 'online' | 'offline' | 'risk_control' | 'account_mismatch' | 'error' | 'paused';
   runtimeStatus: 'idle' | 'queued' | 'loading' | 'ready' | 'error' | 'paused';
   collectionStatus: 'idle' | 'watching' | 'collecting' | 'login_required' | 'risk_control' | 'error' | 'paused';
@@ -43,6 +50,50 @@ interface PddImportCandidate {
   previewText: string | null;
   unreadCount: number;
   active: boolean;
+}
+
+interface PddCustomerProduct {
+  product_id: string | null;
+  title: string | null;
+  image_url: string | null;
+  link_url: string | null;
+  price?: number | null;
+  price_label?: string | null;
+  quantity?: number | null;
+  sold_quantity?: number | null;
+  sold_quantity_30d?: number | null;
+  source?: string | null;
+  raw_payload?: Record<string, unknown>;
+}
+
+interface PddCustomerProductsResponse {
+  status: 'collected' | 'failed';
+  method?: 'api_recommend_goods';
+  conversation_key: string | null;
+  customer_name: string | null;
+  collection_status?: 'success' | 'empty' | 'unavailable';
+  observed_at?: string | null;
+  total_count?: number;
+  has_more?: boolean;
+  products: PddCustomerProduct[];
+  error?: string | null;
+}
+
+interface PddTransferCs {
+  csid: string;
+  accountName: string;
+  username?: string;
+  nickname: string;
+  remark: string;
+  unreplyNum: number;
+  recvUser: number | null;
+  bindWechat: boolean;
+  id?: string;
+}
+
+interface PddTransferReason {
+  code: string | number | null;
+  desc: string;
 }
 
 interface WechatAccount {
@@ -109,12 +160,36 @@ interface Window {
     }>;
     refreshPddCustomerOrders(payload: {
       platformAccountId: string;
+      localAccountId?: string | null;
       externalConversationId: string | null;
       customerName: string;
     }): Promise<{
       status: 'collected';
       conversation_key: string;
       customer_name: string | null;
+    }>;
+    refreshPddCustomerProducts(payload: {
+      platformAccountId: string;
+      localAccountId?: string | null;
+      externalConversationId: string | null;
+      customerName: string;
+    }): Promise<PddCustomerProductsResponse>;
+    importPddPlatformPhrases(payload: {
+      accountId: string;
+      source: 'personal' | 'team';
+    }): Promise<{
+      status: 'collected' | 'failed';
+      account_id: string;
+      source: 'personal' | 'team';
+      records: Array<{
+        source_id: string;
+        category: string;
+        quick_key: string;
+        content: string;
+        images: Array<{ url: string; width?: number | null; height?: number | null; image_size?: number | null }>;
+      }>;
+      raw_count: number;
+      error?: string | null;
     }>;
     preparePddConversationTestReset(payload: {
       platformAccountId: string;
@@ -133,27 +208,103 @@ interface Window {
     }>;
     sendPddMessage(payload: {
       platformAccountId: string;
+      localAccountId?: string | null;
       externalConversationId: string | null;
       customerName: string;
       content: string;
+      quoteMessageId?: string | null;
     }): Promise<{
       status: 'sent';
       conversation_key: string;
       customer_name: string | null;
-      method: 'click' | 'enter' | null;
+      method: 'api_send_message';
+      msg_id: string | null;
+      pre_msg_id: string | null;
+      ts: string | null;
+    }>;
+    listPddTransferCs(payload: {
+      platformAccountId: string;
+      localAccountId?: string | null;
+      externalConversationId?: string | null;
+      customerName?: string | null;
+    }): Promise<{
+      status: 'collected';
+      method: 'api_get_assign_cs_list';
+      cs_list: PddTransferCs[];
+      trans_reason: PddTransferReason[];
+      error: null;
+    }>;
+    transferPddConversation(payload: {
+      platformAccountId: string;
+      localAccountId?: string | null;
+      externalConversationId: string;
+      customerName: string;
+      targetCsid: string;
+      transReason?: string | null;
+    }): Promise<{
+      status: 'transferred';
+      method: 'api_move_conversation';
+      conversation_key: string | null;
+      customer_name: string | null;
+      target_cs_id: string | null;
+      target_cs_username: string | null;
+      target_cs_nickname: string | null;
+      trans_reason: string | null;
+      error: null;
+    }>;
+    sendPddProduct(payload: {
+      platformAccountId: string;
+      localAccountId?: string | null;
+      externalConversationId: string | null;
+      customerName: string;
+      productId: string;
+    }): Promise<{
+      status: 'sent';
+      conversation_key: string;
+      customer_name: string | null;
+      method: 'api_send_product';
+      product_id: string | null;
+      backfill?: {
+        status?: string;
+        message_count?: number;
+        has_more?: boolean;
+        error?: string | null;
+      } | null;
     }>;
     sendPddImage(payload: {
       platformAccountId: string;
+      localAccountId?: string | null;
       externalConversationId: string | null;
       customerName: string;
       imageUrl: string;
-    }): Promise<{ status: 'sent'; conversation_key: string; customer_name: string | null }>;
+      quoteMessageId?: string | null;
+    }): Promise<{
+      status: 'sent';
+      conversation_key: string;
+      customer_name: string | null;
+      method: 'api_send_image';
+      msg_id: string | null;
+      pre_msg_id: string | null;
+      ts: string | null;
+      image_url: string | null;
+    }>;
     sendPddImageData(payload: {
       platformAccountId: string;
+      localAccountId?: string | null;
       externalConversationId: string | null;
       customerName: string;
       imageDataUrl: string;
-    }): Promise<{ status: 'sent'; conversation_key: string; customer_name: string | null }>;
+      quoteMessageId?: string | null;
+    }): Promise<{
+      status: 'sent';
+      conversation_key: string;
+      customer_name: string | null;
+      method: 'api_send_image';
+      msg_id: string | null;
+      pre_msg_id: string | null;
+      ts: string | null;
+      image_url: string | null;
+    }>;
   };
   pddWorkspace: {
     getState(): Promise<PddWorkspaceState>;
@@ -162,7 +313,7 @@ interface Window {
     showAccountMenu(accountId: string): Promise<'rename' | 'reidentify' | 'toggle_paused' | 'remove' | null>;
     detectAccountName(accountId: string): Promise<{
       accountName: string;
-      source: 'dom' | 'document_title';
+      source: 'dom' | 'document_title' | 'pdd_api_latest_conversations' | 'pdd_api_custom_service_info' | 'pdd_api_userinfo_realtime' | 'pdd_api_shop_info';
     }>;
     renameAccount(accountId: string, alias: string): Promise<PddWorkspaceState>;
     setAccountPaused(accountId: string, paused: boolean): Promise<PddWorkspaceState>;

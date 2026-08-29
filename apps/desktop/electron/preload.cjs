@@ -40,6 +40,14 @@ contextBridge.exposeInMainWorld('desktopBridge', {
     'pdd-workspace:refresh-customer-orders',
     payload,
   ),
+  refreshPddCustomerProducts: (payload) => ipcRenderer.invoke(
+    'pdd-workspace:refresh-customer-products',
+    payload,
+  ),
+  importPddPlatformPhrases: (payload) => ipcRenderer.invoke(
+    'pdd-workspace:import-platform-phrases',
+    payload,
+  ),
   preparePddConversationTestReset: (payload) => ipcRenderer.invoke(
     'pdd-workspace:prepare-conversation-test-reset',
     payload,
@@ -49,6 +57,9 @@ contextBridge.exposeInMainWorld('desktopBridge', {
     payload,
   ),
   sendPddMessage: (payload) => ipcRenderer.invoke('pdd-workspace:send-message', payload),
+  listPddTransferCs: (payload) => ipcRenderer.invoke('pdd-workspace:list-transfer-cs', payload),
+  transferPddConversation: (payload) => ipcRenderer.invoke('pdd-workspace:transfer-conversation', payload),
+  sendPddProduct: (payload) => ipcRenderer.invoke('pdd-workspace:send-product', payload),
   sendPddImage: (payload) => ipcRenderer.invoke('pdd-workspace:send-image', payload),
   sendPddImageData: (payload) => ipcRenderer.invoke('pdd-workspace:send-image-data', payload),
   getWechatAccounts: () => ipcRenderer.invoke('wechat:get-accounts'),

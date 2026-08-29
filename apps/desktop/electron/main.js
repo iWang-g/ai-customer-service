@@ -28,6 +28,7 @@ const shownHumanRequiredNotificationKeys = new Set();
 const activeHumanRequiredNotifications = new Set();
 let humanRequiredNotificationTimer = null;
 let runtimeConfig = null;
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
 function rendererWebPreferences() {
   return {
@@ -46,6 +47,12 @@ function focusMessageCenter(conversationId = null) {
   mainWindow.show();
   mainWindow.focus();
   mainWindow.webContents.send('desktop:open-human-required-conversation', conversationId);
+}
+
+if (hasSingleInstanceLock) {
+  app.on('second-instance', (_event, _commandLine, _workingDirectory) => {
+    focusMessageCenter();
+  });
 }
 
 function flushHumanRequiredNotifications() {
@@ -330,6 +337,10 @@ function registerIpcHandlers() {
       && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
       throw new Error('目标会话参数无效');
     }
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
+    }
     if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
       throw new Error('客户名称参数无效');
     }
@@ -337,6 +348,36 @@ function registerIpcHandlers() {
       platformAccountId: payload.platformAccountId,
       externalConversationId: payload.externalConversationId || null,
       customerName: payload.customerName,
+    });
+  });
+  ipcMain.handle('pdd-workspace:refresh-customer-products', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (payload.externalConversationId !== null && payload.externalConversationId !== undefined
+      && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
+      throw new Error('目标会话参数无效');
+    }
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
+    }
+    if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
+      throw new Error('客户名称参数无效');
+    }
+    return pddWorkspaceManager.refreshCustomerProducts({
+      platformAccountId: payload.platformAccountId,
+      localAccountId: payload.localAccountId || null,
+      externalConversationId: payload.externalConversationId || null,
+      customerName: payload.customerName,
+    });
+  });
+  ipcMain.handle('pdd-workspace:import-platform-phrases', (_event, payload) => {
+    if (!isValidAccountId(payload?.accountId)) throw new Error('店铺账号参数无效');
+    if (!['personal', 'team'].includes(payload?.source)) throw new Error('话术来源参数无效');
+    return pddWorkspaceManager.importPlatformPhrases({
+      accountId: payload.accountId,
+      source: payload.source,
     });
   });
   ipcMain.handle('pdd-workspace:prepare-conversation-test-reset', (_event, payload) => {
@@ -369,22 +410,121 @@ function registerIpcHandlers() {
       && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
       throw new Error('目标会话参数无效');
     }
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
+    }
     if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
       throw new Error('客户名称参数无效');
     }
     if (typeof payload?.content !== 'string' || !payload.content.trim() || payload.content.length > 4000) {
       throw new Error('消息内容无效');
     }
+    if (payload.quoteMessageId !== null && payload.quoteMessageId !== undefined
+      && (typeof payload.quoteMessageId !== 'string' || payload.quoteMessageId.length > 128)) {
+      throw new Error('quoteMessageId invalid');
+    }
     return pddWorkspaceManager.sendMessage({
       platformAccountId: payload.platformAccountId,
+      localAccountId: payload.localAccountId || null,
       externalConversationId: payload.externalConversationId || null,
       customerName: payload.customerName,
       content: payload.content,
+      quoteMessageId: payload.quoteMessageId || null,
+    });
+  });
+  ipcMain.handle('pdd-workspace:list-transfer-cs', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
+    }
+    if (payload.externalConversationId !== null && payload.externalConversationId !== undefined
+      && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
+      throw new Error('目标会话参数无效');
+    }
+    if (payload.customerName !== null && payload.customerName !== undefined
+      && (typeof payload.customerName !== 'string' || payload.customerName.length > 128)) {
+      throw new Error('客户名称参数无效');
+    }
+    return pddWorkspaceManager.listTransferCs({
+      platformAccountId: payload.platformAccountId,
+      localAccountId: payload.localAccountId || null,
+      externalConversationId: payload.externalConversationId || null,
+      customerName: payload.customerName || '',
+    });
+  });
+  ipcMain.handle('pdd-workspace:transfer-conversation', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (
+      typeof payload?.externalConversationId !== 'string'
+      || !payload.externalConversationId
+      || payload.externalConversationId.length > 128
+    ) throw new Error('目标会话参数无效');
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
+    }
+    if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
+      throw new Error('客户名称参数无效');
+    }
+    if (typeof payload?.targetCsid !== 'string' || !payload.targetCsid || payload.targetCsid.length > 128) {
+      throw new Error('目标客服参数无效');
+    }
+    if (payload.transReason !== null && payload.transReason !== undefined
+      && (typeof payload.transReason !== 'string' || payload.transReason.length > 128)) {
+      throw new Error('转移原因参数无效');
+    }
+    return pddWorkspaceManager.transferConversation({
+      platformAccountId: payload.platformAccountId,
+      localAccountId: payload.localAccountId || null,
+      externalConversationId: payload.externalConversationId,
+      customerName: payload.customerName,
+      targetCsid: payload.targetCsid,
+      transReason: payload.transReason || '无原因直接转移',
+    });
+  });
+  ipcMain.handle('pdd-workspace:send-product', (_event, payload) => {
+    if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
+      throw new Error('平台店铺参数无效');
+    }
+    if (payload.externalConversationId !== null && payload.externalConversationId !== undefined
+      && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
+      throw new Error('目标会话参数无效');
+    }
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
+    }
+    if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
+      throw new Error('客户名称参数无效');
+    }
+    if (typeof payload?.productId !== 'string' || !payload.productId.trim() || payload.productId.length > 128) {
+      throw new Error('商品参数无效');
+    }
+    return pddWorkspaceManager.sendProduct({
+      platformAccountId: payload.platformAccountId,
+      localAccountId: payload.localAccountId || null,
+      externalConversationId: payload.externalConversationId || null,
+      customerName: payload.customerName,
+      productId: payload.productId,
     });
   });
   ipcMain.handle('pdd-workspace:send-image', (_event, payload) => {
     if (typeof payload?.platformAccountId !== 'string' || payload.platformAccountId.length > 128) {
       throw new Error('平台店铺参数无效');
+    }
+    if (payload.externalConversationId !== null && payload.externalConversationId !== undefined
+      && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
+      throw new Error('目标会话参数无效');
+    }
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
     }
     if (typeof payload?.imageUrl !== 'string' || !/^https?:\/\//i.test(payload.imageUrl)) {
       throw new Error('图片地址参数无效');
@@ -392,11 +532,17 @@ function registerIpcHandlers() {
     if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
       throw new Error('客户名称参数无效');
     }
+    if (payload.quoteMessageId !== null && payload.quoteMessageId !== undefined
+      && (typeof payload.quoteMessageId !== 'string' || payload.quoteMessageId.length > 128)) {
+      throw new Error('quoteMessageId invalid');
+    }
     return pddWorkspaceManager.sendImage({
       platformAccountId: payload.platformAccountId,
+      localAccountId: payload.localAccountId || null,
       externalConversationId: payload.externalConversationId || null,
       customerName: payload.customerName,
       imageUrl: payload.imageUrl,
+      quoteMessageId: payload.quoteMessageId || null,
     });
   });
   ipcMain.handle('pdd-workspace:send-image-data', (_event, payload) => {
@@ -407,11 +553,19 @@ function registerIpcHandlers() {
       && (typeof payload.externalConversationId !== 'string' || payload.externalConversationId.length > 128)) {
       throw new Error('目标会话参数无效');
     }
+    if (payload.localAccountId !== null && payload.localAccountId !== undefined
+      && (typeof payload.localAccountId !== 'string' || payload.localAccountId.length > 128)) {
+      throw new Error('本机店铺参数无效');
+    }
     if (typeof payload?.customerName !== 'string' || payload.customerName.length > 128) {
       throw new Error('客户名称参数无效');
     }
     if (typeof payload?.imageDataUrl !== 'string' || payload.imageDataUrl.length > 14 * 1024 * 1024) {
       throw new Error('图片内容无效或超过 10 MB');
+    }
+    if (payload.quoteMessageId !== null && payload.quoteMessageId !== undefined
+      && (typeof payload.quoteMessageId !== 'string' || payload.quoteMessageId.length > 128)) {
+      throw new Error('quoteMessageId invalid');
     }
     return pddWorkspaceManager.sendImageData(payload);
   });
@@ -439,13 +593,17 @@ function createWindow() {
     void window.loadFile(path.join(currentDirectory, '..', 'dist', 'index.html'));
   }
   mainWindow = window;
+  window.on('close', (event) => {
+    if (shutdownStarted || shutdownComplete || !app.isPackaged) return;
+    event.preventDefault();
+    window.hide();
+  });
   window.on('closed', () => {
     if (mainWindow === window) mainWindow = null;
-    if (process.platform !== 'darwin') app.quit();
   });
 }
 
-app.whenReady().then(async () => {
+if (hasSingleInstanceLock) app.whenReady().then(async () => {
   if (process.platform === 'win32') app.setAppUserModelId('com.omniai.customer-service');
   try {
     runtimeConfig = loadRuntimeConfig({
@@ -493,6 +651,7 @@ app.whenReady().then(async () => {
     requiredFilePath: rpaAgentPath,
     apiBaseUrl: runtimeConfig.businessApiUrl,
     appVersion: app.getVersion(),
+    logPath: path.join(diagnosticLogDirectory, 'rpa-agent.log'),
   });
   rpaProcessManager.on('bindings', (bindings) => {
     for (const binding of bindings) {

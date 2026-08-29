@@ -39,11 +39,12 @@ export function validateRuntimeConfig(value, { rejectLoopback = false } = {}) {
   if (!config.knowledgeBaseUrl.endsWith('/api/v1')) {
     throw new Error('Knowledge Base 地址必须以 /api/v1 结尾');
   }
-  if (rejectLoopback) {
+  const allowLoopback = value.allowLoopback === true;
+  if (rejectLoopback && !allowLoopback) {
     for (const configuredUrl of Object.values(config)) {
       const hostname = new URL(configuredUrl).hostname.toLowerCase();
       if (['127.0.0.1', 'localhost', '::1'].includes(hostname)) {
-        throw new Error('发布配置不能指向用户电脑的本机地址');
+        throw new Error('发布配置不能指向用户电脑的本机地址，除非显式设置 allowLoopback=true');
       }
     }
   }

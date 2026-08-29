@@ -23,6 +23,7 @@ export class RpaProcessManager extends EventEmitter {
     requiredFilePath = null,
     apiBaseUrl,
     appVersion = '0.1.0',
+    logPath = null,
   }) {
     super();
     this.userDataPath = userDataPath;
@@ -31,6 +32,7 @@ export class RpaProcessManager extends EventEmitter {
     this.requiredFilePath = requiredFilePath;
     this.apiBaseUrl = apiBaseUrl.replace(/\/$/, '');
     this.appVersion = appVersion;
+    this.logPath = logPath;
     this.process = null;
     this.secret = null;
     this.userId = null;
@@ -50,6 +52,11 @@ export class RpaProcessManager extends EventEmitter {
   }
 
   async start({ userId, accessToken }) {
+    this.#writeLog('start_requested', {
+      user_id_present: Boolean(userId),
+      access_token_present: Boolean(accessToken),
+      has_existing_process: Boolean(this.process),
+    });
     if (this.process && this.userId === userId) {
       this.accessToken = accessToken;
       this.#send({ type: 'update_access_token', access_token: accessToken });
@@ -80,12 +87,19 @@ export class RpaProcessManager extends EventEmitter {
       login_status: account.paused || account.archivedAt
         ? 'paused'
         : account.loginStatus === 'account_mismatch' ? 'error' : account.loginStatus || 'unknown',
-      metadata_json: account.metadataJson || {
-        process_id: account.processId || null,
-        window_handle: account.windowHandle || null,
-        wechat_name: account.wechatName || null,
-        wechat_id: account.wechatId || null,
-        identity_source: account.identitySource || null,
+      metadata_json: {
+        ...(account.metadataJson || {
+          process_id: account.processId || null,
+          window_handle: account.windowHandle || null,
+          wechat_name: account.wechatName || null,
+          wechat_id: account.wechatId || null,
+          identity_source: account.identitySource || null,
+        }),
+        logo_url: account.platformAccountLogoUrl || account.metadataJson?.logo_url || null,
+        cs_username: account.platformAccountServiceUsername || account.metadataJson?.cs_username || null,
+        cs_id: account.platformAccountCsId || account.metadataJson?.cs_id || null,
+        cs_uid: account.platformAccountCsUid || account.metadataJson?.cs_uid || null,
+        is_mall_owner: account.platformAccountIsMallOwner === true,
       },
     }));
     this.accountsByPlatform.set(platformCode, normalized);
@@ -104,6 +118,7 @@ export class RpaProcessManager extends EventEmitter {
   }
 
   async stop() {
+    this.#writeLog('stop_requested', { has_process: Boolean(this.process) });
     this.stopping = true;
     if (this.restartTimer) clearTimeout(this.restartTimer);
     this.restartTimer = null;
@@ -149,6 +164,12 @@ export class RpaProcessManager extends EventEmitter {
     this.secret = randomBytes(32).toString('hex');
     this.buffer = '';
     this.#setState({ status: 'starting', detail: null });
+    this.#writeLog('process_spawning', {
+      executable_path: this.executablePath,
+      executable_args: this.executableArgs,
+      required_file_path: this.requiredFilePath,
+      api_base_url: this.apiBaseUrl,
+    });
     const child = spawn(this.executablePath, this.executableArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -158,11 +179,18 @@ export class RpaProcessManager extends EventEmitter {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => this.#consume(chunk));
     child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => console.error('[RPA]', chunk.trimEnd()));
-    child.on('error', (error) => this.#setState({ status: 'error', detail: error.message }));
+    child.stderr.on('data', (chunk) => {
+      console.error('[RPA]', chunk.trimEnd());
+      this.#writeLog('process_stderr', { text: chunk.trimEnd().slice(0, 4000) });
+    });
+    child.on('error', (error) => {
+      this.#writeLog('process_error', { error: error?.message || String(error) });
+      this.#setState({ status: 'error', detail: error.message });
+    });
     child.on('exit', (code) => {
       if (this.process === child) this.process = null;
       if (this.stopping) return;
+      this.#writeLog('process_exited', { code: code ?? null });
       this.#setState({ status: 'offline', detail: `RPA 进程已退出 (${code ?? 'unknown'})` });
       this.restartTimer = setTimeout(() => this.#spawn(), 5000);
     });
@@ -191,12 +219,17 @@ export class RpaProcessManager extends EventEmitter {
         this.#handleMessage(message);
       } catch (error) {
         console.error('[RPA] 无法解析节点消息:', error);
+        this.#writeLog('message_parse_failed', {
+          error: error?.message || String(error),
+          line: line.slice(0, 1000),
+        });
       }
     }
   }
 
   #handleMessage(message) {
     if (message.type === 'agent_started') {
+      this.#writeLog('agent_started', { pid: message.pid || null });
       this.#send({ type: 'sync_accounts', accounts: this.accounts });
       for (const event of this.pendingEvents.values()) {
         this.#send({ type: 'enqueue_event', event });
@@ -204,6 +237,7 @@ export class RpaProcessManager extends EventEmitter {
       return;
     }
     if (message.type === 'registered') {
+      this.#writeLog('registered', { node_id: message.node_id || null });
       this.#setState({ status: 'online', nodeId: message.node_id, detail: null });
       return;
     }
@@ -216,7 +250,13 @@ export class RpaProcessManager extends EventEmitter {
       });
       return;
     }
-    if (message.type === 'offline' || message.type === 'command_error') {
+    if (message.type === 'command_error') {
+      this.#writeLog(message.type, { detail: message.detail || null });
+      this.#setState({ detail: message.detail || 'RPA command error' });
+      return;
+    }
+    if (message.type === 'offline') {
+      this.#writeLog(message.type, { detail: message.detail || null });
       this.#setState({ status: 'offline', detail: message.detail || 'RPA 节点离线' });
       return;
     }
@@ -298,6 +338,21 @@ export class RpaProcessManager extends EventEmitter {
 
   #setState(changes) {
     this.state = { ...this.state, ...changes };
+    this.#writeLog('state_changed', this.state);
     this.emit('state-changed', this.getState());
+  }
+
+  #writeLog(stage, details = {}) {
+    if (!this.logPath) return;
+    try {
+      fs.mkdirSync(path.dirname(this.logPath), { recursive: true });
+      fs.appendFileSync(this.logPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        stage,
+        details,
+      })}\n`, 'utf8');
+    } catch {
+      // RPA lifecycle must not depend on diagnostic logging.
+    }
   }
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -165,7 +166,260 @@ function failedSwitchFixture() {
 }
 
 app.whenReady().then(async () => {
+  const chatListRequests = [];
+  const syncMessageRequests = [];
+  const sendMessageRequests = [];
   const server = http.createServer((request, response) => {
+    if (request.url?.includes('/janus/api/customService/queryCustomServiceInfo')) {
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({
+        success: true,
+        errorCode: 1000000,
+        errorMsg: null,
+        result: {
+          customServiceInfo: null,
+          mallInfoResult: {
+            mallId: 688523141,
+            logo: 'https://img.pddpic.com/store-logo.png',
+            mallName: 'API Test store',
+          },
+        },
+      }));
+      return;
+    }
+    if (request.url?.includes('/chats/userinfo/realtime')) {
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({
+        success: true,
+        mall_id: 688523141,
+        cs_id: '688523141',
+        username: '主账号',
+        mall: {
+          mall_id: 688523141,
+          mall_name: 'API Test store',
+          logo: 'https://img.pddpic.com/store-logo.png',
+        },
+      }));
+      return;
+    }
+    if (request.url?.includes('/plateau/chat/latest_conversations')) {
+      response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({
+        success: true,
+        result: {
+          response: 'latest_conversations',
+          result: 'ok',
+          has_more: false,
+          page: 1,
+          size: 100,
+          conversations: [{
+            to: { role: 'user', uid: '8715744365612' },
+            from: { role: 'mall_cs', uid: '688523141', mall_id: '688523141' },
+            content: 'Hello again',
+            type: 0,
+            msg_id: '1786955732373',
+            mallName: 'API Test store',
+            user_info: {
+              uid: 8715744365612,
+              nickname: 'Buyer A',
+              avatar: 'https://savatar.pddpic.com/avatar.png',
+            },
+          }],
+        },
+      }));
+      return;
+    }
+    if (request.url?.includes('/plateau/chat/list')) {
+      let body = '';
+      request.on('data', (chunk) => {
+        body += chunk;
+      });
+      request.on('end', () => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = null;
+        }
+        chatListRequests.push({
+          headers: request.headers,
+          body: parsed,
+        });
+        const customerUid = parsed?.data?.list?.with?.id || 'unknown';
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({
+          success: true,
+          result: {
+            response: 'list',
+            result: 'ok',
+            has_more: false,
+            read_mark: {
+              user_last_read: '1786953946927',
+              min_supported_msg_id: '1588908282573',
+            },
+            messages: [
+              {
+                to: { role: 'user', uid: customerUid },
+                from: { role: 'mall_cs', uid: '688523141', mall_id: '688523141' },
+                ts: '1786955732',
+                content: 'API agent reply',
+                type: 0,
+                msg_id: '1786955732373',
+                pre_msg_id: '1786955420775',
+                status: 'read',
+              },
+              {
+                from: { uid: customerUid, role: 'user' },
+                to: { uid: '688523141', role: 'mall_cs' },
+                content: 'API customer message',
+                type: 0,
+                ts: '1786955420',
+                msg_id: '1786955420775',
+                pre_msg_id: '1786953946927',
+                status: 'unread',
+              },
+            ],
+          },
+        }));
+      });
+      return;
+    }
+    if (request.url?.includes('pre_upload')) {
+      let body = '';
+      request.on('data', (chunk) => {
+        body += chunk;
+      });
+      request.on('end', () => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = null;
+        }
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({
+          success: true,
+          result: {
+            response: 'pre_upload',
+            result: 'ok',
+            request_id: parsed?.request_id || 1787204151000,
+            upload_token: 'smoke-upload-token',
+            upload_url: `http://${request.headers.host}/dynamic-image-upload`,
+            upload_host: `http://${request.headers.host}`,
+            store_url: '/plateau/chat/store_image',
+          },
+        }));
+      });
+      return;
+    }
+    if (request.url?.includes('dynamic-image-upload')) {
+      request.resume();
+      request.on('end', () => {
+        response.writeHead(204, { 'Content-Type': 'text/plain; charset=utf-8' });
+        response.end('');
+      });
+      return;
+    }
+    if (request.url?.includes('store_image')) {
+      request.resume();
+      request.on('end', () => {
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({
+          success: true,
+          result: {
+            response: 'store_image',
+            result: 'ok',
+            url: 'https://chat-img.pddugc.com/chat-pic-mall-cs-v1/2026-08-20/smoke.jpeg',
+            hash: 'smoke-image-hash',
+            size: {
+              width: 1170,
+              height: 1550,
+              image_size: 89,
+            },
+            info: {
+              thumb_data: 'data:image/jpeg;base64,AAAA',
+            },
+          },
+        }));
+      });
+      return;
+    }
+    if (request.url?.includes('/plateau/chat/send_message')) {
+      let body = '';
+      request.on('data', (chunk) => {
+        body += chunk;
+      });
+      request.on('end', () => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = null;
+        }
+        sendMessageRequests.push({
+          headers: request.headers,
+          body: parsed,
+        });
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({
+          success: true,
+          result: {
+            response: 'send_message',
+            request_id: parsed?.data?.request_id || 1787031726880,
+            result: 'ok',
+            msg_id: 1787031727088,
+            pre_msg_id: '1786933622874',
+            ts: 1787031727,
+          },
+        }));
+      });
+      return;
+    }
+    if (request.url?.includes('/plateau/sync/message')) {
+      let body = '';
+      request.on('data', (chunk) => {
+        body += chunk;
+      });
+      request.on('end', () => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = null;
+        }
+        syncMessageRequests.push({
+          headers: request.headers,
+          body: parsed,
+        });
+        const seqId = Number(parsed?.sync_key?.[0]?.seq_id) || 0;
+        const nextSeqId = seqId < 11 ? 11 : 12;
+        const messageId = seqId < 11 ? 'sync-native-message' : 'sync-poll-message';
+        const content = seqId < 11 ? 'Native sync customer message' : 'Polled sync customer message';
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({
+          success: true,
+          result: {
+            sync_data: [{
+              seq_type: 1,
+              seq_id: nextSeqId,
+              data: [{
+                message: {
+                  from: { uid: '9922334455667', role: 'user' },
+                  to: { uid: '688523141', role: 'mall_cs' },
+                  content,
+                  type: 0,
+                  ts: String(1786955400 + nextSeqId),
+                  msg_id: messageId,
+                  pre_msg_id: '1786953946927',
+                },
+              }],
+            }],
+            server_time: 1786955400000 + nextSeqId,
+          },
+        }));
+      });
+      return;
+    }
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     response.end(request.url?.includes('failed-switch') ? failedSwitchFixture() : fixture());
   });
@@ -208,6 +462,36 @@ app.whenReady().then(async () => {
     }
   });
   await window.loadURL(`http://127.0.0.1:${address.port}/chat-merchant/index.html`);
+  await window.webContents.executeJavaScript(`
+    fetch('/plateau/chat/latest_conversations', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anti-content': 'test-anti-content',
+      },
+      body: JSON.stringify({
+        data: {
+          cmd: 'latest_conversations',
+          anti_content: 'test-body-anti-content',
+        },
+        client: 'WEB',
+        anti_content: 'test-body-anti-content',
+      }),
+    }).then((response) => response.json())
+  `);
+  await window.webContents.executeJavaScript(`
+    fetch('/plateau/sync/message', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anti-content': 'test-anti-content',
+      },
+      body: JSON.stringify({
+        sync_key: [{ seq_id: 10, seq_type: 1 }],
+        anti_content: 'test-body-anti-content',
+      }),
+    }).then((response) => response.json())
+  `);
 
   const buyerBSnapshot = () => messages.find((item) => (
     item.type === 'snapshot'
@@ -234,7 +518,7 @@ app.whenReady().then(async () => {
     ))
   ));
   const storeIdentity = () => messages.find((item) => (
-    item.type === 'identity' && item.account_name === 'Test store'
+    item.type === 'identity' && item.account_name === 'API Test store'
   ));
   const deadline = Date.now() + 8000;
   while ((!buyerBSnapshot() || !buyerCSnapshot() || !storeIdentity()) && Date.now() < deadline) {
@@ -252,9 +536,9 @@ app.whenReady().then(async () => {
   const unreadSnapshot = buyerBSnapshot();
   const secondUnreadSnapshot = buyerCSnapshot();
   assert.equal(status?.status, 'online');
-  assert.equal(identity?.external_account_id, 'mall-100');
-  assert.equal(identity?.account_name, 'Test store');
-  assert.equal(identity?.account_name_source, 'document_title');
+  assert.equal(identity?.external_account_id, '688523141');
+  assert.equal(identity?.account_name, 'API Test store');
+  assert.equal(identity?.account_name_source, 'pdd_api_custom_service_info');
   assert.equal(
     messages.some((item) => item.type === 'identity' && item.account_name === '拼多多客服平台'),
     false,
@@ -277,8 +561,36 @@ app.whenReady().then(async () => {
   const manualDetection = messages.find((item) => (
     item.type === 'account_name_detection' && item.request_id === detectionRequestId
   ));
-  assert.equal(manualDetection?.account_name, 'Test store');
-  assert.equal(manualDetection?.source, 'document_title');
+  assert.equal(manualDetection?.account_name, 'API Test store');
+  assert.equal(manualDetection?.source, 'pdd_api_custom_service_info');
+
+  const latestCandidatesRequestId = 'adapter-smoke-latest-candidates';
+  window.webContents.send('pdd-adapter:command', {
+    type: 'list-conversations-api',
+    requestId: latestCandidatesRequestId,
+  });
+  const latestCandidatesDeadline = Date.now() + 2000;
+  while (
+    !messages.some((item) => (
+      item.type === 'api_latest_conversations_result' && item.request_id === latestCandidatesRequestId
+    ))
+    && Date.now() < latestCandidatesDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const latestCandidates = messages.find((item) => (
+    item.type === 'api_latest_conversations_result' && item.request_id === latestCandidatesRequestId
+  ));
+  assert.equal(latestCandidates?.status, 'collected');
+  assert.ok(
+    latestCandidates?.response?.result?.conversations?.some((conversation) => (
+      String(conversation?.user_info?.uid) === '8715744365612'
+      && conversation?.mallName === 'API Test store'
+      && conversation?.user_info?.nickname === 'Buyer A'
+      && conversation?.content === 'Hello again'
+    )),
+    'list-conversations-api must return latest_conversations response data for import candidates',
+  );
   const initialConversation = snapshot?.conversations?.find(
     (conversation) => conversation.external_conversation_id === '8715744365612',
   );
@@ -405,6 +717,207 @@ app.whenReady().then(async () => {
     'the already-active unread conversation must still be clicked first',
   );
 
+  const apiSwitchCountBefore = await window.webContents.executeJavaScript('document.body.dataset.switchCount');
+  const apiRequestId = 'adapter-smoke-api-chat-list';
+  window.webContents.send('pdd-adapter:command', {
+    type: 'collect-conversation-api',
+    requestId: apiRequestId,
+    conversationKey: '9922334455667',
+  });
+  const apiDeadline = Date.now() + 5000;
+  while (
+    !messages.some((item) => item.type === 'api_chat_list_result' && item.request_id === apiRequestId)
+    && Date.now() < apiDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const apiChatListResult = messages.find((item) => (
+    item.type === 'api_chat_list_result' && item.request_id === apiRequestId
+  ));
+  assert.equal(apiChatListResult?.status, 'collected');
+  assert.equal(apiChatListResult?.customer_uid, '9922334455667');
+  assert.equal(apiChatListResult?.response?.result?.messages?.length, 2);
+  assert.equal(chatListRequests.at(-1)?.body?.data?.list?.with?.id, '9922334455667');
+  assert.equal(chatListRequests.at(-1)?.body?.data?.list?.start_index, 0);
+  assert.equal(chatListRequests.at(-1)?.body?.client, 'WEB');
+  assert.equal(chatListRequests.at(-1)?.headers?.['anti-content'], 'test-anti-content');
+  assert.equal(chatListRequests.at(-1)?.body?.anti_content, 'test-body-anti-content');
+  assert.equal(chatListRequests.at(-1)?.body?.data?.anti_content, 'test-body-anti-content');
+  const apiSwitchCountAfter = await window.webContents.executeJavaScript('document.body.dataset.switchCount');
+  assert.equal(
+    apiSwitchCountAfter,
+    apiSwitchCountBefore,
+    'API chat/list collection must not click or switch the active DOM conversation',
+  );
+  const apiChatListShadow = messages.find((item) => (
+    item.type === 'diagnostic'
+    && item.stage === 'api_shadow_snapshot'
+    && item.details?.endpoint === 'chat_list'
+    && item.details?.customer_uids?.includes('9922334455667')
+  ));
+  assert.equal(apiChatListShadow?.details?.message_count, 2);
+  await window.webContents.executeJavaScript(`
+    (async () => {
+      await fetch('/plateau/chat/pre_upload', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'anti-content': 'test-anti-content'
+        },
+        body: JSON.stringify({
+          request_id: 1787204151000,
+          file_name: 'smoke.jpeg',
+          file_type: 'image/jpeg'
+        })
+      });
+      const uploadForm = new FormData();
+      uploadForm.append('file', new Blob(['dynamic-upload-bytes'], { type: 'image/jpeg' }), 'dynamic.jpeg');
+      uploadForm.append('upload_signature', 'smoke-upload-token');
+      await fetch('/dynamic-image-upload', {
+        method: 'POST',
+        body: uploadForm
+      });
+      const form = new FormData();
+      form.append('file', new Blob(['smoke-image-bytes'], { type: 'image/jpeg' }), 'smoke.jpeg');
+      form.append('hash', 'smoke-image-hash');
+      await fetch('/plateau/chat/store_image', {
+        method: 'POST',
+        headers: { 'anti-content': 'test-anti-content' },
+        body: form
+      });
+    })();
+  `);
+  const imageUploadDeadline = Date.now() + 5000;
+  while (
+    !messages.some((item) => (
+      item.type === 'diagnostic'
+      && item.stage === 'api_shadow_snapshot'
+      && item.details?.endpoint === 'image_store'
+    ))
+    && Date.now() < imageUploadDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const imagePreUploadShadow = messages.find((item) => (
+    item.type === 'diagnostic'
+    && item.stage === 'api_shadow_snapshot'
+    && item.details?.endpoint === 'image_pre_upload'
+  ));
+  assert.equal(imagePreUploadShadow?.details?.request?.body_kind, 'json');
+  assert.equal(imagePreUploadShadow?.details?.upload_token_present, true);
+  const imageUploadShadow = messages.find((item) => (
+    item.type === 'diagnostic'
+    && item.stage === 'api_shadow_snapshot'
+    && item.details?.endpoint === 'image_upload'
+  ));
+  assert.equal(imageUploadShadow?.details?.request?.body_kind, 'form_data');
+  assert.deepEqual(imageUploadShadow?.details?.request?.field_names, ['file', 'upload_signature']);
+  assert.equal(imageUploadShadow?.details?.http_status, 204);
+  assert.equal(imageUploadShadow?.details?.request_url?.pathname, '/dynamic-image-upload');
+  const imageStoreShadow = messages.find((item) => (
+    item.type === 'diagnostic'
+    && item.stage === 'api_shadow_snapshot'
+    && item.details?.endpoint === 'image_store'
+  ));
+  assert.equal(imageStoreShadow?.details?.request?.body_kind, 'form_data');
+  assert.deepEqual(imageStoreShadow?.details?.request?.field_names, ['file', 'hash']);
+  assert.equal(imageStoreShadow?.details?.image_url, 'https://chat-img.pddugc.com/chat-pic-mall-cs-v1/2026-08-20/smoke.jpeg');
+  assert.equal(imageStoreShadow?.details?.hash, 'smoke-image-hash');
+  assert.equal(imageStoreShadow?.details?.width, 1170);
+  assert.equal(imageStoreShadow?.details?.height, 1550);
+  assert.equal(imageStoreShadow?.details?.image_size, 89);
+  assert.equal(imageStoreShadow?.details?.thumb_data_present, true);
+  const nativeSyncResult = messages.find((item) => (
+    item.type === 'api_sync_message_result'
+    && item.source === 'native'
+    && item.response?.result?.sync_data?.some((syncItem) => (
+      syncItem.data?.some((wrapper) => wrapper.message?.msg_id === 'sync-native-message')
+    ))
+  ));
+  assert.equal(nativeSyncResult?.status, 'synced');
+  const pollSyncDeadline = Date.now() + 5000;
+  while (
+    !messages.some((item) => (
+      item.type === 'api_sync_message_result'
+      && item.source === 'poll'
+      && item.response?.result?.sync_data?.some((syncItem) => (
+        syncItem.data?.some((wrapper) => wrapper.message?.msg_id === 'sync-poll-message')
+      ))
+    ))
+    && Date.now() < pollSyncDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const pollSyncResult = messages.find((item) => (
+    item.type === 'api_sync_message_result'
+    && item.source === 'poll'
+    && item.response?.result?.sync_data?.some((syncItem) => (
+      syncItem.data?.some((wrapper) => wrapper.message?.msg_id === 'sync-poll-message')
+    ))
+  ));
+  assert.equal(pollSyncResult?.status, 'synced', JSON.stringify({
+    sync_request_count: syncMessageRequests.length,
+    sync_request_seq_ids: syncMessageRequests.map((item) => item.body?.sync_key?.[0]?.seq_id),
+    sync_result_sources: messages
+      .filter((item) => item.type === 'api_sync_message_result')
+      .map((item) => ({
+        source: item.source,
+        status: item.status,
+        error: item.error,
+        message_ids: item.response?.result?.sync_data?.flatMap((syncItem) => (
+          syncItem.data?.map((wrapper) => wrapper.message?.msg_id) || []
+        )),
+      })),
+    sync_diagnostics: messages
+      .filter((item) => item.type === 'diagnostic' && String(item.stage || '').includes('api_sync'))
+      .map((item) => ({ stage: item.stage, details: item.details })),
+  }));
+  assert.equal(syncMessageRequests[0]?.body?.sync_key?.[0]?.seq_id, 10);
+  const firstPollSyncRequest = syncMessageRequests.find((item) => item.body?.sync_key?.[0]?.seq_id === 11);
+  assert.equal(firstPollSyncRequest?.body?.sync_key?.[0]?.seq_id, 11);
+  assert.equal(firstPollSyncRequest?.headers?.['anti-content'], 'test-anti-content');
+  assert.equal(firstPollSyncRequest?.body?.anti_content, 'test-body-anti-content');
+
+  const apiSendSwitchCountBefore = await window.webContents.executeJavaScript('document.body.dataset.switchCount');
+  const apiSendRequestId = 'adapter-smoke-api-send-message';
+  const apiSendContent = 'API send line 1\nline 2  with spaces';
+  window.webContents.send('pdd-adapter:command', {
+    type: 'send-message-api',
+    requestId: apiSendRequestId,
+    conversationKey: '9922334455667',
+    customerName: 'Buyer B',
+    content: apiSendContent,
+  });
+  const apiSendDeadline = Date.now() + 5000;
+  while (
+    !messages.some((item) => item.type === 'api_message_send_result' && item.request_id === apiSendRequestId)
+    && Date.now() < apiSendDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const apiSendResult = messages.find((item) => (
+    item.type === 'api_message_send_result' && item.request_id === apiSendRequestId
+  ));
+  assert.equal(apiSendResult?.status, 'sent');
+  assert.equal(apiSendResult?.result?.msg_id, '1787031727088');
+  assert.equal(sendMessageRequests.at(-1)?.headers?.['anti-content'], 'test-anti-content');
+  assert.equal(sendMessageRequests.at(-1)?.body?.anti_content, 'test-body-anti-content');
+  assert.equal(sendMessageRequests.at(-1)?.body?.data?.anti_content, 'test-body-anti-content');
+  assert.equal(sendMessageRequests.at(-1)?.body?.data?.cmd, 'send_message');
+  assert.equal(sendMessageRequests.at(-1)?.body?.data?.message?.to?.uid, '9922334455667');
+  assert.equal(sendMessageRequests.at(-1)?.body?.data?.message?.content, apiSendContent);
+  assert.equal(sendMessageRequests.at(-1)?.body?.data?.message?.type, 0);
+  assert.equal(
+    sendMessageRequests.at(-1)?.body?.data?.message?.hash,
+    createHash('sha256').update(apiSendContent).digest('hex'),
+  );
+  const apiSendSwitchCountAfter = await window.webContents.executeJavaScript('document.body.dataset.switchCount');
+  assert.equal(
+    apiSendSwitchCountAfter,
+    apiSendSwitchCountBefore,
+    'API send_message must not click or switch the active DOM conversation',
+  );
+
   await window.webContents.executeJavaScript(`
     document.body.dataset.buyerBVersion = '2';
     document.querySelector('#conversation-b .bottom-message').textContent = 'Follow-up message';
@@ -435,6 +948,15 @@ app.whenReady().then(async () => {
     diagnosticStages.includes('switch_verification_succeeded'),
     'a verified unread switch must be logged',
   );
+  const apiShadow = messages.find((item) => (
+    item.type === 'diagnostic'
+    && item.stage === 'api_shadow_snapshot'
+    && item.details?.endpoint === 'latest_conversations'
+  ));
+  assert.equal(apiShadow?.details?.shop_name, 'API Test store');
+  assert.equal(apiShadow?.details?.conversation_count, 1);
+  assert.equal(apiShadow?.details?.has_anti_content_header, true);
+  assert.equal(apiShadow?.details?.has_anti_content_body, true);
 
   const sendRequestId = 'adapter-smoke-send-message';
   window.webContents.send('pdd-adapter:command', {

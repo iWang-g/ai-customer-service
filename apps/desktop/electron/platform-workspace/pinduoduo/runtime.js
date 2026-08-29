@@ -201,6 +201,26 @@ export class PddCollectionRuntime {
         });
       }
 
+      if (conversation.customer_products) {
+        const productsPayload = conversation.customer_products;
+        const productsDedup = `pinduoduo:${platformAccountId}:${externalConversationId}:products:${digest(compact(productsPayload)).slice(0, 32)}`;
+        emittedCandidates += 1;
+        this.#emitOnce(productsDedup, {
+          event_id: `pdd_${digest(productsDedup)}`,
+          dedup_key: productsDedup,
+          event_type: 'customer_products_snapshot',
+          platform_code: 'pinduoduo',
+          platform_account_id: platformAccountId,
+          conversation_external_id: externalConversationId,
+          received_at: productsPayload.observed_at || snapshot.observed_at,
+          payload_json: {
+            customer_key: `conversation:${externalConversationId}`,
+            customer_name: conversation.customer_name,
+            ...productsPayload,
+          },
+        });
+      }
+
       this.#diagnostic('runtime_conversation_snapshot_expanded', {
         snapshot_id: snapshot.snapshot_id || null,
         conversation_external_id: externalConversationId,
@@ -305,6 +325,11 @@ export class PddCollectionRuntime {
         order_collection_status: event.payload_json?.collection_status || null,
         order_collection_error: event.payload_json?.error || null,
         order_count: Array.isArray(event.payload_json?.orders) ? event.payload_json.orders.length : 0,
+      } : {}),
+      ...(event.event_type === 'customer_products_snapshot' ? {
+        product_collection_status: event.payload_json?.collection_status || null,
+        product_collection_error: event.payload_json?.error || null,
+        product_count: Array.isArray(event.payload_json?.products) ? event.payload_json.products.length : 0,
       } : {}),
     });
     this.enqueueEvent(event);

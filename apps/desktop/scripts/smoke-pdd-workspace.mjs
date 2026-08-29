@@ -126,6 +126,18 @@ async function runSmokeTest() {
   await manager.restoreAccount(accountB.id);
   assert.equal(manager.getState().accounts.length, 2);
 
+  await manager.addAccount();
+  const accountC = registry.list(smokeUserId).find((account) =>
+    account.id !== accountA.id && account.id !== accountB.id
+  );
+  assert.ok(accountC);
+  await waitFor(() => manager.getState().accounts.length === 3);
+  await manager.removeAccount(accountC.id, true);
+  state = manager.getState();
+  assert.equal(state.accounts.length, 2);
+  assert.equal(state.archivedAccounts.length, 0);
+  assert.equal(registry.get(smokeUserId, accountC.id), null);
+
   await manager.closeForLogout();
 
   const restoredRegistry = new PddAccountRegistry(userDataPath);

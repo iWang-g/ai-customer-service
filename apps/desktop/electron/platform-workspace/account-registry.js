@@ -10,6 +10,11 @@ function normalizeAccount(account) {
     platformAccountId: account.platformAccountId || null,
     externalAccountId: account.externalAccountId || null,
     platformAccountName: account.platformAccountName || null,
+    platformAccountLogoUrl: account.platformAccountLogoUrl || null,
+    platformAccountServiceUsername: account.platformAccountServiceUsername || null,
+    platformAccountCsId: account.platformAccountCsId || null,
+    platformAccountCsUid: account.platformAccountCsUid || null,
+    platformAccountIsMallOwner: account.platformAccountIsMallOwner === true,
     loginStatus: account.loginStatus || (account.paused ? 'paused' : 'unknown'),
   };
 }
@@ -78,6 +83,11 @@ export class PddAccountRegistry {
       platformAccountId: null,
       externalAccountId: null,
       platformAccountName: null,
+      platformAccountLogoUrl: null,
+      platformAccountServiceUsername: null,
+      platformAccountCsId: null,
+      platformAccountCsUid: null,
+      platformAccountIsMallOwner: false,
       loginStatus: 'unknown',
       archivedAt: null,
       createdAt: now,
@@ -99,6 +109,11 @@ export class PddAccountRegistry {
     if (updates.platformAccountId !== undefined) account.platformAccountId = updates.platformAccountId;
     if (updates.externalAccountId !== undefined) account.externalAccountId = updates.externalAccountId;
     if (updates.platformAccountName !== undefined) account.platformAccountName = updates.platformAccountName;
+    if (updates.platformAccountLogoUrl !== undefined) account.platformAccountLogoUrl = updates.platformAccountLogoUrl;
+    if (updates.platformAccountServiceUsername !== undefined) account.platformAccountServiceUsername = updates.platformAccountServiceUsername;
+    if (updates.platformAccountCsId !== undefined) account.platformAccountCsId = updates.platformAccountCsId;
+    if (updates.platformAccountCsUid !== undefined) account.platformAccountCsUid = updates.platformAccountCsUid;
+    if (updates.platformAccountIsMallOwner !== undefined) account.platformAccountIsMallOwner = updates.platformAccountIsMallOwner === true;
     if (updates.loginStatus !== undefined) account.loginStatus = updates.loginStatus;
     account.updatedAt = new Date().toISOString();
     this.#save();

@@ -65,10 +65,42 @@ function cleanConversation(conversation) {
     avatar_url: cleanText(conversation.avatar_url, 1000),
     active: Boolean(conversation.active),
     customer_orders: cleanOrdersSnapshot(conversation.customer_orders),
+    customer_products: cleanProductsSnapshot(conversation.customer_products),
     snapshot_messages: snapshotMessages?.map((message, domSequence) => ({
       ...message,
       dom_sequence: domSequence,
     })) || null,
+  };
+}
+
+function cleanProductsSnapshot(value) {
+  if (!value || typeof value !== 'object') return null;
+  const allowed = ['success', 'empty', 'unavailable'];
+  const collectionStatus = allowed.includes(value.collection_status)
+    ? value.collection_status
+    : 'unavailable';
+  return {
+    collection_status: collectionStatus,
+    observed_at: cleanText(value.observed_at, 64),
+    products: Array.isArray(value.products) ? value.products.slice(0, 100).map((product) => ({
+      product_id: cleanId(product?.product_id ?? product?.platform_product_id),
+      title: cleanText(product?.title, 1000),
+      image_url: cleanText(product?.image_url, 8192),
+      link_url: cleanText(product?.link_url, 8192),
+      price: Number.isFinite(product?.price) ? product.price : null,
+      price_label: cleanText(product?.price_label, 64),
+      quantity: Number.isFinite(product?.quantity) ? product.quantity : null,
+      sold_quantity: Number.isFinite(product?.sold_quantity) ? product.sold_quantity : null,
+      sold_quantity_30d: Number.isFinite(product?.sold_quantity_30d) ? product.sold_quantity_30d : null,
+      source: cleanText(product?.source, 64),
+      raw_payload: product?.raw_payload && typeof product.raw_payload === 'object'
+        ? product.raw_payload
+        : {},
+    })).filter((product) => product.product_id) : [],
+    page_summary: value.page_summary && typeof value.page_summary === 'object'
+      ? value.page_summary
+      : {},
+    error: cleanText(value.error, 256),
   };
 }
 
@@ -116,7 +148,18 @@ export function validateAdapterPayload(payload) {
   if (payload.type === 'identity') {
     const externalAccountId = cleanId(payload.external_account_id);
     const accountName = cleanText(payload.account_name, 128);
-    const accountNameSource = ['dom', 'document_title'].includes(payload.account_name_source)
+    const logoUrl = cleanText(payload.logo_url, 1000);
+    const serviceUsername = cleanText(payload.service_username, 128);
+    const csId = cleanText(payload.cs_id, 128);
+    const csUid = cleanText(payload.cs_uid, 256);
+    const accountNameSource = [
+      'dom',
+      'document_title',
+      'pdd_api_latest_conversations',
+      'pdd_api_custom_service_info',
+      'pdd_api_userinfo_realtime',
+      'pdd_api_shop_info',
+    ].includes(payload.account_name_source)
       ? payload.account_name_source
       : null;
     if (!externalAccountId && !accountName) return null;
@@ -125,6 +168,11 @@ export function validateAdapterPayload(payload) {
       type: 'identity',
       external_account_id: externalAccountId,
       account_name: accountName,
+      logo_url: logoUrl,
+      service_username: serviceUsername,
+      cs_id: csId,
+      cs_uid: csUid,
+      is_mall_owner: payload.is_mall_owner === true,
       account_name_source: accountNameSource,
       observed_at: observedAt,
     };
