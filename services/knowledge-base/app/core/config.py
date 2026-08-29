@@ -13,6 +13,17 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", alias="KB_HOST")
     port: int = Field(default=8010, alias="KB_PORT")
     log_level: str = Field(default="INFO", alias="KB_LOG_LEVEL")
+    embedding_enabled: bool = Field(default=True, alias="KB_EMBEDDING_ENABLED")
+    embedding_provider: str = Field(default="fastembed", alias="KB_EMBEDDING_PROVIDER")
+    embedding_model: str = Field(default="BAAI/bge-small-zh-v1.5", alias="KB_EMBEDDING_MODEL")
+    embedding_cache_path: str = Field(default="./data/models", alias="KB_EMBEDDING_CACHE_PATH")
+    embedding_local_files_only: bool = Field(default=True, alias="KB_EMBEDDING_LOCAL_FILES_ONLY")
+    embedding_batch_size: int = Field(default=16, ge=1, le=128, alias="KB_EMBEDDING_BATCH_SIZE")
+    vector_search_enabled: bool = Field(default=True, alias="KB_VECTOR_SEARCH_ENABLED")
+    vector_min_score: float = Field(default=0.5, ge=-1.0, le=1.0, alias="KB_VECTOR_MIN_SCORE")
+    vector_candidate_limit: int = Field(default=80, ge=1, le=1000, alias="KB_VECTOR_CANDIDATE_LIMIT")
+    hybrid_fts_limit: int = Field(default=80, ge=1, le=1000, alias="KB_HYBRID_FTS_LIMIT")
+    hybrid_rrf_k: int = Field(default=60, ge=1, le=1000, alias="KB_HYBRID_RRF_K")
     jwt_secret_key: str = Field(
         default="development-only-secret-change-in-production",
         alias="JWT_SECRET_KEY",

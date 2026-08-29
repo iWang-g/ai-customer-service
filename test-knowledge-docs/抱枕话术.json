@@ -1,0 +1,187 @@
+{
+    "success": true,
+    "errorCode": 1000000,
+    "errorMsg": null,
+    "result": {
+        "groupList": [
+            {
+                "id": 42825450,
+                "groupName": "欢迎"
+            },
+            {
+                "id": 42828943,
+                "groupName": "定制流程"
+            },
+            {
+                "id": 42831300,
+                "groupName": "定制需求"
+            },
+            {
+                "id": 42832989,
+                "groupName": "双面不一样的图案吗"
+            },
+            {
+                "id": 42833839,
+                "groupName": "尺寸 & 面料问题"
+            },
+            {
+                "id": 42834189,
+                "groupName": "是枕套 + 枕芯"
+            },
+            {
+                "id": 42834225,
+                "groupName": "尺寸会不会有误差"
+            },
+            {
+                "id": 42834257,
+                "groupName": "抱枕怎么清洗"
+            },
+            {
+                "id": 42834883,
+                "groupName": "印花会不会掉色、缩水"
+            },
+            {
+                "id": 42834926,
+                "groupName": "图片会不会有色差？"
+            },
+            {
+                "id": 42835045,
+                "groupName": "收到有线头"
+            },
+            {
+                "id": 42835147,
+                "groupName": "多久可以发货"
+            },
+            {
+                "id": 42835497,
+                "groupName": "售后"
+            },
+            {
+                "id": 42835562,
+                "groupName": "催单安抚"
+            }
+        ],
+        "phraseList": [
+            {
+                "id": 42828941,
+                "groupId": 42825450,
+                "groupName": null,
+                "content": "亲亲下午好！定制抱枕桃皮绒面料，双面同款图案，多款尺寸可选，有任何疑问都可以随时问我哈！",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42831299,
+                "groupId": 42828943,
+                "groupName": null,
+                "content": "亲亲定制很简单哦～您把想要印制的图片发给客服，再选择好抱枕尺寸，我们确认图片没问题就可以安排制作啦。动漫图片、个人照片、手绘图片、企业 logo 都可以定制",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42831302,
+                "groupId": 42831300,
+                "groupName": null,
+                "content": "亲亲建议您发送高清原图哦！图片清晰度越高，打印出来抱枕效果越好，如果图片分辨率过低，印花会出现模糊，我们会提前跟您沟通确认。",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42832993,
+                "groupId": 42832989,
+                "groupName": null,
+                "content": "亲亲，默认是正反面相同图案哦，如果您需要双面不同图案，可以联系客服补差价，拍下后把正反面两张图都发给我们哈。",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42833840,
+                "groupId": 42833839,
+                "groupName": null,
+                "content": "：我们可选尺寸（正方形）：\n35*35CM｜40*40CM｜45*45CM｜50*50CM｜60*60CM，您可以按需挑选哈。",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42833841,
+                "groupId": 42833839,
+                "groupName": null,
+                "content": "面料是桃皮绒，柔软亲肤；填充物甄选 PP 棉，柔软饱满舒适。枕套可以拆下来清洗，枕芯没办法水洗哦。",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42834193,
+                "groupId": 42834189,
+                "groupName": null,
+                "content": "亲亲拍下默认是【枕套 + 枕芯整套】，如果您只需要单独枕套，可以和客服说明，给您修改价格",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42834245,
+                "groupId": 42834225,
+                "groupName": null,
+                "content": "抱枕属于手工裁剪缝制，存在 1‑2cm 以内误差属于正常现象，不属于质量问题，不影响正常使用，请您知悉～",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42834300,
+                "groupId": 42834257,
+                "groupName": null,
+                "content": "亲亲枕套可以拆开单独清洗，枕芯不可以水洗哦～清洗枕套建议 30℃以下温水弱洗，可以中温熨烫；禁止漂白、干洗，洗完悬挂晾干就可以啦",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42834884,
+                "groupId": 42834883,
+                "groupName": null,
+                "content": "亲亲印花水洗不容易掉色，面料不易缩水，正常清洗保养就可以放心使用哈",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42834928,
+                "groupId": 42834926,
+                "groupName": null,
+                "content": "亲亲不同手机屏幕、室内灯光环境不一样，图片显示会存在轻微色差，网购无法完全避免，抱枕成品颜色以收到实物为准，介意色差请谨慎下单哦。",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42835097,
+                "groupId": 42835045,
+                "groupName": null,
+                "content": "抱枕手工缝制，少量线头属于正常现象，不属于质量问题，剪掉线头即可正常使用，请多多谅解哈。",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42835494,
+                "groupId": 42835147,
+                "groupName": null,
+                "content": "定制款需要现做，图片确认无误后一般 3‑5个工作日发货，定制商品不支持极速退款，拍下后无法随意更改图案哦。",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42835560,
+                "groupId": 42835497,
+                "groupName": null,
+                "content": "亲亲收到商品后如有印花错误、破损等质量问题，请在 24 小时内拍下清晰照片发给客服，我们核实后为您处理售后方案",
+                "quickKey": "",
+                "errorMsg": null
+            },
+            {
+                "id": 42835563,
+                "groupId": 42835562,
+                "groupName": null,
+                "content": "这边已经帮您催促仓库优先安排制作啦，做好第一时间发货，有物流更新会同步通知您～",
+                "quickKey": "",
+                "errorMsg": null
+            }
+        ]
+    }
+}

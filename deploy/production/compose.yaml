@@ -26,6 +26,17 @@ services:
       KB_ASSET_PATH: /data/assets
       KB_LOG_LEVEL: ${LOG_LEVEL:-INFO}
       KB_CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-null}
+      KB_EMBEDDING_ENABLED: ${KB_EMBEDDING_ENABLED:-true}
+      KB_EMBEDDING_PROVIDER: ${KB_EMBEDDING_PROVIDER:-fastembed}
+      KB_EMBEDDING_MODEL: ${KB_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+      KB_EMBEDDING_CACHE_PATH: /data/models
+      KB_EMBEDDING_LOCAL_FILES_ONLY: ${KB_EMBEDDING_LOCAL_FILES_ONLY:-true}
+      KB_EMBEDDING_BATCH_SIZE: ${KB_EMBEDDING_BATCH_SIZE:-16}
+      KB_VECTOR_SEARCH_ENABLED: ${KB_VECTOR_SEARCH_ENABLED:-true}
+      KB_VECTOR_MIN_SCORE: ${KB_VECTOR_MIN_SCORE:-0.5}
+      KB_VECTOR_CANDIDATE_LIMIT: ${KB_VECTOR_CANDIDATE_LIMIT:-80}
+      KB_HYBRID_FTS_LIMIT: ${KB_HYBRID_FTS_LIMIT:-80}
+      KB_HYBRID_RRF_K: ${KB_HYBRID_RRF_K:-60}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
       KB_LEGACY_OWNER_USER_ID: ${KB_LEGACY_OWNER_USER_ID:-}
     ports:
@@ -38,7 +49,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
-    mem_limit: 1g
+    mem_limit: 1536m
 
   ai-reply:
     <<: *service-defaults

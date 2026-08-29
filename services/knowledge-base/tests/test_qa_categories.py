@@ -90,6 +90,19 @@ class QaCategoryTests(unittest.TestCase):
         self.assertEqual(counted["物流问题"], 1)
         self.assertEqual(counted["常见问题"], 1)
 
+    def test_qa_keywords_are_deserialized_as_list(self) -> None:
+        create_qa_entry(self.user_id, self.base["id"], QaEntryCreate(
+            category="Common",
+            question="Is it available?",
+            keywords=["stock", "available"],
+            answer="Yes.",
+        ))
+
+        page = list_qa_entries(self.user_id, self.base["id"])
+
+        self.assertEqual(page["total"], 1)
+        self.assertEqual(page["items"][0]["keywords"], ["stock", "available"])
+
 
 if __name__ == "__main__":
     unittest.main()

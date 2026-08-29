@@ -56,6 +56,11 @@ def dumps(value: Any) -> str:
 def loads(value: str | None, default: Any) -> Any:
     if not value:
         return default
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return default
+    return default if parsed is None else parsed
 
 
 def fts_terms(value: str) -> str:
@@ -72,10 +77,6 @@ def has_chunk_fts(db: sqlite3.Connection) -> bool:
     return db.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_chunks_fts'"
     ).fetchone() is not None
-    try:
-        return json.loads(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def init_db() -> None:
@@ -149,10 +150,21 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(document_id, chunk_index)
             );
+            CREATE TABLE IF NOT EXISTS document_chunk_embeddings (
+                chunk_id TEXT NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chunk_id, model)
+            );
             CREATE INDEX IF NOT EXISTS ix_qa_entries_base ON qa_entries(base_id, enabled);
             CREATE INDEX IF NOT EXISTS ix_qa_categories_base ON qa_categories(base_id, sort_order);
             CREATE INDEX IF NOT EXISTS ix_documents_base ON documents(base_id, status);
             CREATE INDEX IF NOT EXISTS ix_document_chunks_base ON document_chunks(base_id, enabled);
+            CREATE INDEX IF NOT EXISTS ix_document_chunk_embeddings_model ON document_chunk_embeddings(model);
             """
         )
         existing = {row[1] for row in db.execute("PRAGMA table_info(documents)").fetchall()}

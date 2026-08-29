@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import mimetypes
 import re
 import sqlite3
@@ -15,7 +16,11 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from app.db import DEFAULT_QA_CATEGORIES, connect, dumps, fts_terms, has_chunk_fts, loads, utc_now
 from app.core.config import get_settings
 from app.document_parser import CHUNK_STRATEGY_VERSION, ParsedDocument, TextChunk, chunk_text, parse_document
+from app.embedding import cosine_similarity, embed_texts, pack_vector, unpack_vector
 from app.schemas import DocumentCreate, DocumentSearchRequest, KnowledgeBaseCreate, KnowledgeBaseUpdate, QaCategoryCreate, QaEntryCreate, QaMatchRequest
+
+
+logger = logging.getLogger(__name__)
 
 
 def new_id(prefix: str) -> str:
@@ -459,6 +464,7 @@ def _persist_document(
             (base_id, content_hash),
         ).fetchone()
         if existing:
+            _ensure_document_embeddings(db, existing["id"])
             return {**document_dict(existing), "duplicate": True}
         doc_id = new_id("doc")
         chunks = chunk_text(content)
@@ -469,6 +475,7 @@ def _persist_document(
             (doc_id, base_id, title, content, "ready", original_filename, file_type, file_size, content_hash, "", len(chunks), CHUNK_STRATEGY_VERSION, now, now),
         )
         _insert_document_chunks(db, doc_id, base_id, title, chunks, now)
+        _ensure_document_embeddings(db, doc_id)
         db.execute("UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", (now, base_id))
         row = db.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
     return {**document_dict(row), "duplicate": False}
@@ -599,6 +606,11 @@ def delete_document(user_id: str, document_id: str) -> dict[str, Any]:
         db.execute("UPDATE documents SET status = 'deleted', updated_at = ? WHERE id = ?", (now, document_id))
         if has_chunk_fts(db):
             db.execute("DELETE FROM document_chunks_fts WHERE document_id = ?", (document_id,))
+        db.execute(
+            """DELETE FROM document_chunk_embeddings
+            WHERE chunk_id IN (SELECT id FROM document_chunks WHERE document_id = ?)""",
+            (document_id,),
+        )
         db.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
         db.execute("UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", (now, row["base_id"]))
     return document_dict(row)
@@ -652,8 +664,14 @@ def reprocess_document(user_id: str, document_id: str) -> dict[str, Any]:
         chunks = chunk_text(row["content"])
         if has_chunk_fts(db):
             db.execute("DELETE FROM document_chunks_fts WHERE document_id = ?", (document_id,))
+        db.execute(
+            """DELETE FROM document_chunk_embeddings
+            WHERE chunk_id IN (SELECT id FROM document_chunks WHERE document_id = ?)""",
+            (document_id,),
+        )
         db.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
         _insert_document_chunks(db, row["id"], row["base_id"], row["title"], chunks, now)
+        _ensure_document_embeddings(db, document_id)
         db.execute(
             """UPDATE documents SET chunk_count = ?, chunk_strategy_version = ?,
                error_message = '', status = 'ready', updated_at = ? WHERE id = ?""",
@@ -662,6 +680,113 @@ def reprocess_document(user_id: str, document_id: str) -> dict[str, Any]:
         db.execute("UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", (now, row["base_id"]))
         updated = db.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
     return document_dict(updated)
+
+
+def _embedding_content(row: Any) -> str:
+    return "\n".join(
+        item
+        for item in (
+            str(row["source_title"] or "").strip() if "source_title" in row.keys() else "",
+            str(row["title_path"] or "").strip(),
+            str(row["content"] or "").strip(),
+        )
+        if item
+    )
+
+
+def _embedding_content_hash(row: Any) -> str:
+    return hashlib.sha256(_embedding_content(row).encode("utf-8")).hexdigest()
+
+
+def _ensure_document_embeddings(db: Any, document_id: str) -> None:
+    settings = get_settings()
+    if not settings.embedding_enabled or not settings.vector_search_enabled:
+        return
+    rows = db.execute(
+        """SELECT c.*, d.title AS source_title
+        FROM document_chunks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE c.document_id = ? AND c.enabled = 1 AND d.status = 'ready'
+        ORDER BY c.chunk_index""",
+        (document_id,),
+    ).fetchall()
+    _ensure_chunk_embeddings(db, rows)
+
+
+def _ensure_chunk_embeddings(db: Any, rows: list[Any]) -> None:
+    settings = get_settings()
+    if not settings.embedding_enabled or not settings.vector_search_enabled or not rows:
+        return
+    model = settings.embedding_model
+    missing: list[Any] = []
+    hashes: dict[str, str] = {}
+    for row in rows:
+        content_hash = _embedding_content_hash(row)
+        hashes[row["id"]] = content_hash
+        existing = db.execute(
+            """SELECT 1 FROM document_chunk_embeddings
+            WHERE chunk_id = ? AND model = ? AND content_hash = ?""",
+            (row["id"], model, content_hash),
+        ).fetchone()
+        if not existing:
+            missing.append(row)
+    if not missing:
+        return
+    vectors = embed_texts([_embedding_content(row) for row in missing])
+    if not vectors:
+        return
+    if len(vectors) != len(missing):
+        logger.warning(
+            "document chunk embedding skipped expected=%d actual=%d",
+            len(missing),
+            len(vectors),
+        )
+        return
+    now = utc_now()
+    for row, vector in zip(missing, vectors):
+        if not vector:
+            continue
+        db.execute(
+            """INSERT OR REPLACE INTO document_chunk_embeddings
+            (chunk_id,model,dim,vector,content_hash,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (row["id"], model, len(vector), pack_vector(vector), hashes[row["id"]], now, now),
+        )
+
+
+def rebuild_document_embeddings(base_id: str = "", document_id: str = "") -> dict[str, Any]:
+    settings = get_settings()
+    with connect() as db:
+        conditions = ["status = 'ready'"]
+        params: list[Any] = []
+        if base_id:
+            conditions.append("base_id = ?")
+            params.append(base_id)
+        if document_id:
+            conditions.append("id = ?")
+            params.append(document_id)
+        rows = db.execute(
+            f"SELECT id FROM documents WHERE {' AND '.join(conditions)} ORDER BY created_at",
+            params,
+        ).fetchall()
+        before = int(db.execute(
+            "SELECT COUNT(*) FROM document_chunk_embeddings WHERE model = ?",
+            (settings.embedding_model,),
+        ).fetchone()[0])
+        for row in rows:
+            _ensure_document_embeddings(db, row["id"])
+        after = int(db.execute(
+            "SELECT COUNT(*) FROM document_chunk_embeddings WHERE model = ?",
+            (settings.embedding_model,),
+        ).fetchone()[0])
+    return {
+        "embedding_enabled": bool(settings.embedding_enabled and settings.vector_search_enabled),
+        "embedding_model": settings.embedding_model,
+        "document_count": len(rows),
+        "before_count": before,
+        "after_count": after,
+        "created_count": max(0, after - before),
+    }
 
 
 def _keyword_candidates(db: Any, user_id: str, payload: DocumentSearchRequest) -> list[dict[str, Any]]:
@@ -695,6 +820,7 @@ def _fts_candidates(db: Any, user_id: str, payload: DocumentSearchRequest) -> li
     tokens = fts_terms(payload.query).split()
     if not tokens or not has_chunk_fts(db):
         return []
+    settings = get_settings()
     match_query = " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens[:64])
     conditions = ["c.enabled = 1", "d.status = 'ready'", "(b.user_id = ? OR b.is_public = 1)"]
     parameters: list[Any] = [match_query, user_id]
@@ -712,9 +838,95 @@ def _fts_candidates(db: Any, user_id: str, payload: DocumentSearchRequest) -> li
         WHERE document_chunks_fts MATCH ? AND {' AND '.join(conditions)}
         ORDER BY bm25_score ASC
         LIMIT ?""",
-        (*parameters, max(payload.top_k * 6, 20)),
+        (*parameters, max(settings.hybrid_fts_limit, payload.top_k)),
     ).fetchall()
     return [{"row": row, "rank": abs(float(row["bm25_score"]))} for row in rows]
+
+
+def _vector_candidates(db: Any, user_id: str, payload: DocumentSearchRequest) -> list[dict[str, Any]]:
+    settings = get_settings()
+    if not settings.embedding_enabled or not settings.vector_search_enabled:
+        return []
+    query_vectors = embed_texts([payload.query])
+    if not query_vectors:
+        return []
+    query_vector = query_vectors[0]
+    chunk_conditions = [
+        "c.enabled = 1",
+        "d.status = 'ready'",
+        "(b.user_id = ? OR b.is_public = 1)",
+    ]
+    chunk_params: list[Any] = [user_id]
+    if payload.base_ids:
+        placeholders = ",".join("?" for _ in payload.base_ids)
+        chunk_conditions.append(f"c.base_id IN ({placeholders})")
+        chunk_params.extend(payload.base_ids)
+    chunk_rows = db.execute(
+        f"""SELECT c.*, d.title AS source_title
+        FROM document_chunks c
+        JOIN documents d ON d.id = c.document_id
+        JOIN knowledge_bases b ON b.id = c.base_id
+        WHERE {' AND '.join(chunk_conditions)}""",
+        chunk_params,
+    ).fetchall()
+    _ensure_chunk_embeddings(db, chunk_rows)
+
+    embedding_conditions = [*chunk_conditions, "e.model = ?"]
+    embedding_params: list[Any] = [*chunk_params, settings.embedding_model]
+    rows = db.execute(
+        f"""SELECT c.*, d.title AS source_title, e.vector
+        FROM document_chunk_embeddings e
+        JOIN document_chunks c ON c.id = e.chunk_id
+        JOIN documents d ON d.id = c.document_id
+        JOIN knowledge_bases b ON b.id = c.base_id
+        WHERE {' AND '.join(embedding_conditions)}""",
+        embedding_params,
+    ).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        score = cosine_similarity(query_vector, unpack_vector(row["vector"]))
+        if score >= settings.vector_min_score:
+            results.append({"row": row, "rank": float(score)})
+    results.sort(key=lambda item: item["rank"], reverse=True)
+    return results[: settings.vector_candidate_limit]
+
+
+def _candidate_key(candidate: dict[str, Any]) -> str:
+    return str(candidate["row"]["id"])
+
+
+def _rrf_candidates(
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    settings = get_settings()
+    by_id: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
+    ranks: dict[str, dict[str, int]] = {}
+    for label, candidates in (("fts", primary), ("vector", secondary)):
+        for index, candidate in enumerate(candidates, start=1):
+            key = _candidate_key(candidate)
+            by_id.setdefault(key, candidate)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (settings.hybrid_rrf_k + index)
+            ranks.setdefault(key, {})[label] = index
+    merged = [
+        {
+            "row": by_id[key]["row"],
+            "rank": score,
+            "source_rank": by_id[key]["rank"],
+            "ranks": ranks.get(key, {}),
+        }
+        for key, score in scores.items()
+    ]
+    merged.sort(
+        key=lambda item: (
+            item["rank"],
+            1 if "vector" in item["ranks"] else 0,
+            float(item.get("source_rank") or 0),
+        ),
+        reverse=True,
+    )
+    return merged
 
 
 def _expanded_snippet(db: Any, row: Any, reserved_chunk_ids: set[str]) -> tuple[str, list[str]]:
@@ -751,11 +963,29 @@ def _expanded_snippet(db: Any, row: Any, reserved_chunk_ids: set[str]) -> tuple[
 
 def search_documents(user_id: str, payload: DocumentSearchRequest) -> dict[str, Any]:
     with connect() as db:
+        settings = get_settings()
         mode = "fts5_bm25"
+        fts_candidates: list[dict[str, Any]] = []
+        vector_candidates: list[dict[str, Any]] = []
         try:
-            candidates = _fts_candidates(db, user_id, payload)
+            fts_candidates = _fts_candidates(db, user_id, payload)
         except sqlite3.OperationalError:
-            candidates = []
+            fts_candidates = []
+        if settings.embedding_enabled and settings.vector_search_enabled:
+            try:
+                vector_candidates = _vector_candidates(db, user_id, payload)
+            except (sqlite3.OperationalError, ValueError):
+                vector_candidates = []
+
+        if fts_candidates and vector_candidates:
+            mode = "hybrid"
+            candidates = _rrf_candidates(fts_candidates, vector_candidates)
+        elif vector_candidates:
+            mode = "vector"
+            candidates = vector_candidates
+        else:
+            candidates = fts_candidates
+
         if not candidates:
             mode = "keyword"
             candidates = _keyword_candidates(db, user_id, payload)
@@ -788,6 +1018,10 @@ def search_documents(user_id: str, payload: DocumentSearchRequest) -> dict[str, 
         "metadata": {
             "mode": mode,
             "candidate_count": len(candidates),
+            "fts_candidate_count": len(fts_candidates),
+            "vector_candidate_count": len(vector_candidates),
+            "embedding_enabled": bool(settings.embedding_enabled and settings.vector_search_enabled),
+            "embedding_model": settings.embedding_model,
             "count": len(results),
             "chunk_strategy_version": CHUNK_STRATEGY_VERSION,
         },
