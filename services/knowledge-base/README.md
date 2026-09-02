@@ -4,7 +4,7 @@
 
 ```powershell
 python -m pip install -e services/knowledge-base
-python -m uvicorn app.main:app --app-dir services/knowledge-base --host 127.0.0.1 --port 8010
+pnpm dev:kb
 ```
 
 健康检查：`GET http://127.0.0.1:8010/healthz`
@@ -12,6 +12,13 @@ python -m uvicorn app.main:app --app-dir services/knowledge-base --host 127.0.0.
 当前提供：知识库 CRUD、QA 条目 CRUD、QA 精确/关键词匹配、产品文档写入、SQLite FTS5/BM25 检索，以及可选的本地 embedding 语义检索。当前是本地 MVP，后续可替换存储和检索实现，只要保持 HTTP 契约不变。
 
 产品文档语义检索默认使用 `fastembed` 和 `BAAI/bge-small-zh-v1.5`。服务会从 `KB_EMBEDDING_CACHE_PATH` 加载模型，默认 `KB_EMBEDDING_LOCAL_FILES_ONLY=true`，模型不存在或加载失败时自动降级到 FTS5/BM25 或关键词检索，不阻断服务启动和自动回复链路。
+
+仓库根目录的 `pnpm dev:kb` 会优先使用 `.venv-kb-embedding`，确保本地开发时能加载 `fastembed`。首次启用或导入历史文档后，可执行：
+
+```powershell
+$env:PYTHONPATH='services/knowledge-base'
+.\.venv-kb-embedding\Scripts\python.exe -m app.scripts.rebuild_embeddings
+```
 
 除 `/healthz` 外，所有接口都要求携带 Business API 签发的 Bearer access token。Knowledge Base 的 `JWT_SECRET_KEY` 必须与 Business API 保持一致，所有知识库、QA、文档、分块和图片资源均按 token 中的 `sub` 用户 ID 隔离。
 

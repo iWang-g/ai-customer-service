@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "concurrently -k \"pnpm dev:api\" \"pnpm dev:kb\" \"pnpm dev:ai\" \"pnpm dev:desktop\"",
     "dev:api": "cross-env DATABASE_URL=sqlite:///./services/business-api/data/business-api.db KNOWLEDGE_BASE_URL=http://127.0.0.1:8010 python -m uvicorn app.main:app --app-dir services/business-api --host 127.0.0.1 --port 8001",
-    "dev:kb": "cross-env KB_DATABASE_PATH=./data/knowledge-base.db python -m uvicorn app.main:app --app-dir services/knowledge-base --host 127.0.0.1 --port 8010",
+    "dev:kb": "node scripts/dev_knowledge_base.mjs",
     "dev:ai": "cross-env KNOWLEDGE_BASE_URL=http://127.0.0.1:8010 python -m uvicorn app.main:app --app-dir services/ai-reply --host 127.0.0.1 --port 8020",
     "dev:desktop": "pnpm --dir apps/desktop dev",
     "build": "pnpm --dir apps/desktop build",
