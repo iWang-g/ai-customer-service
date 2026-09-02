@@ -27,3 +27,17 @@ services/release-server-*.tar.gz
 *.pyc
 *.db
 ~$*
+
+# Local Qianniu capture/probe artifacts.
+/.tmp-qn-webui/
+/qn-*.csv
+/qn-*.ndjson
+/qn-*.json
+/qn-*.txt
+/qn-*.log
+/qn-*.js
+/qnt.ps1
+/Analyze-QnCapture.ps1
+/proxifier-qn-observe-direct.ppx
+/千牛抓包分析记录.md
+/test-knowledge-docs/* - 副本.docx
