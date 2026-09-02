@@ -75,7 +75,8 @@ function cn(...inputs: ClassValue[]) {
 const DEFAULT_CONTEXT_LENGTH = 10;
 const LEGACY_DEFAULT_ADVANCED_INSTRUCTION = '善用颜文字';
 const DEFAULT_SENSITIVE_WORD_REPLY_TEXT = '亲亲，已收到您的消息，正在为您核实，请稍等~';
-const DEFAULT_ENTRY_WELCOME_TEXT = '亲亲，我是本店小助理，发送“转人工”可为您转接客服。';
+const DEFAULT_ENTRY_WELCOME_TEXT = '亲亲，我是本店AI客服，有什么需要了解的可以咨询我。如果需要人工回复的话可以发送“转人工”~';
+const DEFAULT_PDD_CUSTOM_ORDER_SUPPLEMENT_TEXT = '亲亲，如果您不需要额外定制，默认是按您下单时选择的那款商品图安排制作发货~';
 const DEFAULT_ORDER_FOLLOW_UP_TEXT = '亲亲，现在下单可以享受九五折优惠哦~';
 const DEFAULT_POST_RECEIPT_CARE_TEXT = '亲亲，商品还满意吗？欢迎反馈真实体验，可参与平台评价领奖励活动哦~';
 const DEFAULT_PRODUCT_RECOMMEND_TEXT = '可以看下我们这些款式哦亲亲';
@@ -363,6 +364,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [sensitiveWordReplyText, setSensitiveWordReplyText] = useState(DEFAULT_SENSITIVE_WORD_REPLY_TEXT);
   const [entryWelcomeEnabled, setEntryWelcomeEnabled] = useState(false);
   const [entryWelcomeText, setEntryWelcomeText] = useState(DEFAULT_ENTRY_WELCOME_TEXT);
+  const [pddCustomOrderSupplementEnabled, setPddCustomOrderSupplementEnabled] = useState(true);
+  const [pddCustomOrderSupplementText, setPddCustomOrderSupplementText] = useState(DEFAULT_PDD_CUSTOM_ORDER_SUPPLEMENT_TEXT);
   const [prohibitedContentInstruction, setProhibitedContentInstruction] = useState('');
   const [fallbackReplyText, setFallbackReplyText] = useState('您的问题我将为您接入专业产品客服，请稍后');
   const [fallbackMarkHumanRequired, setFallbackMarkHumanRequired] = useState(false);
@@ -508,6 +511,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     setEntryWelcomeText(typeof config.entry_welcome_text === 'string' && config.entry_welcome_text.trim()
       ? config.entry_welcome_text
       : DEFAULT_ENTRY_WELCOME_TEXT);
+    setPddCustomOrderSupplementEnabled(config.pdd_custom_order_supplement_enabled !== false);
+    setPddCustomOrderSupplementText(typeof config.pdd_custom_order_supplement_text === 'string' && config.pdd_custom_order_supplement_text.trim()
+      ? config.pdd_custom_order_supplement_text
+      : DEFAULT_PDD_CUSTOM_ORDER_SUPPLEMENT_TEXT);
     setProhibitedContentInstruction(typeof config.prohibited_content_instruction === 'string'
       ? config.prohibited_content_instruction
       : '');
@@ -659,6 +666,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         sensitive_word_reply_text: sensitiveWordReplyText.trim() || DEFAULT_SENSITIVE_WORD_REPLY_TEXT,
         entry_welcome_enabled: entryWelcomeEnabled,
         entry_welcome_text: entryWelcomeText.trim() || DEFAULT_ENTRY_WELCOME_TEXT,
+        pdd_custom_order_supplement_enabled: pddCustomOrderSupplementEnabled,
+        pdd_custom_order_supplement_text: pddCustomOrderSupplementText.trim() || DEFAULT_PDD_CUSTOM_ORDER_SUPPLEMENT_TEXT,
         fallback_reply_text: fallbackReplyText.trim(),
         fallback_mark_human_required: fallbackMarkHumanRequired,
         human_handoff_strategy: humanHandoffStrategy,
@@ -1436,6 +1445,29 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                               maxLength={1000}
                               className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
                               placeholder={DEFAULT_ENTRY_WELCOME_TEXT}
+                            />
+                          </div>
+                          <div className="space-y-3 rounded-xl border border-slate-100 bg-slate-50 p-4">
+                            <div className="flex items-center justify-between gap-4">
+                              <div>
+                                <h4 className="text-sm font-bold text-slate-800">拼多多定制提醒场景应答</h4>
+                                <p className="mt-1 text-xs text-slate-400">客户回复主账号定制确认提醒时，优先按该说明组织自动回复。</p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setPddCustomOrderSupplementEnabled((value) => !value)}
+                                className={cn("w-12 h-6 shrink-0 rounded-full relative shadow-inner transition-colors", pddCustomOrderSupplementEnabled ? "bg-indigo-500" : "bg-slate-300")}
+                                title="启用拼多多定制提醒场景应答"
+                              >
+                                <div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full transition-all shadow-sm", pddCustomOrderSupplementEnabled ? "right-1" : "left-1")}></div>
+                              </button>
+                            </div>
+                            <textarea
+                              value={pddCustomOrderSupplementText}
+                              onChange={(event) => setPddCustomOrderSupplementText(event.target.value)}
+                              maxLength={1000}
+                              className="w-full h-24 p-4 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
+                              placeholder={DEFAULT_PDD_CUSTOM_ORDER_SUPPLEMENT_TEXT}
                             />
                           </div>
                         </div>

@@ -23,6 +23,7 @@ from app.models import (
 from app.schemas.automation import ReplyRunRequest
 from app.schemas.message import SendMessageRequest
 from app.services.automation_service import (
+    PDD_CUSTOM_ORDER_SCENE_METADATA_KEY,
     _pending_inbound_reply_tasks,
     _can_refresh_order_context,
     _queue_reply_task,
@@ -323,6 +324,113 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.payload_json["content"], "亲亲，这款商品想了解哪方面呢")
         self.assertFalse(task.payload_json.get("follow_up_products"))
 
+    async def test_pdd_custom_order_scene_is_passed_once_to_auto_reply(self) -> None:
+        self.robot.config_json = {
+            "allow_auto_send": True,
+            "pdd_custom_order_supplement_text": "亲亲，默认按您下单时选择的那款商品图制作发货~",
+        }
+        prompt = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            platform_message_id="main-custom-order-prompt",
+            sender_role="agent",
+            content="你刚刚拼单的商品为定制商品，需要确认定制方案哦~",
+            message_status="sent",
+            conversation_sequence=0,
+            raw_payload={
+                "message_type": "text",
+                "automation_mode": "context",
+                "structured_payload": {"from_csid": "主账号", "from_role": "mall_cs"},
+            },
+        )
+        self.source_message.content = "就直接我拍下的这款照片"
+        self.source_message.conversation_sequence = 1
+        self.db.add_all([self.robot, prompt, self.source_message])
+        self.db.commit()
+        first_result = {
+            "decision": "auto_send",
+            "text": "好的亲亲，默认按您下单时选择的那款商品图制作发货~",
+            "confidence": 1.0,
+            "risk_flags": [],
+            "provider": "test",
+            "trace_id": "trace-pdd-custom-order",
+            "intent": {"intent": "direct_reply"},
+            "action_plan": {"workflow": "pdd_custom_order_confirmation"},
+            "qa_match": None,
+            "retrieval": [],
+            "model_call_details": [],
+            "task_ids": [],
+        }
+
+        with patch(
+            "app.services.automation_service._decide_reply",
+            new=AsyncMock(return_value=first_result),
+        ) as decide:
+            result = await run_reply(
+                self.db,
+                self.user,
+                ReplyRunRequest(
+                    conversation_id=self.conversation.id,
+                    source_message_id=self.source_message.id,
+                    allow_auto_send=True,
+                ),
+            )
+
+        self.assertEqual(result["platform_rule_scene"]["type"], "pdd_custom_order_confirmation")
+        first_call_scene = decide.await_args.kwargs["platform_rule_scene"]
+        self.assertEqual(first_call_scene["prompt_message_id"], prompt.id)
+        self.assertEqual(first_call_scene["supplement_text"], "亲亲，默认按您下单时选择的那款商品图制作发货~")
+        self.db.refresh(self.conversation)
+        self.assertEqual(
+            self.conversation.metadata_json[PDD_CUSTOM_ORDER_SCENE_METADATA_KEY]["status"],
+            "applied",
+        )
+
+        next_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="多久发货",
+            message_status="sent",
+            conversation_sequence=3,
+        )
+        self.conversation.last_message_sequence = 3
+        self.db.add(next_message)
+        self.db.add(self.conversation)
+        self.db.commit()
+        second_result = {
+            "decision": "auto_send",
+            "text": "亲亲，这边会尽快安排制作发货~",
+            "confidence": 0.8,
+            "risk_flags": [],
+            "provider": "test",
+            "trace_id": "trace-normal-after-pdd-custom-order",
+            "intent": {"intent": "normal_question"},
+            "action_plan": {"workflow": "answer_question"},
+            "qa_match": None,
+            "retrieval": [],
+            "model_call_details": [],
+            "task_ids": [],
+        }
+        with patch(
+            "app.services.automation_service._decide_reply",
+            new=AsyncMock(return_value=second_result),
+        ) as second_decide:
+            second = await run_reply(
+                self.db,
+                self.user,
+                ReplyRunRequest(
+                    conversation_id=self.conversation.id,
+                    source_message_id=next_message.id,
+                    allow_auto_send=True,
+                ),
+            )
+
+        self.assertNotIn("platform_rule_scene", second)
+        self.assertIsNone(second_decide.await_args.kwargs["platform_rule_scene"])
+
     async def test_product_title_match_does_not_send_cards_without_ai_recommendation_intent(self) -> None:
         account = PlatformAccount(
             user_id=self.user.id,
@@ -562,6 +670,47 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             "message-new",
             "event-new",
         )
+        self.assertNotIn((self.user.id, self.conversation.id), _pending_inbound_reply_tasks)
+
+    async def test_debounced_inbound_reply_does_not_cancel_started_processing(self) -> None:
+        _pending_inbound_reply_tasks.clear()
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release = asyncio.Event()
+        processed: list[str] = []
+
+        async def process(user_id: str, conversation_id: str, source_message_id: str, source_event_id: str | None) -> None:
+            processed.append(source_message_id)
+            if len(processed) == 1:
+                first_started.set()
+            if len(processed) == 2:
+                second_started.set()
+            await release.wait()
+
+        with patch(
+            "app.services.automation_service.process_inbound_reply",
+            new=AsyncMock(side_effect=process),
+        ):
+            schedule_debounced_inbound_reply(
+                self.user.id,
+                self.conversation.id,
+                "message-started",
+                "event-started",
+                delay_seconds=0.01,
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            schedule_debounced_inbound_reply(
+                self.user.id,
+                self.conversation.id,
+                "message-later",
+                "event-later",
+                delay_seconds=0.01,
+            )
+            await asyncio.wait_for(second_started.wait(), timeout=1)
+            release.set()
+            await asyncio.sleep(0.01)
+
+        self.assertEqual(processed, ["message-started", "message-later"])
         self.assertNotIn((self.user.id, self.conversation.id), _pending_inbound_reply_tasks)
 
     def test_auto_send_idempotency_key_reuses_message_and_task(self) -> None:

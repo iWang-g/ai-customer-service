@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 from time import monotonic
 from typing import Any
+import unicodedata
 
 import httpx
 from fastapi import HTTPException, status
@@ -64,9 +65,15 @@ DEFAULT_SENSITIVE_WORD_REPLY_TEXT = "亲亲，已收到您的消息，正在为�
 DEFAULT_PRODUCT_CARD_ACK_TEXT = "亲亲，关于这款商品有什么想要了解的吗"
 DEFAULT_TRANSFER_CONFIRM_TEXT = "亲亲，为及时给您解答，是否需要转接给其他客服"
 DEFAULT_TRANSFER_ACK_TEXT = "好的，稍等一下"
+DEFAULT_TRANSFER_CANCEL_TEXT = "好的亲亲，有需要随时告诉我"
 TRANSFER_REASON_TEXT = "无原因直接转移"
 AUTO_TRANSFER_METADATA_KEY = "auto_transfer"
 HUMAN_HANDOFF_STRATEGY_TRANSFER = "transfer_conversation"
+PDD_CUSTOM_ORDER_CONFIRMATION_PROMPT = "你刚刚拼单的商品为定制商品，需要确认定制方案哦~"
+DEFAULT_PDD_CUSTOM_ORDER_SUPPLEMENT_TEXT = "亲亲，如果您不需要额外定制，默认是按您下单时选择的那款商品图安排制作发货~"
+PDD_CUSTOM_ORDER_SCENE_METADATA_KEY = "pdd_custom_order_prompt_reply"
+_INVISIBLE_CONTENT_RE = re.compile(r"[\u200b-\u200d\ufeff]")
+_CONTENT_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _active_robot(db: Session, user: User, conversation: Conversation) -> Robot | None:
@@ -121,6 +128,116 @@ def _product_recommendation_config(robot: Robot | None) -> tuple[bool, str]:
 def _product_card_ack_text(robot: Robot | None) -> str:
     text = str(_robot_config(robot).get("product_card_ack_text") or "").strip()
     return text or DEFAULT_PRODUCT_CARD_ACK_TEXT
+
+
+def _pdd_custom_order_supplement_text(robot: Robot | None) -> str:
+    text = str(_robot_config(robot).get("pdd_custom_order_supplement_text") or "").strip()
+    return text or DEFAULT_PDD_CUSTOM_ORDER_SUPPLEMENT_TEXT
+
+
+def _normalized_message_content(value: Any) -> str:
+    content = unicodedata.normalize("NFKC", str(value or ""))
+    content = _INVISIBLE_CONTENT_RE.sub("", content)
+    return _CONTENT_WHITESPACE_RE.sub(" ", content).strip()
+
+
+def _message_structured_payload(message: Message) -> dict[str, Any]:
+    raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    structured = raw_payload.get("structured_payload")
+    return structured if isinstance(structured, dict) else {}
+
+
+def _is_pdd_main_account_custom_order_prompt(message: Message) -> bool:
+    if message.platform_code != "pinduoduo" or message.sender_role != "agent":
+        return False
+    if _normalized_message_content(message.content) != _normalized_message_content(
+        PDD_CUSTOM_ORDER_CONFIRMATION_PROMPT
+    ):
+        return False
+    return _normalized_message_content(_message_structured_payload(message).get("from_csid")) == "主账号"
+
+
+def _pdd_custom_order_scene_used(conversation: Conversation) -> bool:
+    metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
+    state = metadata.get(PDD_CUSTOM_ORDER_SCENE_METADATA_KEY)
+    return isinstance(state, dict) and state.get("status") == "applied"
+
+
+def _detect_pdd_custom_order_scene(
+    db: Session,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    history_rows: list[Message],
+) -> dict[str, Any] | None:
+    if conversation.platform_code != "pinduoduo" or source_message.sender_role != "customer":
+        return None
+    if _robot_config(robot).get("pdd_custom_order_supplement_enabled") is False:
+        return None
+    if _pdd_custom_order_scene_used(conversation):
+        return None
+    prompt = next(
+        (
+            item for item in sorted(
+                history_rows,
+                key=lambda row: int(row.conversation_sequence or 0),
+                reverse=True,
+            )
+            if int(item.conversation_sequence or 0) < int(source_message.conversation_sequence or 0)
+            and _is_pdd_main_account_custom_order_prompt(item)
+        ),
+        None,
+    )
+    if prompt is None:
+        return None
+    prompt_sequence = int(prompt.conversation_sequence or 0)
+    source_sequence = int(source_message.conversation_sequence or 0)
+    has_customer_between = db.scalar(
+        select(Message.id).where(
+            Message.conversation_id == conversation.id,
+            Message.sender_role == "customer",
+            Message.conversation_sequence > prompt_sequence,
+            Message.conversation_sequence < source_sequence,
+            Message.message_status != "failed",
+        ).limit(1)
+    )
+    if has_customer_between is not None:
+        return None
+    return {
+        "type": "pdd_custom_order_confirmation",
+        "prompt_message_id": prompt.id,
+        "prompt_platform_message_id": prompt.platform_message_id or "",
+        "prompt_text": prompt.content,
+        "supplement_text": _pdd_custom_order_supplement_text(robot),
+    }
+
+
+def _mark_pdd_custom_order_scene_applied(
+    db: Session,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    scene: dict[str, Any] | None,
+    result: dict[str, Any],
+) -> None:
+    if not scene:
+        return
+    metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
+    conversation.metadata_json = {
+        **metadata,
+        PDD_CUSTOM_ORDER_SCENE_METADATA_KEY: {
+            "status": "applied",
+            "robot_id": robot.id,
+            "source_message_id": source_message.id,
+            "source_message_sequence": source_message.conversation_sequence,
+            "prompt_message_id": scene.get("prompt_message_id"),
+            "prompt_platform_message_id": scene.get("prompt_platform_message_id"),
+            "reply_text": str(result.get("text") or "")[:1000],
+            "updated_at": utcnow().isoformat(),
+        },
+    }
+    db.add(conversation)
+    db.commit()
 
 
 def _timeout_config(robot: Robot | None) -> tuple[bool, int, str]:
@@ -340,6 +457,11 @@ def _transfer_ack_text(robot: Robot | None) -> str:
     return text or DEFAULT_TRANSFER_ACK_TEXT
 
 
+def _transfer_cancel_text(robot: Robot | None) -> str:
+    text = str(_robot_config(robot).get("transfer_cancel_text") or "").strip()
+    return text or DEFAULT_TRANSFER_CANCEL_TEXT
+
+
 def _auto_transfer_state(conversation: Conversation) -> dict[str, Any]:
     metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
     state = metadata.get(AUTO_TRANSFER_METADATA_KEY)
@@ -365,7 +487,7 @@ def _customer_confirms_transfer(message: str) -> bool:
     normalized = re.sub(r"[\s，。！？、,.!?~～]+", "", str(message or "")).casefold()
     if not normalized:
         return False
-    if any(word in normalized for word in ("不用", "不要", "不需要", "否", "算了")):
+    if _customer_declines_transfer(message):
         return False
     return any(
         normalized == word
@@ -387,6 +509,13 @@ def _customer_confirms_transfer(message: str) -> bool:
             "yes",
         )
     )
+
+
+def _customer_declines_transfer(message: str) -> bool:
+    normalized = re.sub(r"[\s，。！？、,.!?~～]+", "", str(message or "")).casefold()
+    if not normalized:
+        return False
+    return any(word in normalized for word in ("不用", "先不用", "不要", "不需要", "否", "算了"))
 
 
 def _transfer_prompt_result(
@@ -860,6 +989,44 @@ def _queue_transfer_ack_task(
     return result
 
 
+async def _queue_transfer_cancel_task(
+    db: Session,
+    user: User,
+    conversation: Conversation,
+    robot: Robot,
+    source_message: Message,
+    *,
+    reason: str,
+    auto_send_allowed: bool,
+    timeout_deadline: asyncio.Event | None = None,
+    ordering_lock: asyncio.Lock | None = None,
+) -> dict[str, Any]:
+    _clear_auto_transfer_state(conversation)
+    db.add(conversation)
+    db.commit()
+    result = _transfer_prompt_result(
+        source_message.id,
+        text=_transfer_cancel_text(robot),
+        workflow="transfer_cancel",
+        next_action="cancel_transfer_confirmation",
+        reason=reason,
+    )
+    result["quote_message_id"] = _quote_platform_message_id(source_message)
+    task_id = await _queue_reply_task_ordered(
+        db,
+        user,
+        conversation,
+        robot,
+        source_message,
+        result,
+        auto_send_allowed=auto_send_allowed,
+        timeout_deadline=timeout_deadline,
+        ordering_lock=ordering_lock,
+    )
+    result["task_ids"] = [task_id] if task_id else []
+    return result
+
+
 async def _queue_reply_task_ordered(
     db: Session,
     user: User,
@@ -1147,6 +1314,7 @@ async def _decide_reply(
     customer_orders: dict[str, Any] | None = None,
     platform_context: list[dict[str, Any]] | None = None,
     shop_product_summary: dict[str, str] | None = None,
+    platform_rule_scene: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = _robot_config(robot)
     payload = {
@@ -1173,6 +1341,7 @@ async def _decide_reply(
             "prohibited_content_instruction": str(config.get("prohibited_content_instruction") or ""),
             "fallback_reply_text": str(config.get("fallback_reply_text") or ""),
             "email_trigger_scenarios": str(getattr(email_config, "trigger_scenarios", "") or ""),
+            "platform_rule_scene": platform_rule_scene or {},
         },
         "provider_config": {
             "provider": settings.ai_provider if settings.ai_provider_api_key else ai_config.provider,
@@ -1284,6 +1453,18 @@ async def _execute_bound_reply(
                 robot,
                 source_message,
                 reason=str(transfer_state.get("reason") or "transfer_confirmation"),
+            )
+        if _customer_declines_transfer(source_message.content):
+            return await _queue_transfer_cancel_task(
+                db,
+                user,
+                conversation,
+                robot,
+                source_message,
+                reason=str(transfer_state.get("reason") or "transfer_confirmation"),
+                auto_send_allowed=auto_send_allowed,
+                timeout_deadline=timeout_deadline,
+                ordering_lock=timeout_ordering_lock,
             )
         _clear_auto_transfer_state(conversation)
         db.add(conversation)
@@ -1479,6 +1660,17 @@ async def _execute_bound_reply(
         "missing_template_text": email_config.missing_template_text,
     }
     workflow = active_workflow(db, user, conversation, robot)
+    platform_rule_scene = (
+        None
+        if workflow is not None or not auto_send_allowed
+        else _detect_pdd_custom_order_scene(
+            db,
+            conversation,
+            robot,
+            source_message,
+            history_rows,
+        )
+    )
     logger.info(
         "automation reply started conversation_id=%s robot_id=%s prompt_message_count=%d "
         "history_limit=%d auto_send_allowed=%s",
@@ -1521,6 +1713,7 @@ async def _execute_bound_reply(
             email_config=email_config,
             customer_orders=customer_orders,
             platform_context=platform_context,
+            platform_rule_scene=platform_rule_scene,
             shop_product_summary={
                 "shop_intro": str(shop_product_summary.get("shop_intro") or ""),
                 "on_sale_products": str(shop_product_summary.get("on_sale_products") or ""),
@@ -1555,6 +1748,16 @@ async def _execute_bound_reply(
                 )
 
     result["order_context_refresh"] = order_context_refresh
+    if platform_rule_scene is not None:
+        result["platform_rule_scene"] = platform_rule_scene
+        _mark_pdd_custom_order_scene_applied(
+            db,
+            conversation,
+            robot,
+            source_message,
+            platform_rule_scene,
+            result,
+        )
     product_recommend_enabled, product_recommend_text = _product_recommendation_config(robot)
     qa_match = result.get("qa_match") if isinstance(result.get("qa_match"), dict) else {}
     should_recommend_products = (
@@ -1939,6 +2142,8 @@ def schedule_debounced_inbound_reply(
     async def run_later() -> None:
         try:
             await asyncio.sleep(delay_seconds)
+            if _pending_inbound_reply_tasks.get(key) is task:
+                _pending_inbound_reply_tasks.pop(key, None)
             await process_inbound_reply(
                 user_id,
                 conversation_id,

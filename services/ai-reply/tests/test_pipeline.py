@@ -33,6 +33,52 @@ def intent_json(intent: str = "normal_question", **overrides: object) -> str:
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pdd_custom_order_scene_confirms_default_photo_without_model(self) -> None:
+        request = ReplyRequest(
+            message="就直接我拍下的这款照片",
+            allow_auto_send=True,
+            reply_config={
+                "platform_rule_scene": {
+                    "type": "pdd_custom_order_confirmation",
+                    "prompt_text": "你刚刚拼单的商品为定制商品，需要确认定制方案哦~",
+                    "supplement_text": "亲亲，如果您不需要额外定制，默认是按您下单时选择的那款商品图安排制作发货~",
+                },
+            },
+        )
+
+        result = await build_reply(request)
+
+        self.assertEqual(result.decision, "auto_send")
+        self.assertEqual(result.provider, "pdd-custom-order-rule")
+        self.assertEqual(result.action_plan.workflow, "pdd_custom_order_confirmation")
+        self.assertEqual(
+            result.text,
+            "好的亲亲，如果您不需要额外定制，默认是按您下单时选择的那款商品图安排制作发货~",
+        )
+        self.assertEqual(result.model_calls["intent"], "skipped-pdd-custom-order")
+
+    async def test_pdd_custom_order_scene_explains_confirmation_without_model(self) -> None:
+        request = ReplyRequest(
+            message="确认什么定制",
+            allow_auto_send=True,
+            reply_config={
+                "platform_rule_scene": {
+                    "type": "pdd_custom_order_confirmation",
+                    "prompt_text": "你刚刚拼单的商品为定制商品，需要确认定制方案哦~",
+                    "supplement_text": "亲亲，如果您不需要额外定制，默认是按您下单时选择的那款商品图安排制作发货~",
+                },
+            },
+        )
+
+        result = await build_reply(request)
+
+        self.assertEqual(result.decision, "auto_send")
+        self.assertEqual(result.provider, "pdd-custom-order-rule")
+        self.assertEqual(
+            result.text,
+            "亲亲，如果您不需要额外定制，默认是按您下单时选择的那款商品图安排制作发货~",
+        )
+
     async def test_tone_persona_uses_enabled_tone_base(self) -> None:
         with patch(
             "app.pipeline.get_knowledge_base",
@@ -159,6 +205,38 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不能让客户察觉到自动化系统的存在", intent_call.kwargs["system"])
         self.assertIn("不得说“知识库中没有”“未检索到”“无法访问知识库”", intent_call.kwargs["system"])
         self.assertIn("不得主动建议或要求客户联系平台人工客服", intent_call.kwargs["system"])
+
+    async def test_generation_prompt_includes_document_title_path(self) -> None:
+        request = ReplyRequest(
+            message="可以来图定制吗",
+            product_base_ids=["product-1"],
+        )
+        provider = AsyncMock(
+            side_effect=[
+                (intent_json(), "deepseek"),
+                ("可以的亲亲，支持来图定制，确认设计后会安排制作。", "deepseek"),
+            ]
+        )
+        with (
+            patch("app.pipeline.generate_with_provider", provider),
+            patch(
+                "app.pipeline.search_documents",
+                AsyncMock(return_value=[{
+                    "source_title": "小源抱枕知识-产品知识库导入版.docx",
+                    "title_path": "商品介绍：高品质定制抱枕 / 枕套 > 专属定制",
+                    "snippet": "支持来图定制，设计确认后安排加急制作。",
+                }]),
+            ),
+            patch("app.pipeline.get_knowledge_base", AsyncMock(return_value={})),
+        ):
+            result = await build_reply(request)
+
+        self.assertEqual(result.retrieval_status, "hit")
+        generation_call = provider.await_args_list[1]
+        self.assertIn(
+            "[1] 小源抱枕知识-产品知识库导入版.docx / 商品介绍：高品质定制抱枕 / 枕套 > 专属定制：支持来图定制",
+            generation_call.kwargs["user"],
+        )
 
     def test_default_fallback_uses_store_agent_voice_without_internal_disclosure(self) -> None:
         request = ReplyRequest(message="这个活动有什么优惠")
@@ -323,6 +401,15 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.text, "好的亲亲，正在为您转接人工客服，请稍等～")
         self.assertNotIn("identity_disclosure", result.risk_flags)
+
+    async def test_transfer_to_agent_uses_human_handoff_logic(self) -> None:
+        result = await build_reply(ReplyRequest(message="转客服", allow_auto_send=True))
+
+        self.assertEqual(result.text, "好的亲亲，正在为您转接人工客服，请稍等～")
+        self.assertEqual(result.intent.reply_route, "human_handoff")
+        self.assertEqual(result.action_plan.workflow, "human_review")
+        self.assertIn("转客服", result.risk_flags)
+        self.assertEqual(result.model_calls["intent"], "local-fallback")
 
     async def test_unsafe_fallback_escalates_instead_of_sending(self) -> None:
         request = ReplyRequest(

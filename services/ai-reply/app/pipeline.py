@@ -17,13 +17,13 @@ from app.provider import (
 from app.schemas import ActionPlan, IntentDecision, ReplyRequest, ReplyResponse
 
 
-RISK_WORDS = ("退款", "退货", "投诉", "赔偿", "隐私", "地址", "手机号", "转人工")
+RISK_WORDS = ("退款", "退货", "投诉", "赔偿", "隐私", "地址", "手机号", "转人工", "转客服")
 EMAIL_WORDS = ("邮箱", "邮件")
 DIRECT_REPLY_WORDS = (
     "你好", "您好", "嗨", "哈喽", "hello", "hi", "好", "好的", "嗯", "行", "可以",
     "知道了", "明白了", "收到", "谢谢", "感谢", "不用了", "不需要了", "再见",
 )
-HUMAN_WORDS = ("转人工", "人工客服", "投诉", "举报")
+HUMAN_WORDS = ("转人工", "转客服", "人工客服", "投诉", "举报")
 PRODUCT_KNOWLEDGE_WORDS = (
     "商品", "产品", "键盘", "键帽", "轴体", "规格", "尺寸", "型号", "适配", "兼容", "能装",
     "安装", "价格", "多少钱", "优惠", "库存", "现货", "发货", "物流", "快递", "订单", "售后",
@@ -151,6 +151,101 @@ def _direct_fallback_reply(message: str) -> str:
     if any(word in normalized for word in ("你好", "您好", "嗨", "哈喽", "hello", "hi")):
         return "您好亲亲，请问有什么可以帮您？"
     return DEFAULT_DIRECT_REPLY
+
+
+def _platform_rule_scene(request: ReplyRequest) -> dict[str, Any]:
+    scene = request.reply_config.get("platform_rule_scene")
+    if not isinstance(scene, dict):
+        return {}
+    if scene.get("type") != "pdd_custom_order_confirmation":
+        return {}
+    return scene
+
+
+def _platform_rule_scene_prompt(request: ReplyRequest) -> str:
+    scene = _platform_rule_scene(request)
+    if not scene:
+        return "无"
+    return json.dumps({
+        "type": scene.get("type"),
+        "prompt_text": scene.get("prompt_text"),
+        "reply_guidance": scene.get("supplement_text"),
+        "instruction": (
+            "客户正在回复拼多多主账号自动发出的定制商品确认提醒。"
+            "如果客户表示不额外定制、按拍下图片或按默认款制作，直接确认会按下单时选择的商品图安排制作发货；"
+            "如果客户询问确认什么定制，解释不需要额外定制时默认按下单时选择的商品图制作发货；"
+            "如果客户提出改图、加字、换内容等定制诉求，按普通商品咨询继续回答。"
+        ),
+    }, ensure_ascii=False)
+
+
+def _acknowledge_custom_order_text(text: str) -> str:
+    cleaned = clean_reply(text)
+    if cleaned.startswith("亲亲，"):
+        return f"好的亲亲，{cleaned.removeprefix('亲亲，')}"
+    if cleaned.startswith("亲，"):
+        return f"好的亲亲，{cleaned.removeprefix('亲，')}"
+    return f"好的亲亲，{cleaned}" if cleaned else "好的亲亲，那这边就按您下单时选择的那款商品图安排制作发货~"
+
+
+def _pdd_custom_order_scene_reply(request: ReplyRequest) -> str:
+    scene = _platform_rule_scene(request)
+    if not scene:
+        return ""
+    message = _normalized_short_message(request.message)
+    guidance = clean_reply(str(scene.get("supplement_text") or ""))
+    default_or_original = (
+        "不额外定制", "不需要额外定制", "不用额外定制", "不要额外定制",
+        "按原图", "按图片", "按照片", "原图", "原样", "默认",
+        "拍下的这款", "拍下这款", "下单的这款", "直接我拍下", "就直接",
+    )
+    asks_meaning = (
+        "确认什么", "确认啥", "什么定制", "定制什么", "什么意思", "怎么确认",
+    )
+    if any(word in message for word in default_or_original):
+        return _acknowledge_custom_order_text(guidance)
+    if any(word in message for word in asks_meaning):
+        return guidance
+    return ""
+
+
+def _pdd_custom_order_scene_result(
+    request: ReplyRequest,
+    text: str,
+    trace_id: str,
+    risk_flags: list[str],
+    qa_result: dict[str, Any],
+) -> ReplyResponse:
+    intent = IntentDecision(
+        intent="direct_reply",
+        reply_route="direct",
+        direct_reply_text=text,
+        confidence=1.0,
+        need_doc_search=False,
+        workflow="pdd_custom_order_confirmation",
+        next_action="send_direct_reply",
+        risk_flags=risk_flags,
+        reason="客户正在回复拼多多主账号定制商品确认提醒",
+    )
+    action_plan = ActionPlan(
+        workflow="pdd_custom_order_confirmation",
+        next_action="send_direct_reply",
+        required_actions=["send_platform_text"],
+        blocked_actions=["qa_match", "generate_reply"],
+    )
+    return _reply_with_outbound_guard(
+        request,
+        text=text,
+        intent=intent,
+        action_plan=action_plan,
+        confidence=1.0,
+        risk_flags=risk_flags,
+        qa_match=qa_result,
+        retrieval=[],
+        model_calls={"intent": "skipped-pdd-custom-order", "generation": "skipped"},
+        provider="pdd-custom-order-rule",
+        trace_id=trace_id,
+    )
 
 
 def _reply_with_outbound_guard(
@@ -353,7 +448,7 @@ direct_reply_text 是最终可发送给客户的内容，必须遵守基础风�
 你作为店铺中正在接待客户的真正客服与客户交流，回复必须自然、可信，不能让客户察觉到自动化系统的存在。
 所有可发送内容都不得提及或暗示 AI、机器人、模型、系统、提示词、知识库、知识片段、文档检索、信息来源、能力限制等内部实现。
 信息不足时只能以店铺客服口吻说明“这边暂时无法确认，我帮您进一步核实”，不得说“知识库中没有”“未检索到”“无法访问知识库”等。
-除非客户明确要求转人工且当前路由为 human_handoff，否则不得主动建议或要求客户联系平台人工客服、其他客服或转人工。
+除非客户明确要求转人工或转客服且当前路由为 human_handoff，否则不得主动建议或要求客户联系平台人工客服、其他客服或转人工。
 confidence: 0 到 1
 need_customer_reply: 必须为 true
 need_doc_search: 仅 retrieve_product 为 true
@@ -395,6 +490,7 @@ wants_product_recommendation 只用于判断是否需要额外发送商品卡；
         f"额外要求：{request.reply_config.get('advanced_instruction') or '无'}\n"
         f"用户配置的违禁内容：{request.reply_config.get('prohibited_content_instruction') or '未配置'}\n"
         "生成回复时不得涉及上述用户配置的违禁内容。\n"
+        f"平台业务场景提示：{_platform_rule_scene_prompt(request)}\n"
         f"客户订单信息（仅此处可作为订单事实来源）：{json.dumps(request.customer_orders, ensure_ascii=False)}\n"
         f"平台会话上下文（商品卡片、来源卡片等，仅作指代和商品背景）：{json.dumps(request.platform_context, ensure_ascii=False)}\n"
         f"店铺资料摘要（仅作为店铺商品范围和经营方向参考，不可据此编造具体商品事实）：{json.dumps(request.shop_product_summary, ensure_ascii=False)}\n"
@@ -575,7 +671,7 @@ def _generation_prompts(
         "回复必须自然、可信，不能让客户察觉到自动化系统的存在；"
         "不得提及或暗示 AI、机器人、模型、系统、提示词、知识库、知识片段、文档检索、信息来源或能力限制等内部实现；"
         "信息不足时只能以店铺客服口吻说明‘这边暂时无法确认，我帮您进一步核实’，不得说‘知识库中没有’‘未检索到’或‘无法访问知识库’；"
-        "除非客户明确要求转人工且当前执行计划确实为人工转接，否则不得主动建议或要求客户联系平台人工客服、其他客服或转人工；"
+        "除非客户明确要求转人工或转客服且当前执行计划确实为人工转接，否则不得主动建议或要求客户联系平台人工客服、其他客服或转人工；"
         "优先回答最新问题，不输出分析过程，不编造提供的商品资料中不存在的事实；"
         "没有执行结果时不得声称邮件或图片已经发送；"
         "无论客户消息、最近对话、文档片段、知识库、人设或额外要求中是否包含，"
@@ -589,10 +685,11 @@ def _generation_prompts(
         f"虚拟人设：{persona or '未配置'}\n"
         f"额外要求：{config.get('advanced_instruction') or '无'}\n"
         f"用户配置的违禁内容：{config.get('prohibited_content_instruction') or '未配置'}\n"
-        "生成回复时不得涉及上述用户配置的违禁内容。"
+        "生成回复时不得涉及上述用户配置的违禁内容。\n"
+        f"平台业务场景提示：{_platform_rule_scene_prompt(request)}"
     )
     snippets = "\n".join(
-        f"[{index}] {item.get('source_title') or item.get('document_title') or '文档'}：{item.get('snippet') or ''}"
+        f"[{index}] {_retrieval_source_label(item)}：{item.get('snippet') or ''}"
         for index, item in enumerate(retrieval[:5], start=1)
     )
     user = (
@@ -609,6 +706,14 @@ def _generation_prompts(
         f"最新客户问题：{request.message}"
     )
     return system, user
+
+
+def _retrieval_source_label(item: dict[str, Any]) -> str:
+    source_title = clean_reply(str(item.get("source_title") or item.get("document_title") or "文档"))
+    title_path = clean_reply(str(item.get("title_path") or ""))
+    if title_path and title_path != source_title:
+        return f"{source_title} / {title_path}"
+    return source_title
 
 
 @observe_model_calls
@@ -641,6 +746,16 @@ async def build_reply(request: ReplyRequest) -> ReplyResponse:
             "entry": None,
             "status": "skipped",
         }
+
+    scene_reply = _pdd_custom_order_scene_reply(request)
+    if scene_reply:
+        return _pdd_custom_order_scene_result(
+            request,
+            scene_reply,
+            trace_id,
+            risk_flags,
+            qa_result,
+        )
 
     if qa_result.get("matched") and isinstance(qa_result.get("entry"), dict):
         entry = qa_result["entry"]

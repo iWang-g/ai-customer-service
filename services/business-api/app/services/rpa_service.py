@@ -48,7 +48,7 @@ from app.services.platform_account_service import resolve_merged_platform_accoun
 from app.services.settings_service import auto_reply_enabled
 
 
-DEFAULT_ENTRY_WELCOME_TEXT = "亲亲，我是本店小助理，发送“转人工”可为您转接客服。"
+DEFAULT_ENTRY_WELCOME_TEXT = "亲亲，我是本店AI客服，有什么需要了解的可以咨询我。如果需要人工回复的话可以发送“转人工”~"
 ENTRY_WELCOME_METADATA_KEY = "entry_welcome"
 ENTRY_WELCOME_CANDIDATE_EVENTS = {"conversation_snapshot", "customer_message", "message_received"}
 _OUTBOUND_MESSAGE_SOURCES = frozenset({

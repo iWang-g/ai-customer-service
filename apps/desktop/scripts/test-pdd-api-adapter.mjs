@@ -217,6 +217,28 @@ assert.equal(transferSystemMessage.conversations[0].snapshot_messages[0].message
 assert.equal(transferSystemMessage.conversations[0].snapshot_messages[0].display_mode, 'separator');
 assert.equal(transferSystemMessage.conversations[0].snapshot_messages[0].automation_mode, 'ignore');
 assert.equal(transferSystemMessage.conversations[0].snapshot_messages[0].structured_payload.raw_type, 24);
+assert.equal(transferSystemMessage.conversations[0].snapshot_messages[0].structured_payload.from_csid, '主账号');
+
+const customOrderPromptMessage = mapChatListResponse({
+  success: true,
+  result: {
+    response: 'list',
+    result: 'ok',
+    has_more: false,
+    messages: [{
+      from: { role: 'mall_cs', uid: '688523141', mall_id: '688523141', csid: '主账号' },
+      to: { role: 'user', uid: '1839008689561' },
+      type: 0,
+      content: '你刚刚拼单的商品为定制商品，需要确认定制方案哦~',
+      ts: '1786955700',
+      msg_id: '1786955700001',
+    }],
+  },
+}, { customerUid: '1839008689561', customerName: 'Buyer' });
+assert.equal(customOrderPromptMessage.conversations[0].snapshot_messages[0].sender_role, 'agent');
+assert.equal(customOrderPromptMessage.conversations[0].snapshot_messages[0].automation_mode, 'context');
+assert.equal(customOrderPromptMessage.conversations[0].snapshot_messages[0].structured_payload.from_csid, '主账号');
+assert.equal(customOrderPromptMessage.conversations[0].snapshot_messages[0].structured_payload.to_uid, '1839008689561');
 
 const additionalSystemMessages = mapChatListResponse({
   success: true,

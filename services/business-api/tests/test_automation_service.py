@@ -16,6 +16,7 @@ from app.services.automation_service import (
     _human_handoff_strategy,
     _is_fallback_reply,
     _customer_confirms_transfer,
+    _customer_declines_transfer,
     _matched_sensitive_word,
     _sensitive_words,
     _should_create_send_task,
@@ -105,6 +106,10 @@ class AutomationConfigTests(unittest.TestCase):
         self.assertTrue(_customer_confirms_transfer("麻烦转接一下"))
         self.assertFalse(_customer_confirms_transfer("不用了"))
         self.assertFalse(_customer_confirms_transfer("不是"))
+        self.assertTrue(_customer_declines_transfer("不用"))
+        self.assertTrue(_customer_declines_transfer("先不用"))
+        self.assertTrue(_customer_declines_transfer("算了"))
+        self.assertFalse(_customer_declines_transfer("可以转"))
 
     def test_fallback_result_is_identified_by_workflow(self) -> None:
         self.assertTrue(_is_fallback_reply({"action_plan": {"workflow": "fallback_reply"}}))

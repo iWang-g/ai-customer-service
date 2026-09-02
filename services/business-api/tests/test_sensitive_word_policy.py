@@ -405,6 +405,55 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transfer_payload["trans_reason"], "无原因直接转移")
         self.assertEqual(transfer_payload["external_conversation_id"], "customer-sensitive")
 
+    async def test_transfer_confirmation_no_clears_state_and_sends_cancel_reply(self) -> None:
+        self.conversation.platform_account_id = "pdd-account-1"
+        self.conversation.metadata_json = {
+            "auto_transfer": {
+                "status": "confirming",
+                "reason": "fallback_reply",
+                "source_message_id": self.source_message.id,
+                "robot_id": self.robot.id,
+            }
+        }
+        self.robot.config_json = {
+            "allow_auto_send": True,
+            "fallback_mark_human_required": True,
+            "human_handoff_strategy": "transfer_conversation",
+        }
+        no_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="pinduoduo",
+            sender_role="customer",
+            content="先不用",
+        )
+        self.db.add_all([self.conversation, self.robot, no_message])
+        self.db.commit()
+
+        with patch(
+            "app.services.automation_service._decide_reply",
+            new=AsyncMock(),
+        ) as decide_reply:
+            result = await run_reply(
+                self.db,
+                self.user,
+                ReplyRunRequest(
+                    conversation_id=self.conversation.id,
+                    source_message_id=no_message.id,
+                    allow_auto_send=True,
+                ),
+            )
+
+        decide_reply.assert_not_awaited()
+        self.db.refresh(self.conversation)
+        self.assertNotIn("auto_transfer", self.conversation.metadata_json)
+        self.assertEqual(result["text"], "好的亲亲，有需要随时告诉我")
+        self.assertEqual(result["qa_match"]["match_type"], "transfer_cancel")
+        task = self.db.scalars(select(RpaTask).order_by(RpaTask.requested_at.desc())).first()
+        self.assertIsNotNone(task)
+        self.assertEqual(task.payload_json["content"], "好的亲亲，有需要随时告诉我")
+        self.assertNotIn("after_send_transfer_conversation", task.payload_json)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,11 @@ from app.models import (
 from app.schemas.rpa import RpaEventCreate, TaskCompleteRequest
 from app.services.message_sequence_service import snapshot_payload_hash
 from app.services.rpa_service import get_or_create_desktop_ingest_node
-from app.services.rpa_service import create_event, complete_task, maybe_queue_entry_welcome
+from app.services.rpa_service import (
+    create_event,
+    complete_task,
+    maybe_queue_entry_welcome,
+)
 
 
 class RpaServiceTests(unittest.TestCase):
@@ -293,7 +297,10 @@ class RpaServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(task_id)
         task = self.db.get(RpaTask, task_id)
-        self.assertEqual(task.payload_json["content"], "亲亲，我是本店小助理，发送“转人工”可为您转接客服。")
+        self.assertEqual(
+            task.payload_json["content"],
+            "亲亲，我是本店AI客服，有什么需要了解的可以咨询我。如果需要人工回复的话可以发送“转人工”~",
+        )
 
     def test_send_ack_completion_creates_transfer_task(self) -> None:
         conversation = Conversation(

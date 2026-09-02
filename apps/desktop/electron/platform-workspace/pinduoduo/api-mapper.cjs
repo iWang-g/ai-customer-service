@@ -78,6 +78,13 @@ function normalizePddLink(value) {
 
 function commonStructuredPayload(message) {
   return {
+    from_role: cleanText(message?.from?.role, 64),
+    from_uid: cleanId(message?.from?.uid ?? message?.from?.id),
+    from_mall_id: cleanId(message?.from?.mall_id),
+    from_csid: cleanText(message?.from?.csid, 128),
+    to_role: cleanText(message?.to?.role, 64),
+    to_uid: cleanId(message?.to?.uid ?? message?.to?.id),
+    to_csid: cleanText(message?.to?.csid, 128),
     pre_msg_id: cleanId(message.pre_msg_id),
     quote_msg_id: cleanId(message.quote_msg_id ?? message.quote_msg?.msg_id),
     quote_msg: mapQuoteMessage(message.quote_msg),
