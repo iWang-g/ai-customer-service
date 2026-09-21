@@ -461,6 +461,9 @@ export class PddWorkspaceManager {
     this.pageClassifier = pageClassifier;
     this.now = now;
     this.window = null;
+    this.hostWindow = false;
+    this.hostLayout = null;
+    this.hostVisible = true;
     this.userId = null;
     this.activeAccountId = null;
     this.views = new Map();
@@ -556,6 +559,37 @@ export class PddWorkspaceManager {
     this.#startSessionHealthMonitor();
     this.syncRpaAccounts();
     this.#publishState();
+  }
+
+  attachHostWindow(window) {
+    if (!window || window.isDestroyed()) throw new Error('聚合工作台宿主窗口无效');
+    if (this.window && this.window !== window && !this.window.isDestroyed()) {
+      throw new Error('拼多多工作区已经绑定到其它窗口');
+    }
+    this.window = window;
+    this.hostWindow = true;
+    this.hostVisible = false;
+    this.#layoutViews();
+  }
+
+  detachHostWindow() {
+    if (!this.hostWindow) return;
+    this.hostWindow = false;
+    this.hostLayout = null;
+    this.hostVisible = true;
+    this.window = null;
+  }
+
+  setHostLayout(bounds) {
+    this.hostLayout = bounds && Number.isFinite(bounds.width) && Number.isFinite(bounds.height)
+      ? { x: Math.round(bounds.x || 0), y: Math.round(bounds.y || 0), width: Math.max(1, Math.round(bounds.width)), height: Math.max(1, Math.round(bounds.height)) }
+      : null;
+    this.#layoutViews();
+  }
+
+  setHostVisible(visible) {
+    this.hostVisible = Boolean(visible);
+    this.#layoutViews();
   }
 
   async #refreshCollectorRules(providedAccessToken = null) {
@@ -720,7 +754,7 @@ export class PddWorkspaceManager {
     this.activeAccountId = accountId;
     this.registry.update(this.userId, accountId, { lastOpenedAt: new Date().toISOString() });
     for (const [id, candidate] of this.views) {
-      candidate.setVisible(id === accountId && !this.overlayOpen);
+      candidate.setVisible(id === accountId && !this.overlayOpen && this.hostVisible);
     }
     view.webContents.focus();
     this.#layoutViews();
@@ -2126,7 +2160,7 @@ export class PddWorkspaceManager {
     this.overlayOpen = Boolean(open);
     const activeView = this.views.get(this.activeAccountId);
     if (activeView && !activeView.webContents.isDestroyed()) {
-      activeView.setVisible(!this.overlayOpen);
+      activeView.setVisible(!this.overlayOpen && this.hostVisible);
     }
     return this.getState();
   }
@@ -2159,12 +2193,15 @@ export class PddWorkspaceManager {
     this.activeAccountId = null;
     this.runtime.clear();
     this.collectors.clear();
-    if (this.window && !this.window.isDestroyed()) {
+    if (this.window && !this.window.isDestroyed() && !this.hostWindow) {
       this.isQuitting = true;
       this.window.destroy();
       this.isQuitting = false;
     }
     this.window = null;
+    this.hostWindow = false;
+    this.hostLayout = null;
+    this.hostVisible = true;
     this.userId = null;
   }
 
@@ -3759,13 +3796,16 @@ export class PddWorkspaceManager {
   #layoutViews() {
     if (!this.window || this.window.isDestroyed()) return;
     const [width, height] = this.window.getContentSize();
-    const bounds = {
+    const bounds = this.hostLayout || {
       x: 0,
       y: WORKSPACE_TOOLBAR_HEIGHT,
       width: Math.max(width, 1),
       height: Math.max(height - WORKSPACE_TOOLBAR_HEIGHT, 1),
     };
-    for (const view of this.views.values()) view.setBounds(bounds);
+    for (const [id, view] of this.views) {
+      view.setBounds(bounds);
+      view.setVisible(id === this.activeAccountId && !this.overlayOpen && this.hostVisible);
+    }
   }
 
   #destroyView(accountId) {

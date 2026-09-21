@@ -4,6 +4,7 @@ import AppShell from './app/AppShell';
 import PinduoduoWorkspaceApp from './platform-workspace/App';
 import './index.css';
 import MessageNoticeApp from './message-notice/App';
+import AggregatedPlatformWorkspaceApp from './platform-workspace/AggregatedApp';
 
 const appView = new URLSearchParams(window.location.search).get('view');
 document.body.dataset.appView = appView || 'message-center';
@@ -49,7 +50,7 @@ window.addEventListener('unhandledrejection', (event) => {
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <RendererErrorBoundary>
-      {appView === 'message-notice' ? <MessageNoticeApp /> : appView === 'pinduoduo-workspace' ? <PinduoduoWorkspaceApp />
+      {appView === 'message-notice' ? <MessageNoticeApp /> : appView === 'platform-workspace' ? <AggregatedPlatformWorkspaceApp /> : appView === 'pinduoduo-workspace' ? <PinduoduoWorkspaceApp />
         : appView === 'douyin-workspace' ? <PinduoduoWorkspaceApp platform="douyin" /> : <AppShell />}
     </RendererErrorBoundary>
   </StrictMode>,

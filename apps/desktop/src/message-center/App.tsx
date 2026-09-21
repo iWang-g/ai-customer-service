@@ -37,6 +37,7 @@ export default function App() {
       selectedPlatform={controller.selectedPlatform}
       onPlatformSelect={controller.setSelectedPlatform}
       onOpenAdmin={() => controller.setCurrentView('admin')}
+      onOpenWorkspace={() => void window.desktopBridge?.openPlatformWorkspace?.().catch((error) => console.error('打开多平台工作台失败:', error))}
       onLogout={controller.handleLogout}
       currentUser={controller.currentUser}
       conversations={controller.filteredConversations}

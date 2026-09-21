@@ -55,6 +55,7 @@ interface MessageCenterWorkspaceProps {
   selectedPlatform: string;
   onPlatformSelect: (id: string) => void;
   onOpenAdmin: () => void;
+  onOpenWorkspace: () => void;
   onLogout: () => void;
   currentUser?: ApiUser;
   conversations: Conversation[];
@@ -143,6 +144,7 @@ export default function MessageCenterWorkspace({
   selectedPlatform,
   onPlatformSelect,
   onOpenAdmin,
+  onOpenWorkspace,
   onLogout,
   currentUser,
   conversations,
@@ -262,6 +264,7 @@ export default function MessageCenterWorkspace({
         selectedPlatform={selectedPlatform}
         onPlatformSelect={onPlatformSelect}
         onOpenAdmin={onOpenAdmin}
+        onOpenWorkspace={onOpenWorkspace}
         onLogout={onLogout}
         userName={currentUser?.display_name || currentUser?.username || '客服账号'}
         userId={currentUser?.id || ''}

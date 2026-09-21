@@ -134,6 +134,19 @@ interface WechatAccount {
 }
 
 interface Window {
+  platformWorkspace?: {
+    getState(): Promise<import('./platform-workspace/AggregatedApp').WorkspaceState>;
+    selectAccount(platformCode: 'pinduoduo' | 'douyin', accountId: string): Promise<import('./platform-workspace/AggregatedApp').WorkspaceState>;
+    setPlatformFilter(platformCode: 'all' | 'pinduoduo' | 'douyin'): Promise<import('./platform-workspace/AggregatedApp').WorkspaceState>;
+    addAccount(platformCode: 'pinduoduo' | 'douyin'): Promise<import('./platform-workspace/AggregatedApp').WorkspaceState>;
+    callAccount(payload: { platformCode: 'pinduoduo' | 'douyin'; accountId: string; method: string; args?: unknown[] }): Promise<import('./platform-workspace/AggregatedApp').WorkspaceState>;
+    setPageBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<import('./platform-workspace/AggregatedApp').WorkspaceState>;
+    setOverlayOpen(open: boolean): Promise<import('./platform-workspace/AggregatedApp').WorkspaceState>;
+    goBack(): Promise<unknown>;
+    goForward(): Promise<unknown>;
+    reload(): Promise<unknown>;
+    onStateChanged(listener: (state: import('./platform-workspace/AggregatedApp').WorkspaceState) => void): () => void;
+  };
   messageNoticeBridge?: {
     getState(): Promise<import('./message-notice/types').MessageNoticeState>;
     onState(listener: (state: import('./message-notice/types').MessageNoticeState) => void): () => void;
@@ -146,6 +159,7 @@ interface Window {
     websocketUrl: string;
   };
   desktopBridge?: {
+    openPlatformWorkspace?(payload?: { platformCode?: 'pinduoduo' | 'douyin'; accountId?: string }): Promise<{ opened: boolean; reused: boolean }>;
     setMessageNoticeOwner(userId: string | null): Promise<import('./message-notice/types').MessageNoticeState>;
     publishMessageNotices(payload: {
       sessionId: string;

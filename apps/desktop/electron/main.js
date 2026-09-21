@@ -17,6 +17,7 @@ import { DailyLogFile } from './daily-log-file.js';
 import { loadRuntimeConfig, rendererRuntimeArguments, serviceProxyBypassRules } from './runtime-config.js';
 import { WechatAccountRegistry } from './wechat/account-registry.js';
 import { WechatProcessManager } from './wechat/process-manager.js';
+import { PlatformWorkspaceManager } from './platform-workspace-manager.js';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
@@ -29,6 +30,7 @@ const mainWindowLog = new DailyLogFile({ directory: diagnosticLogDirectory, base
 let mainWindow = null;
 let pddWorkspaceManager = null;
 let douyinWorkspaceManager = null;
+let platformWorkspaceManager = null;
 let pddAccountRegistry = null;
 let rpaProcessManager = null;
 let qianniuWorkerManager = null;
@@ -299,6 +301,16 @@ function registerIpcHandlers() {
     return true;
   });
 
+  ipcMain.handle('desktop:open-platform-workspace', async (event, payload = {}) => {
+    if (!fromMain(event)) throw new Error('无效的工作台调用来源');
+    const userId = rpaProcessManager?.userId || pddWorkspaceManager?.userId || douyinWorkspaceManager?.userId;
+    if (!isValidUserId(userId)) throw new Error('请先登录本系统');
+    const platformCode = payload?.platformCode || null;
+    if (platformCode !== null && !['pinduoduo', 'douyin'].includes(platformCode)) throw new Error('平台参数无效');
+    if (payload?.accountId !== undefined && !isValidAccountId(payload.accountId)) throw new Error('店铺账号参数无效');
+    return platformWorkspaceManager.open(userId, { platformCode, accountId: payload?.accountId || null });
+  });
+
   ipcMain.handle('desktop:start-rpa', async (_event, payload) => {
     if (!isValidUserId(payload?.userId) || !isValidAccessToken(payload?.accessToken)) {
       throw new Error('RPA 启动参数无效');
@@ -322,9 +334,58 @@ function registerIpcHandlers() {
   });
   ipcMain.handle('desktop:close-platform-workspaces', async () => {
     await qianniuWorkerManager?.stop();
-    await pddWorkspaceManager.closeForLogout();
-    await douyinWorkspaceManager.closeForLogout();
+    if (platformWorkspaceManager) {
+      await platformWorkspaceManager.closeForLogout();
+    } else {
+      await pddWorkspaceManager?.closeForLogout();
+      await douyinWorkspaceManager?.closeForLogout();
+    }
     await rpaProcessManager.stop();
+  });
+  const fromPlatformWorkspace = (event) => platformWorkspaceManager?.window
+    && event.sender === platformWorkspaceManager.window.webContents
+    && event.senderFrame === event.sender.mainFrame;
+  ipcMain.handle('platform-workspace:get-state', (event) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.getState();
+  });
+  ipcMain.handle('platform-workspace:page-bounds', (event, bounds) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.setPageBounds(bounds);
+  });
+  ipcMain.handle('platform-workspace:select-account', (event, payload) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.selectAccount(payload?.platformCode, payload?.accountId);
+  });
+  ipcMain.handle('platform-workspace:set-platform-filter', (event, platformCode) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.setPlatformFilter(platformCode);
+  });
+  ipcMain.handle('platform-workspace:add-account', (event, platformCode) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.addAccount(platformCode);
+  });
+  ipcMain.handle('platform-workspace:call-account', (event, payload) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    const methods = new Set(['renameAccount', 'setAccountPaused', 'removeAccount', 'restoreAccount']);
+    if (!methods.has(payload?.method)) throw new Error('不支持的工作台操作');
+    return platformWorkspaceManager.callAccount(payload.platformCode, payload.method, payload.accountId, ...(Array.isArray(payload.args) ? payload.args : []));
+  });
+  ipcMain.handle('platform-workspace:set-overlay-open', (event, open) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.setOverlayOpen(open);
+  });
+  ipcMain.handle('platform-workspace:go-back', (event) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.goBack();
+  });
+  ipcMain.handle('platform-workspace:go-forward', (event) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.goForward();
+  });
+  ipcMain.handle('platform-workspace:reload', (event) => {
+    if (!fromPlatformWorkspace(event)) throw new Error('无效的工作台调用来源');
+    return platformWorkspaceManager.reload();
   });
   ipcMain.handle('wechat:get-accounts', () => wechatProcessManager.refreshAccounts());
   ipcMain.handle('wechat:identify-accounts', (_event, payload) => {
@@ -888,6 +949,14 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     rendererAdditionalArguments: rendererRuntimeArguments(runtimeConfig),
     rpaManager: rpaProcessManager,
   });
+  platformWorkspaceManager = new PlatformWorkspaceManager({
+    pddManager: pddWorkspaceManager,
+    douyinManager: douyinWorkspaceManager,
+    devServerUrl,
+    rendererPath: path.join(currentDirectory, '..', 'dist', 'index.html'),
+    preloadPath,
+    rendererAdditionalArguments: rendererRuntimeArguments(runtimeConfig),
+  });
   messageNoticeWindow = new MessageNoticeWindow({
     BrowserWindow, screen, preload: path.join(currentDirectory, 'message-notice-preload.cjs'),
     devServerUrl, rendererPath: path.join(currentDirectory, '..', 'dist', 'index.html'),
@@ -913,8 +982,12 @@ app.on('before-quit', (event) => {
   messageNoticeWindow?.dispose();
   const shutdownPromise = Promise.allSettled([
     qianniuWorkerManager ? qianniuWorkerManager.stop() : Promise.resolve(),
-    pddWorkspaceManager ? pddWorkspaceManager.prepareToQuit() : Promise.resolve(),
-    douyinWorkspaceManager ? douyinWorkspaceManager.prepareToQuit() : Promise.resolve(),
+    platformWorkspaceManager
+      ? platformWorkspaceManager.prepareToQuit()
+      : Promise.allSettled([
+        pddWorkspaceManager ? pddWorkspaceManager.prepareToQuit() : Promise.resolve(),
+        douyinWorkspaceManager ? douyinWorkspaceManager.prepareToQuit() : Promise.resolve(),
+      ]),
     rpaProcessManager ? rpaProcessManager.stop() : Promise.resolve(),
   ]);
   wechatProcessManager?.stopMonitoring();

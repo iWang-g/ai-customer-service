@@ -29,6 +29,9 @@ export class DouyinWorkspaceManager {
       rendererAdditionalArguments, rpaManager, homeUrl, loadWorkspaceShell, probeIntervalMs });
     this.userId = null;
     this.window = null;
+    this.hostWindow = false;
+    this.hostLayout = null;
+    this.hostVisible = true;
     this.activeAccountId = null;
     this.views = new Map();
     this.runtime = new Map();
@@ -122,6 +125,37 @@ export class DouyinWorkspaceManager {
     for (const child of this.popups.get(this.activeAccountId) || []) child.show();
     this.syncAccounts();
     this.publish();
+  }
+
+  attachHostWindow(window) {
+    if (!window || window.isDestroyed()) throw new Error('聚合工作台宿主窗口无效');
+    if (this.window && this.window !== window && !this.window.isDestroyed()) {
+      throw new Error('抖店工作区已经绑定到其它窗口');
+    }
+    this.window = window;
+    this.hostWindow = true;
+    this.hostVisible = false;
+    this.layout();
+  }
+
+  detachHostWindow() {
+    if (!this.hostWindow) return;
+    this.hostWindow = false;
+    this.hostLayout = null;
+    this.hostVisible = true;
+    this.window = null;
+  }
+
+  setHostLayout(bounds) {
+    this.hostLayout = bounds && Number.isFinite(bounds.width) && Number.isFinite(bounds.height)
+      ? { x: Math.round(bounds.x || 0), y: Math.round(bounds.y || 0), width: Math.max(1, Math.round(bounds.width)), height: Math.max(1, Math.round(bounds.height)) }
+      : null;
+    this.layout();
+  }
+
+  setHostVisible(visible) {
+    this.hostVisible = Boolean(visible);
+    this.layout();
   }
 
   async ensureWindow() {
@@ -496,8 +530,8 @@ export class DouyinWorkspaceManager {
     if (!this.window || this.window.isDestroyed()) return;
     const [width, height] = this.window.getContentSize();
     for (const [id, view] of this.views) {
-      view.setBounds({ x: 0, y: 72, width, height: Math.max(0, height - 72) });
-      view.setVisible(id === this.activeAccountId && !this.overlayOpen);
+      view.setBounds(this.hostLayout || { x: 0, y: 72, width, height: Math.max(0, height - 72) });
+      view.setVisible(id === this.activeAccountId && !this.overlayOpen && this.hostVisible);
     }
   }
   navigate(action) {
@@ -1062,7 +1096,8 @@ export class DouyinWorkspaceManager {
       this.productDetailProbeReports.clear();
       this.collectors.clear();
       this.sendActors.clear(); this.sendTasks.clear(); this.sendJournal = null; this.rpaWasOnline = false;
-      this.window?.destroy(); this.window = null; this.userId = null;
+      if (!this.hostWindow) this.window?.destroy();
+      this.window = null; this.hostWindow = false; this.hostLayout = null; this.hostVisible = true; this.userId = null;
       this.rpaManager?.setPlatformAccounts('douyin', []);
     })();
     try { await this.closing; } finally { this.closing = null; }

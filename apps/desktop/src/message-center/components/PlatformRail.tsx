@@ -4,7 +4,7 @@
  */
 
 import { AnimatePresence, motion } from 'framer-motion';
-import { LayoutDashboard, LayoutGrid, LogOut, ShoppingBag, Store, Music2 } from 'lucide-react';
+import { LayoutDashboard, LayoutGrid, LogOut, ShoppingBag, Store, Music2, PanelsTopLeft } from 'lucide-react';
 import { useState } from 'react';
 import customerServiceAvatar from '../../shared/assets/customer-service-avatar.svg';
 import { MOCK_PLATFORMS } from '../types';
@@ -13,6 +13,7 @@ interface PlatformRailProps {
   selectedPlatform: string;
   onPlatformSelect: (id: string) => void;
   onOpenAdmin: () => void;
+  onOpenWorkspace: () => void;
   onLogout: () => void;
   userName: string;
   userId: string;
@@ -39,7 +40,7 @@ const railPlatforms = visiblePlatformIds
   .map((id) => MOCK_PLATFORMS.find((platform) => platform.id === id))
   .filter((platform): platform is NonNullable<typeof platform> => Boolean(platform));
 
-export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpenAdmin, onLogout, userName, userId, userRole, lang }: PlatformRailProps) {
+export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpenAdmin, onOpenWorkspace, onLogout, userName, userId, userRole, lang }: PlatformRailProps) {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
 
   const t = {
@@ -59,6 +60,12 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
     <div className="w-18 h-full shrink-0 flex flex-col items-center py-6 bg-white border-r border-slate-200 gap-6" id="platform-rail">
       {/* Top Icons */}
       <div className="flex-1 flex flex-col items-center gap-4 w-full">
+        <button type="button" onClick={onOpenWorkspace} className="group relative flex w-full flex-col items-center gap-1.5 focus:outline-none" id="rail-platform-workspace">
+          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-sky-50 text-sky-600 transition-all group-hover:bg-sky-100"><PanelsTopLeft size={23} /></div>
+          <span className="text-[10px] font-bold text-sky-700">工作台</span>
+          <div className="absolute left-full z-50 ml-4 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-[10px] font-bold text-white opacity-0 shadow-2xl transition-all group-hover:opacity-100">打开多平台工作台</div>
+        </button>
+        <div className="h-px w-8 bg-slate-100" />
         {railPlatforms.map((p) => {
           const Icon = platformIcons[p.id];
           const isActive = selectedPlatform === p.id;

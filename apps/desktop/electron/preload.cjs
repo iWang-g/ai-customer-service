@@ -21,6 +21,7 @@ if (Object.values(runtimeConfig).every(Boolean)) {
 }
 
 contextBridge.exposeInMainWorld('desktopBridge', {
+  openPlatformWorkspace: (payload = {}) => ipcRenderer.invoke('desktop:open-platform-workspace', payload),
   setMessageNoticeOwner: (userId) => ipcRenderer.invoke('message-notice:owner', userId),
   publishMessageNotices: (payload) => ipcRenderer.invoke('message-notice:publish', payload),
   onOpenNoticeConversation: (listener) => {
@@ -81,6 +82,24 @@ contextBridge.exposeInMainWorld('desktopBridge', {
     const handler = () => listener();
     ipcRenderer.on('wechat:show-accounts', handler);
     return () => ipcRenderer.removeListener('wechat:show-accounts', handler);
+  },
+});
+
+contextBridge.exposeInMainWorld('platformWorkspace', {
+  getState: () => ipcRenderer.invoke('platform-workspace:get-state'),
+  selectAccount: (platformCode, accountId) => ipcRenderer.invoke('platform-workspace:select-account', { platformCode, accountId }),
+  setPlatformFilter: (platformCode) => ipcRenderer.invoke('platform-workspace:set-platform-filter', platformCode),
+  addAccount: (platformCode) => ipcRenderer.invoke('platform-workspace:add-account', platformCode),
+  callAccount: (payload) => ipcRenderer.invoke('platform-workspace:call-account', payload),
+  setPageBounds: (bounds) => ipcRenderer.invoke('platform-workspace:page-bounds', bounds),
+  setOverlayOpen: (open) => ipcRenderer.invoke('platform-workspace:set-overlay-open', open),
+  goBack: () => ipcRenderer.invoke('platform-workspace:go-back'),
+  goForward: () => ipcRenderer.invoke('platform-workspace:go-forward'),
+  reload: () => ipcRenderer.invoke('platform-workspace:reload'),
+  onStateChanged: (listener) => {
+    const handler = (_event, state) => listener(state);
+    ipcRenderer.on('platform-workspace:state-changed', handler);
+    return () => ipcRenderer.removeListener('platform-workspace:state-changed', handler);
   },
 });
 
