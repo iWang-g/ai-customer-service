@@ -564,11 +564,21 @@ export class PddWorkspaceManager {
   attachHostWindow(window) {
     if (!window || window.isDestroyed()) throw new Error('聚合工作台宿主窗口无效');
     if (this.window && this.window !== window && !this.window.isDestroyed()) {
-      throw new Error('拼多多工作区已经绑定到其它窗口');
+      if (this.hostWindow) throw new Error('拼多多工作区已经绑定到其它窗口');
+      const previousWindow = this.window;
+      for (const view of this.views.values()) {
+        try {
+          previousWindow.contentView.removeChildView(view);
+        } catch {
+          // The standalone workspace may already be closing.
+        }
+      }
+      previousWindow.hide();
     }
     this.window = window;
     this.hostWindow = true;
     this.hostVisible = false;
+    for (const view of this.views.values()) this.window.contentView.addChildView(view);
     this.#layoutViews();
   }
 
@@ -660,15 +670,16 @@ export class PddWorkspaceManager {
       },
     });
 
-    this.window.on('resize', () => this.#layoutViews());
-    this.window.on('close', (event) => {
+    const createdWindow = this.window;
+    createdWindow.on('resize', () => this.#layoutViews());
+    createdWindow.on('close', (event) => {
       if (!this.isQuitting) {
         event.preventDefault();
-        this.window?.hide();
+        createdWindow.hide();
       }
     });
-    this.window.on('closed', () => {
-      this.window = null;
+    createdWindow.on('closed', () => {
+      if (this.window === createdWindow) this.window = null;
     });
 
     if (!this.loadWorkspaceShell) {
