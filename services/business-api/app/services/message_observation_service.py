@@ -55,7 +55,7 @@ def _conversation_for_snapshot(
     user: User,
     request: RpaEventCreate,
 ) -> Conversation:
-    if request.platform_code not in {"pinduoduo", "wechat"}:
+    if request.platform_code not in {"pinduoduo", "wechat", "qianniu"}:
         raise SnapshotProtocolError("unsupported platform for message_snapshot")
     if not request.platform_account_id:
         raise SnapshotProtocolError("platform_account_id is required")
@@ -855,6 +855,10 @@ def _process_message_snapshot_locked(
         hash_contract = accepted_contracts.get(observation.payload_hash)
         if hash_contract is None:
             raise SnapshotProtocolError("assembled snapshot payload_hash does not match")
+        # Verify the original wire hash before normalizing card content for storage/AI.
+        if request.platform_code == 'pinduoduo':
+            from app.services.pdd_message_context import sanitize_inbound
+            messages = [sanitize_inbound(item) for item in messages]
         snapshot_metrics = _snapshot_metrics(messages)
         if _is_pdd_api_chat_list_snapshot(observation, messages):
             appended_messages = (

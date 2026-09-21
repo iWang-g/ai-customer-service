@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -151,6 +152,7 @@ class RpaAgent:
         self.output_lock = threading.Lock()
         self.last_heartbeat = 0.0
         self.last_task_poll = 0.0
+        self.fast_task_poll_until = 0.0
         self.worker: threading.Thread | None = None
 
     def emit(self, message_type: str, **payload: Any) -> None:
@@ -211,7 +213,7 @@ class RpaAgent:
                 "node_key": node_key,
                 "hostname": socket.gethostname(),
                 "machine_name": platform.node() or None,
-                "supported_platforms": ["pinduoduo", "wechat"],
+                "supported_platforms": ["pinduoduo", "wechat", "qianniu", "douyin"],
                 "app_version": self.app_version,
             },
         )
@@ -231,7 +233,7 @@ class RpaAgent:
         self.request(
             "POST",
             "/rpa/nodes/heartbeat",
-            {"status": "online", "active_platforms": ["pinduoduo"] if self.accounts else []},
+            {"status": "online", "active_platforms": self.active_platforms()},
             node_auth=True,
         )
         self.last_heartbeat = time.monotonic()
@@ -245,7 +247,12 @@ class RpaAgent:
         )
 
     def sync_accounts(self) -> None:
-        payloads: dict[str, list[dict[str, Any]]] = {"pinduoduo": [], "wechat": []}
+        payloads: dict[str, list[dict[str, Any]]] = {
+            "pinduoduo": [],
+            "wechat": [],
+            "qianniu": [],
+            "douyin": [],
+        }
         for account in self.accounts:
             platform_code = str(account.get("platform_code") or "pinduoduo")
             payloads.setdefault(platform_code, []).append(
@@ -283,6 +290,14 @@ class RpaAgent:
                 )
         self.emit("accounts_synced", bindings=bindings)
 
+    def active_platforms(self) -> list[str]:
+        platforms = {
+            str(account.get("platform_code") or "pinduoduo")
+            for account in self.accounts
+            if not account.get("paused") and not account.get("archived")
+        }
+        return [item for item in ("pinduoduo", "wechat", "qianniu", "douyin") if item in platforms]
+
     def flush_events(self) -> None:
         with self.event_flush_lock:
             if not self.event_queue:
@@ -294,6 +309,12 @@ class RpaAgent:
             try:
                 self.request("POST", "/rpa/events/batch", {"events": events}, node_auth=True)
                 self.event_queue.mark_synced(event_ids)
+                # Inbound automation creates follow-up tasks after a short debounce. Poll
+                # briefly at low latency so those tasks do not wait for the idle loop.
+                self.fast_task_poll_until = max(
+                    self.fast_task_poll_until,
+                    time.monotonic() + 8.0,
+                )
                 self.emit("events_synced", count=len(event_ids))
             except ApiError as exc:
                 self.event_queue.mark_failed(event_ids, str(exc))
@@ -317,7 +338,9 @@ class RpaAgent:
                     self.sync_accounts()
                     self.synced_accounts_version = self.accounts_version
                 self.flush_events()
-                if time.monotonic() - self.last_task_poll >= 1.0:
+                now = time.monotonic()
+                task_poll_interval = 0.25 if now < self.fast_task_poll_until else 1.0
+                if now - self.last_task_poll >= task_poll_interval:
                     self.poll_tasks()
                     self.last_task_poll = time.monotonic()
                 if time.monotonic() - self.last_heartbeat >= self.heartbeat_interval:
@@ -327,7 +350,9 @@ class RpaAgent:
                 if isinstance(exc, ApiError) and "HTTP 401" in str(exc):
                     self.node_token = ""
                 self.synced_accounts_version = -1
-            self.wake_event.wait(5)
+            now = time.monotonic()
+            wait_seconds = 0.25 if now < self.fast_task_poll_until else 1.0
+            self.wake_event.wait(wait_seconds)
             self.wake_event.clear()
 
     def handle(self, command: dict[str, Any]) -> None:
@@ -373,6 +398,31 @@ class RpaAgent:
                 request_id=str(command["request_id"]),
                 deleted_count=deleted_count,
             )
+        elif command_type == "qianniu_send_guard":
+            request_id = str(command["request_id"])
+            query = urllib.parse.urlencode(
+                {
+                    "platform_account_id": str(command["platform_account_id"]),
+                    "cid": str(command["cid"]),
+                }
+            )
+            try:
+                result = self.request(
+                    "GET",
+                    f"/rpa/tasks/{command['task_id']}/qianniu-send-guard?{query}",
+                    node_auth=True,
+                )
+                self.emit(
+                    "qianniu_send_guard_result",
+                    request_id=request_id,
+                    result=result or {},
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.emit(
+                    "qianniu_send_guard_result",
+                    request_id=request_id,
+                    error=str(exc)[:500],
+                )
         elif command_type == "update_access_token":
             self.access_token = str(command["access_token"])
             self.node_token = ""

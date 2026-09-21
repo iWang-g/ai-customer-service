@@ -1,6 +1,16 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+
+QIANNIU_BLOCK_WORDS = ('微信', 'v', 'qq', '手机号', '电话', '加我', '私聊', '私下',
+                       '支付宝', '二维码', '别的平台', '网盘', '非淘宝链接')
+
+
+def qianniu_outbound_reason(text: str) -> str | None:
+    text = unicodedata.normalize('NFKC', text).casefold()
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Cf')
+    return next(('qianniu_block_word:' + word for word in QIANNIU_BLOCK_WORDS if word in text), None)
 
 
 PROHIBITED_OUTBOUND_PATTERNS = (

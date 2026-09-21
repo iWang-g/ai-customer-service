@@ -3,13 +3,14 @@ from __future__ import annotations
 from datetime import timedelta
 import re
 from typing import Any
+import unicodedata
 
 from fastapi import HTTPException
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.core.security import utcnow
-from app.models import Conversation, ConversationWorkflow, EmailTemplate, Message, Robot, User
+from app.models import Conversation, ConversationWorkflow, EmailTemplate, Message, Robot, RpaTask, User
 from app.services.email_service import (
     DEFAULT_ASK_EMAIL_TEXT,
     DEFAULT_EMAIL_SUCCESS_TEXT,
@@ -25,18 +26,36 @@ EMAIL_PATTERN = re.compile(
     r"(?![A-Za-z0-9-])",
     re.IGNORECASE,
 )
-ACTIVE_STATUSES = ("waiting_for_template", "waiting_for_email", "ready_to_send", "sending")
+ACTIVE_STATUSES = (
+    "waiting_for_template",
+    "prompt_pending",
+    "prompt_confirmation_pending",
+    "waiting_for_email",
+    "ready_to_send",
+    "sending",
+)
 WORKFLOW_TTL = timedelta(hours=24)
 ASK_EMAIL_TEXT = DEFAULT_ASK_EMAIL_TEXT
 ASK_TEMPLATE_TEXT = "亲，请问您需要哪一份资料呢？"
 SUCCESS_TEXT = DEFAULT_EMAIL_SUCCESS_TEXT
-FAILURE_TEXT = "亲，邮件发送暂时异常，我这边帮您进一步处理。"
 MISSING_TEMPLATE_TEXT = DEFAULT_MISSING_TEMPLATE_TEXT
 
 
 def extract_email(value: str) -> str:
     match = EMAIL_PATTERN.search(value or "")
     return match.group(1).lower() if match else ""
+
+
+def email_unavailable(value: str) -> bool:
+    text = unicodedata.normalize("NFKC", value or "").strip()
+    if not text or extract_email(text):
+        return False
+    mailbox = r"(?:电子)?邮箱(?:号)?"
+    unavailable = r"(?:没有|没(?:有)?|无|无法|不能|不方便|不愿意|不想|提供不了|给不了|用不了)"
+    return bool(
+        re.search(unavailable + r".{0,6}" + mailbox, text)
+        or re.search(mailbox + r".{0,6}" + unavailable, text)
+    )
 
 
 def enabled_templates(db: Session, user: User) -> list[EmailTemplate]:
@@ -126,16 +145,109 @@ def active_workflow(
             ConversationWorkflow.workflow_type == "collect_email_for_link",
             ConversationWorkflow.status.in_(ACTIVE_STATUSES),
         )
-        .order_by(desc(ConversationWorkflow.updated_at))
+        .order_by(
+            desc(ConversationWorkflow.updated_at),
+            desc(ConversationWorkflow.created_at),
+            desc(ConversationWorkflow.id),
+        )
     ).all())
+    selected = None
+    changed = False
     for row in rows:
-        if _not_expired(row.expires_at, now):
-            return row
-        row.status = "expired"
-        row.completed_at = now
-    if rows:
+        if not _not_expired(row.expires_at, now):
+            row.status = "expired"
+            row.completed_at = now
+            changed = True
+        elif selected is None:
+            selected = row
+        else:
+            row.status = "cancelled_superseded"
+            row.completed_at = now
+            changed = True
+    if changed:
         db.commit()
-    return None
+    return selected
+
+
+def cancel_email_workflow(
+    db: Session,
+    workflow: ConversationWorkflow,
+    *,
+    status: str,
+) -> None:
+    if workflow.status not in ACTIVE_STATUSES:
+        return
+    workflow.status = status
+    workflow.completed_at = utcnow()
+    db.add(workflow)
+    db.commit()
+
+
+def email_unavailable_result(
+    db: Session,
+    workflow: ConversationWorkflow,
+) -> dict[str, Any]:
+    cancel_email_workflow(db, workflow, status="cancelled_no_email")
+    result = _workflow_result(
+        text="",
+        next_action="mark_needs_human",
+        decision="needs_human",
+        workflow=workflow,
+        email_action="",
+        workflow_type="human_review",
+        blocked_actions=["send_external_link_in_chat", "send_email"],
+        extra_risk_flags=["email_unavailable"],
+        reason="客户无法提供邮箱",
+    )
+    result["intent"]["need_email"] = False
+    return result
+
+
+def bind_email_prompt_task(
+    db: Session,
+    workflow_id: str,
+    task: RpaTask,
+) -> bool:
+    workflow = db.get(ConversationWorkflow, workflow_id)
+    if workflow is None or workflow.status != "waiting_for_email":
+        return False
+    task.payload_json = {
+        **(task.payload_json or {}),
+        "email_workflow_prompt_id": workflow.id,
+    }
+    workflow.status = "prompt_pending"
+    db.add_all([task, workflow])
+    db.commit()
+    return True
+
+
+def reconcile_email_prompt_task(
+    db: Session,
+    task: RpaTask,
+    *,
+    delivered: bool,
+    confirmation_pending: bool = False,
+) -> bool:
+    workflow_id = str((task.payload_json or {}).get("email_workflow_prompt_id") or "")
+    workflow = db.get(ConversationWorkflow, workflow_id) if workflow_id else None
+    if workflow is None or workflow.status not in {"prompt_pending", "prompt_confirmation_pending"}:
+        return False
+    if delivered:
+        workflow.status = "waiting_for_email"
+    elif confirmation_pending:
+        workflow.status = "prompt_confirmation_pending"
+    else:
+        workflow.status = "failed"
+        workflow.completed_at = utcnow()
+        conversation = db.get(Conversation, workflow.conversation_id)
+        if conversation is not None:
+            conversation.human_required = True
+            conversation.human_required_reason = "email_prompt_send_failed"
+            conversation.human_required_word = None
+            conversation.human_required_at = utcnow()
+            db.add(conversation)
+    db.add(workflow)
+    return True
 
 
 def _workflow_result(
@@ -148,10 +260,13 @@ def _workflow_result(
     email_task_id: str = "",
     workflow_type: str = "collect_email_for_link",
     blocked_actions: list[str] | None = None,
+    extra_risk_flags: list[str] | None = None,
+    reason: str = "会话邮件工作流由程序恢复和编排",
 ) -> dict[str, Any]:
     risk_flags = ["direct_external_link_blocked"]
     if email_action == "missing_bound_template":
         risk_flags.append("missing_bound_email_template")
+    risk_flags.extend(flag for flag in (extra_risk_flags or []) if flag not in risk_flags)
     return {
         "decision": decision,
         "text": text,
@@ -166,7 +281,7 @@ def _workflow_result(
             "next_action": next_action,
             "missing_slots": list(workflow.missing_slots_json if workflow else []),
             "risk_flags": risk_flags,
-            "reason": "会话邮件工作流由程序恢复和编排",
+            "reason": reason,
         },
         "action_plan": {
             "workflow": workflow_type,
@@ -243,20 +358,22 @@ def start_or_resume_email_workflow(
     texts = _workflow_texts(config)
     row = workflow
     if row is None:
-        row = ConversationWorkflow(
-            user_id=user.id,
-            conversation_id=conversation.id,
-            robot_id=robot.id,
-            workflow_type="collect_email_for_link",
-            status="waiting_for_template",
-            intent="email_link_request",
-            collected_slots_json={},
-            missing_slots_json=["template", "email"],
-            source_message_id=source_message.id if source_message else None,
-            expires_at=utcnow() + WORKFLOW_TTL,
-        )
-        db.add(row)
-        db.flush()
+        row = active_workflow(db, user, conversation, robot)
+        if row is None:
+            row = ConversationWorkflow(
+                user_id=user.id,
+                conversation_id=conversation.id,
+                robot_id=robot.id,
+                workflow_type="collect_email_for_link",
+                status="waiting_for_template",
+                intent="email_link_request",
+                collected_slots_json={},
+                missing_slots_json=["template", "email"],
+                source_message_id=source_message.id if source_message else None,
+                expires_at=utcnow() + WORKFLOW_TTL,
+            )
+            db.add(row)
+            db.flush()
 
     slots = dict(row.collected_slots_json or {})
     template = None
@@ -327,11 +444,15 @@ def start_or_resume_email_workflow(
         row.completed_at = utcnow()
         db.commit()
         return _workflow_result(
-            text=FAILURE_TEXT,
+            text="",
             next_action="email_failed",
-            decision="auto_send",
+            decision="needs_human",
             workflow=row,
             email_action="email_failed",
+            workflow_type="human_review",
+            blocked_actions=["send_external_link_in_chat", "retry_email"],
+            extra_risk_flags=["email_send_failed"],
+            reason="email_send_failed",
         )
 
     if task.status != "sent":
@@ -339,12 +460,16 @@ def start_or_resume_email_workflow(
         row.completed_at = utcnow()
         db.commit()
         return _workflow_result(
-            text=FAILURE_TEXT,
+            text="",
             next_action="email_failed",
-            decision="auto_send",
+            decision="needs_human",
             workflow=row,
             email_action="email_failed",
             email_task_id=task.id,
+            workflow_type="human_review",
+            blocked_actions=["send_external_link_in_chat", "retry_email"],
+            extra_risk_flags=["email_send_failed"],
+            reason="email_send_failed",
         )
     row.status = "completed"
     row.completed_at = utcnow()

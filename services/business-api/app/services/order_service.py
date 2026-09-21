@@ -18,6 +18,7 @@ from app.models import (
     Robot,
     RobotPlatformScope,
     RpaTask,
+    PlatformAccount,
     User,
     utcnow,
 )
@@ -224,6 +225,8 @@ def maybe_create_order_follow_up(
     source_message: Message,
     result: dict[str, Any],
 ) -> CustomerOutreachRun | None:
+    if conversation.platform_code in {"qianniu", "douyin"}:
+        return None
     config = robot.config_json if isinstance(robot.config_json, dict) else {}
     if config.get("order_follow_up_enabled") is not True:
         return None
@@ -258,6 +261,8 @@ def _maybe_create_post_receipt(
     conversation: Conversation,
     order: CustomerOrder,
 ) -> CustomerOutreachRun | None:
+    if conversation.platform_code in {"qianniu", "douyin"}:
+        return None
     robot = _active_robot(db, conversation)
     if robot is None:
         return None
@@ -297,10 +302,27 @@ def apply_orders_snapshot(
     payload: dict[str, Any],
     observed_at: datetime | None,
 ) -> None:
+    if conversation.platform_code == 'douyin':
+        raise HTTPException(400, 'Douyin orders require a bound read task')
     collection_status = str(payload.get("collection_status") or "unavailable")
     if collection_status not in COLLECTION_STATUSES:
         collection_status = "unavailable"
     observed = observed_at or utcnow()
+    # Qianniu order snapshots also supply reply context. Never schedule
+    # follow-up or post-receipt automation from this platform's read path.
+    qianniu_read_only = conversation.platform_code == "qianniu" or payload.get("platform") == "qianniu"
+    if conversation.platform_code == "qianniu":
+        account = db.get(PlatformAccount, conversation.platform_account_id)
+        shop_uid = str(payload.get("shop_uid") or "")
+        if (not account or account.user_id != conversation.user_id or account.platform_code != "qianniu"
+                or account.external_account_id != f"qianniu:{shop_uid}"
+                or payload.get("identity_verified") is not True
+                or payload.get("cid") != conversation.external_conversation_id):
+            raise HTTPException(status_code=400, detail="Qianniu order identity mismatch")
+        previous = (conversation.metadata_json or {}).get("customer_orders", {})
+        previous_time = _datetime(previous.get("observed_at"))
+        if previous_time and observed <= previous_time:
+            return
     customer_key = _customer_key(conversation, payload)
     orders = payload.get("orders") if isinstance(payload.get("orders"), list) else []
     saved_count = 0
@@ -330,6 +352,8 @@ def apply_orders_snapshot(
                     first_observed_at=observed,
                     last_observed_at=observed,
                 )
+            elif qianniu_read_only and order.conversation_id != conversation.id:
+                raise HTTPException(status_code=400, detail="Qianniu order belongs to another conversation")
             order.conversation_id = conversation.id
             order.customer_key = customer_key
             order.goods_id = _clean_id(item.get("goods_id")) or _goods_id_from_products(item.get("products"))
@@ -342,7 +366,9 @@ def apply_orders_snapshot(
             order.ordered_at = _datetime(item.get("ordered_at"))
             order.paid_at = _datetime(item.get("paid_at"))
             first_signed_observation = normalized_status in {"signed", "completed"} and order.signed_at is None
-            if first_signed_observation:
+            if qianniu_read_only:
+                order.signed_at = _datetime(item.get("signed_at"))
+            elif first_signed_observation:
                 order.signed_at = _datetime(item.get("signed_at")) or observed
             order.after_sale_json = (
                 item.get("after_sale") if isinstance(item.get("after_sale"), dict) else {}
@@ -351,7 +377,7 @@ def apply_orders_snapshot(
             order.raw_payload = item
             db.add(order)
             db.flush()
-            if _order_status_allows_post_receipt_care(order):
+            if not qianniu_read_only and _order_status_allows_post_receipt_care(order):
                 _maybe_create_post_receipt(db, conversation, order)
             observed_order_ids.add(platform_order_id)
             saved_count += 1
@@ -360,6 +386,9 @@ def apply_orders_snapshot(
     # snapshots as unknown so they can never authorize an outreach message.
     if collection_status == "success" and saved_count == 0:
         collection_status = "unavailable"
+    if qianniu_read_only and collection_status in {"success", "empty"}:
+        # Keep only IDs in the last successful snapshot visible; preserve stored history.
+        payload = {**payload, "visible_order_ids": sorted(observed_order_ids)}
 
     page_summary = payload.get("page_summary") if isinstance(payload.get("page_summary"), dict) else {}
     try:
@@ -375,6 +404,7 @@ def apply_orders_snapshot(
             "customer_key": customer_key,
             "order_count": total_count,
             "has_more": page_summary.get("has_more") is True,
+            **({"visible_order_ids": payload["visible_order_ids"]} if "visible_order_ids" in payload else {}),
         },
     }
     db.add(conversation)
@@ -390,13 +420,14 @@ def apply_orders_snapshot(
         page_summary.get("has_more") is True,
         str(payload.get("error") or "")[:128] or None,
     )
-    _resolve_rechecking_outreach(
-        db,
-        conversation,
-        collection_status,
-        observed_order_ids=observed_order_ids,
-        has_more=page_summary.get("has_more") is True,
-    )
+    if not qianniu_read_only:
+        _resolve_rechecking_outreach(
+            db,
+            conversation,
+            collection_status,
+            observed_order_ids=observed_order_ids,
+            has_more=page_summary.get("has_more") is True,
+        )
 
 
 def _cancel(run: CustomerOutreachRun, reason: str) -> None:
@@ -474,6 +505,9 @@ def _queue_outreach_send(
     conversation: Conversation,
     run: CustomerOutreachRun,
 ) -> None:
+    if conversation.platform_code in {"qianniu", "douyin"}:
+        _cancel(run, f"{conversation.platform_code}_orders_read_only")
+        return
     from app.services.message_service import create_send_task
 
     user = db.get(User, run.user_id)
@@ -536,6 +570,10 @@ def schedule_due_outreach_rechecks(db: Session, *, limit: int = 50) -> int:
         conversation = db.get(Conversation, run.conversation_id)
         if not conversation or not conversation.platform_account_id:
             _cancel(run, "conversation_not_found")
+            db.add(run)
+            continue
+        if conversation.platform_code in {"qianniu", "douyin"}:
+            _cancel(run, f"{conversation.platform_code}_orders_read_only")
             db.add(run)
             continue
         if run.strategy_type == "order_follow_up" and _has_pending_formal_reply(db, run):
@@ -616,6 +654,8 @@ def _schedule_open_order_rechecks(
         conversation = db.get(Conversation, order.conversation_id)
         if not conversation or not conversation.platform_account_id:
             continue
+        if conversation.platform_code in {"qianniu", "douyin"}:
+            continue
         refresh_bucket = int(now.timestamp() // 1800)
         idempotency_key = f"customer-order-refresh:{conversation.id}:{refresh_bucket}"
         if db.scalar(select(RpaTask).where(RpaTask.idempotency_key == idempotency_key)):
@@ -662,6 +702,17 @@ def customer_orders_response(
         .order_by(desc(CustomerOutreachRun.created_at))
     ).all())
     observed_at = _datetime(summary.get("observed_at"))
+    if conversation.platform_code == 'douyin':
+        account = db.get(PlatformAccount, conversation.platform_account_id)
+        expected_cid = f"{summary.get('customer_key', '')}:{account.external_account_id}::2:1:pigeon" if account else None
+        if (not account or account.user_id != user.id or summary.get('shop_id') != account.external_account_id
+                or expected_cid != conversation.external_conversation_id):
+            summary = {}
+            observed_at = None
+    if conversation.platform_code in {"qianniu", "douyin"}:
+        visible = set(summary.get("visible_order_ids", []))
+        orders = [order for order in orders if order.platform_order_id in visible]
+        outreach = []
     collection_status = str(summary.get("collection_status") or "not_collected")
     if collection_status not in {*COLLECTION_STATUSES, "not_collected"}:
         collection_status = "not_collected"
@@ -673,18 +724,26 @@ def customer_orders_response(
         customer_key=str(summary.get("customer_key") or ""),
         total_count=max(int(summary.get("order_count") or 0), len(orders)),
         has_more=summary.get("has_more") is True,
+        query_coverage=summary.get("query_coverage"),
+        last_attempt_task_id=summary.get("last_attempt_task_id"),
+        last_attempt_at=_datetime(summary.get("last_attempt_at")),
         orders=[CustomerOrderRead.model_validate(item) for item in orders],
         outreach=[OutreachStatusRead.model_validate(item) for item in outreach],
     )
 
 
 def order_prompt_context(db: Session, conversation: Conversation) -> dict[str, Any]:
+    if conversation.platform_code == "douyin":
+        from app.services.douyin_order_context import prompt_context
+        return prompt_context(db, conversation)
     summary = (conversation.metadata_json or {}).get("customer_orders")
     if not isinstance(summary, dict):
-        return {"collection_status": "not_collected", "has_orders": False, "recent_orders": []}
+        return {"collection_status": "not_collected", "has_orders": False, "recent_orders": [],
+                **({"dynamic_fields_fresh": False, "orders_known": False} if conversation.platform_code == "qianniu" else {})}
     orders = list(db.scalars(
         select(CustomerOrder)
-        .where(CustomerOrder.conversation_id == conversation.id)
+        .where(CustomerOrder.conversation_id == conversation.id, CustomerOrder.user_id == conversation.user_id,
+               CustomerOrder.platform_account_id == conversation.platform_account_id)
         .order_by(desc(CustomerOrder.ordered_at), desc(CustomerOrder.last_observed_at))
         .limit(5)
     ).all())
@@ -698,13 +757,22 @@ def order_prompt_context(db: Session, conversation: Conversation) -> dict[str, A
             "products": item.products_json,
             "paid_amount": item.paid_amount,
             "after_sale": item.after_sale_json,
+            **({"order_amount": item.order_amount, "paid_at": item.paid_at.isoformat() if item.paid_at else None}
+               if conversation.platform_code == "qianniu" else {}),
         }
         for item in orders
     ]
+    extra = {}
+    if conversation.platform_code == "qianniu":
+        from app.services.qianniu_order_context import freshness
+        extra = {**freshness(summary), "orders_known": summary.get("collection_status") in {"success", "empty"},
+                 "total_count": summary.get("order_count"), "has_more": summary.get("has_more") is True,
+                 "context_truncated": len(orders) == 5 or summary.get("has_more") is True}
     return {
         "collection_status": summary.get("collection_status") or "not_collected",
         "observed_at": summary.get("observed_at"),
         "has_orders": bool(normalized),
         "latest_order": normalized[0] if normalized else None,
         "recent_orders": normalized,
+        **extra,
     }

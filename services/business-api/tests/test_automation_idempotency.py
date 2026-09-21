@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
@@ -12,6 +13,8 @@ from app.models import (
     AutomationReplyRun,
     Base,
     Conversation,
+    ConversationWorkflow,
+    EmailTemplate,
     Message,
     PlatformAccount,
     Robot,
@@ -24,8 +27,10 @@ from app.schemas.automation import ReplyRunRequest
 from app.schemas.message import SendMessageRequest
 from app.services.automation_service import (
     PDD_CUSTOM_ORDER_SCENE_METADATA_KEY,
+    _execute_bound_reply,
     _pending_inbound_reply_tasks,
     _can_refresh_order_context,
+    inbound_reply_debounce_seconds,
     _queue_reply_task,
     _refresh_order_context_before_reply,
     _snapshot_customer_batch_size,
@@ -122,6 +127,433 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply_run.qa_match_type, "exact")
         self.assertEqual(reply_run.trigger_sequence, 1)
         self.assertFalse(reply_run.document_retrieval_used)
+
+    async def test_qianniu_waiting_email_resumes_despite_image_request_in_history(self) -> None:
+        account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="qianniu",
+            platform_name="千牛",
+            local_account_id="shop-uid",
+            account_name="测试店铺:客服",
+            account_alias="测试店铺",
+            is_active=True,
+        )
+        self.db.add(account)
+        self.db.flush()
+        self.conversation.platform_code = "qianniu"
+        self.conversation.platform_account_id = account.id
+        self.conversation.last_message_sequence = 2
+        self.source_message.platform_code = "qianniu"
+        self.source_message.content = "怎么看图"
+        template = EmailTemplate(
+            user_id=self.user.id,
+            platform_account_id=account.id,
+            template_key="store-view-link",
+            name="店铺看图资料",
+            scene="store_view_link",
+            subject="店铺看图资料",
+            body="邮件正文",
+            enabled=True,
+        )
+        self.db.add(template)
+        self.db.flush()
+        workflow = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            template_id=template.id,
+            collected_slots_json={"template_id": template.id},
+            missing_slots_json=["email"],
+            source_message_id=self.source_message.id,
+        )
+        email_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="qianniu",
+            sender_role="customer",
+            content="3509932519@qq.com",
+            conversation_sequence=2,
+        )
+        self.db.add_all([workflow, email_message])
+        self.db.commit()
+
+        request = ReplyRunRequest(
+            conversation_id=self.conversation.id,
+            source_message_id=email_message.id,
+            allow_auto_send=True,
+        )
+        with (
+            patch(
+                "app.services.qianniu_product_detail_service.ensure_details",
+                new=AsyncMock(return_value={"attempted": False, "product_ids": []}),
+            ),
+            patch("app.services.qianniu_product_detail_service.prompt_details", return_value=[]),
+            patch(
+                "app.services.automation_service._refresh_order_context_before_reply",
+                new=AsyncMock(return_value={"attempted": False}),
+            ),
+            patch(
+                "app.services.automation_service._decide_reply",
+                new=AsyncMock(side_effect=AssertionError("AI routing must not run for a waiting email workflow")),
+            ) as decide,
+            patch(
+                "app.services.email_workflow_service.send_template_email",
+                return_value=SimpleNamespace(status="sent", id="email-task"),
+            ) as send_email,
+            patch(
+                "app.services.automation_service._queue_reply_task_ordered",
+                new=AsyncMock(return_value="reply-task"),
+            ),
+        ):
+            result = await _execute_bound_reply(
+                self.db,
+                self.user,
+                request,
+                self.conversation,
+                self.robot,
+                email_message,
+            )
+
+        self.db.refresh(workflow)
+        self.assertEqual(workflow.status, "completed")
+        self.assertEqual(result["action_plan"]["next_action"], "email_sent")
+        self.assertEqual(result["task_ids"], ["reply-task"])
+        send_email.assert_called_once()
+        self.assertEqual(send_email.call_args.kwargs["recipient"], "3509932519@qq.com")
+        decide.assert_not_awaited()
+
+    async def test_qianniu_unknown_customer_message_calls_ai_with_raw_context(self) -> None:
+        account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="qianniu",
+            platform_name="千牛",
+            local_account_id="unknown-message-shop",
+            account_name="测试店铺:客服",
+            is_active=True,
+        )
+        self.db.add(account)
+        self.db.flush()
+        self.conversation.platform_code = "qianniu"
+        self.conversation.platform_account_id = account.id
+        self.conversation.external_conversation_id = "100.1-200.1#11001@cntaobao"
+        self.robot.config_json = {
+            **(self.robot.config_json or {}),
+            "human_handoff_strategy": "transfer_conversation",
+        }
+        self.source_message.platform_code = "qianniu"
+        self.source_message.content = "[暂不支持的消息]"
+        self.source_message.raw_payload = {
+            "message_type": "unknown",
+            "automation_mode": "trigger",
+            "service_obligation": "required",
+            "service_obligation_reason": "unsupported_message",
+            "context_eligible": True,
+            "qianniu_raw": {"schema_version": 1, "template_id": 164002},
+        }
+        self.db.commit()
+        with (
+            patch("app.services.automation_service._queue_transfer_ack_task") as queue_transfer,
+            patch("app.services.automation_service._decide_reply",
+                  new=AsyncMock(return_value={"decision": "auto_send", "text": "好的", "intent": {},
+                                             "action_plan": {"workflow": "answer_question"}})) as decide,
+            patch("app.services.automation_service._queue_reply_task_ordered",
+                  new=AsyncMock(return_value="reply-task")),
+            patch("app.services.qianniu_product_detail_service.ensure_details",
+                  new=AsyncMock(return_value={"attempted": False, "product_ids": []})),
+            patch("app.services.automation_service._refresh_order_context_before_reply",
+                  new=AsyncMock(return_value={})),
+        ):
+            result = await _execute_bound_reply(
+                self.db,
+                self.user,
+                ReplyRunRequest(conversation_id=self.conversation.id,
+                                source_message_id=self.source_message.id, allow_auto_send=True),
+                self.conversation,
+                self.robot,
+                self.source_message,
+            )
+
+        self.assertEqual(result["task_ids"], ["reply-task"])
+        queue_transfer.assert_not_called()
+        decide.assert_awaited_once()
+        evidence = decide.call_args.kwargs["platform_context"][-1]
+        self.assertEqual(evidence["type"], "unsupported_qianniu_message")
+        self.assertEqual(evidence["data"]["template_id"], 164002)
+        self.assertTrue(evidence["data"]["untrusted"])
+        self.assertFalse(self.conversation.human_required)
+
+    async def test_qianniu_email_unavailable_cancels_workflow_and_transfers(self) -> None:
+        account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="qianniu",
+            platform_name="千牛",
+            local_account_id="shop-email-unavailable",
+            account_name="测试店铺:客服",
+            is_active=True,
+        )
+        self.db.add(account)
+        self.db.flush()
+        self.conversation.platform_code = "qianniu"
+        self.conversation.platform_account_id = account.id
+        self.conversation.external_conversation_id = "buyer.1-shop.1#11001@cntaobao"
+        self.conversation.last_message_sequence = 2
+        self.robot.config_json = {
+            **(self.robot.config_json or {}),
+            "human_handoff_strategy": "transfer_conversation",
+        }
+        self.source_message.platform_code = "qianniu"
+        self.source_message.content = "怎么看图"
+        workflow = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            missing_slots_json=["email"],
+            source_message_id=self.source_message.id,
+        )
+        follow_up = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="qianniu",
+            sender_role="customer",
+            content="没有邮箱，怎么看图",
+            conversation_sequence=2,
+        )
+        self.db.add_all([workflow, follow_up])
+        self.db.commit()
+        transfer_result = {
+            "decision": "needs_human",
+            "text": "",
+            "task_ids": ["transfer-prepare-task"],
+        }
+
+        with (
+            patch("app.services.qianniu_product_detail_service.ensure_details",
+                  new=AsyncMock(return_value={"attempted": False, "product_ids": []})),
+            patch("app.services.qianniu_product_detail_service.prompt_details", return_value=[]),
+            patch("app.services.automation_service._refresh_order_context_before_reply",
+                  new=AsyncMock(return_value={"attempted": False})),
+            patch("app.services.automation_service._decide_reply",
+                  new=AsyncMock(side_effect=AssertionError("AI must not override mailbox refusal"))) as decide,
+            patch("app.services.automation_service._queue_transfer_ack_task",
+                  return_value=transfer_result) as queue_transfer,
+        ):
+            result = await _execute_bound_reply(
+                self.db,
+                self.user,
+                ReplyRunRequest(conversation_id=self.conversation.id,
+                                source_message_id=follow_up.id, allow_auto_send=True),
+                self.conversation,
+                self.robot,
+                follow_up,
+            )
+
+        self.db.refresh(workflow)
+        self.assertEqual(workflow.status, "cancelled_no_email")
+        self.assertEqual(result["task_ids"], ["transfer-prepare-task"])
+        queue_transfer.assert_called_once_with(
+            self.db,
+            self.user,
+            self.conversation,
+            self.robot,
+            follow_up,
+            reason="客户无法提供邮箱",
+        )
+        decide.assert_not_awaited()
+
+    async def test_qianniu_unrelated_question_interrupts_waiting_email_and_uses_ai(self) -> None:
+        account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="qianniu",
+            platform_name="千牛",
+            local_account_id="shop-email-interrupted",
+            account_name="测试店铺:客服",
+            is_active=True,
+        )
+        self.db.add(account)
+        self.db.flush()
+        self.conversation.platform_code = "qianniu"
+        self.conversation.platform_account_id = account.id
+        self.conversation.external_conversation_id = "buyer.2-shop.1#11001@cntaobao"
+        self.conversation.last_message_sequence = 2
+        self.source_message.platform_code = "qianniu"
+        self.source_message.content = "怎么看图"
+        workflow = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            missing_slots_json=["email"],
+            source_message_id=self.source_message.id,
+        )
+        follow_up = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="qianniu",
+            sender_role="customer",
+            content="推荐什么材料",
+            conversation_sequence=2,
+        )
+        self.db.add_all([workflow, follow_up])
+        self.db.commit()
+        ai_result = {
+            "decision": "auto_send",
+            "text": "建议根据用途选择合适的面料。",
+            "intent": {"intent": "normal_question"},
+            "action_plan": {"workflow": "answer_question"},
+            "qa_match": {"matched": False},
+            "retrieval": [],
+        }
+
+        with (
+            patch("app.services.qianniu_product_detail_service.ensure_details",
+                  new=AsyncMock(return_value={"attempted": False, "product_ids": []})),
+            patch("app.services.qianniu_product_detail_service.prompt_details", return_value=[]),
+            patch("app.services.automation_service._refresh_order_context_before_reply",
+                  new=AsyncMock(return_value={"attempted": False})),
+            patch("app.services.automation_service._decide_reply",
+                  new=AsyncMock(return_value=ai_result)) as decide,
+            patch("app.services.automation_service._queue_reply_task_ordered",
+                  new=AsyncMock(return_value="reply-task")),
+        ):
+            result = await _execute_bound_reply(
+                self.db,
+                self.user,
+                ReplyRunRequest(conversation_id=self.conversation.id,
+                                source_message_id=follow_up.id, allow_auto_send=True),
+                self.conversation,
+                self.robot,
+                follow_up,
+            )
+
+        self.db.refresh(workflow)
+        self.assertEqual(workflow.status, "cancelled_interrupted")
+        self.assertEqual(result["task_ids"], ["reply-task"])
+        decide.assert_awaited_once()
+
+    async def test_qianniu_failed_email_transfers_without_queuing_failure_reply(self) -> None:
+        account = PlatformAccount(
+            user_id=self.user.id,
+            platform_code="qianniu",
+            platform_name="千牛",
+            local_account_id="shop-uid",
+            account_name="测试店铺:客服",
+            account_alias="测试店铺",
+            is_active=True,
+        )
+        self.db.add(account)
+        self.db.flush()
+        self.conversation.platform_code = "qianniu"
+        self.conversation.platform_account_id = account.id
+        self.conversation.last_message_sequence = 2
+        self.robot.config_json = {
+            **(self.robot.config_json or {}),
+            "human_handoff_strategy": "transfer_conversation",
+        }
+        self.source_message.platform_code = "qianniu"
+        self.source_message.content = "怎么看图"
+        template = EmailTemplate(
+            user_id=self.user.id,
+            platform_account_id=account.id,
+            template_key="store-view-link-failure",
+            name="店铺看图资料",
+            scene="store_view_link",
+            subject="店铺看图资料",
+            body="邮件正文",
+            enabled=True,
+        )
+        self.db.add(template)
+        self.db.flush()
+        workflow = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            template_id=template.id,
+            collected_slots_json={"template_id": template.id},
+            missing_slots_json=["email"],
+            source_message_id=self.source_message.id,
+        )
+        email_message = Message(
+            conversation_id=self.conversation.id,
+            user_id=self.user.id,
+            platform_code="qianniu",
+            sender_role="customer",
+            content="3509932519@qq.com",
+            conversation_sequence=2,
+        )
+        self.db.add_all([workflow, email_message])
+        self.db.commit()
+
+        request = ReplyRunRequest(
+            conversation_id=self.conversation.id,
+            source_message_id=email_message.id,
+            allow_auto_send=True,
+        )
+        transfer_result = {
+            "decision": "needs_human",
+            "text": "",
+            "task_ids": ["transfer-prepare-task"],
+            "transfer_reason": "email_send_failed",
+        }
+        with (
+            patch(
+                "app.services.qianniu_product_detail_service.ensure_details",
+                new=AsyncMock(return_value={"attempted": False, "product_ids": []}),
+            ),
+            patch("app.services.qianniu_product_detail_service.prompt_details", return_value=[]),
+            patch(
+                "app.services.automation_service._refresh_order_context_before_reply",
+                new=AsyncMock(return_value={"attempted": False}),
+            ),
+            patch(
+                "app.services.automation_service._decide_reply",
+                new=AsyncMock(side_effect=AssertionError("AI routing must not run for a waiting email workflow")),
+            ),
+            patch(
+                "app.services.email_workflow_service.send_template_email",
+                return_value=SimpleNamespace(status="failed", id="email-task"),
+            ),
+            patch(
+                "app.services.automation_service._queue_transfer_ack_task",
+                return_value=transfer_result,
+            ) as queue_transfer,
+            patch(
+                "app.services.automation_service._queue_reply_task_ordered",
+                new=AsyncMock(return_value="failure-reply-task"),
+            ) as queue_reply,
+        ):
+            result = await _execute_bound_reply(
+                self.db,
+                self.user,
+                request,
+                self.conversation,
+                self.robot,
+                email_message,
+            )
+
+        self.db.refresh(workflow)
+        self.assertEqual(workflow.status, "failed")
+        self.assertEqual(result["task_ids"], ["transfer-prepare-task"])
+        self.assertEqual(result["transfer_reason"], "email_send_failed")
+        queue_transfer.assert_called_once_with(
+            self.db,
+            self.user,
+            self.conversation,
+            self.robot,
+            email_message,
+            reason="email_send_failed",
+        )
+        queue_reply.assert_not_awaited()
 
     async def test_completed_auto_reply_broadcasts_queued_message_for_optimistic_ui(self) -> None:
         response = create_send_task(
@@ -279,7 +711,7 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.conversation.human_required_reason, "image_message")
         task = self.db.scalar(select(RpaTask))
         self.assertIsNotNone(task)
-        self.assertEqual(task.payload_json["quote_message_id"], self.source_message.platform_message_id)
+        self.assertNotIn("quote_message_id", task.payload_json)
         reply_run = self.db.scalar(select(AutomationReplyRun))
         self.assertTrue(reply_run.human_required_marked)
         self.assertEqual(reply_run.human_required_reason, "image_message")
@@ -671,6 +1103,24 @@ class AutomationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             "event-new",
         )
         self.assertNotIn((self.user.id, self.conversation.id), _pending_inbound_reply_tasks)
+
+    def test_inbound_reply_debounce_is_adaptive(self) -> None:
+        def message(content: str, message_type: str = "text") -> Message:
+            return Message(
+                conversation_id=self.conversation.id,
+                user_id=self.user.id,
+                platform_code="qianniu",
+                sender_role="customer",
+                content=content,
+                raw_payload={"message_type": message_type},
+            )
+
+        self.assertEqual(inbound_reply_debounce_seconds(message("什么时候发货")), 1.2)
+        self.assertEqual(inbound_reply_debounce_seconds(message("你好")), 1.2)
+        self.assertEqual(inbound_reply_debounce_seconds(message("商品卡", "product")), 1.2)
+        self.assertEqual(inbound_reply_debounce_seconds(message("我想")), 3.0)
+        self.assertEqual(inbound_reply_debounce_seconds(message("还有")), 3.0)
+        self.assertEqual(inbound_reply_debounce_seconds(message("麻烦帮忙确认一下")), 1.5)
 
     async def test_debounced_inbound_reply_does_not_cancel_started_processing(self) -> None:
         _pending_inbound_reply_tasks.clear()

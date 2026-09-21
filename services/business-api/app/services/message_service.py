@@ -48,7 +48,6 @@ from app.services.message_observation_service import (
     snapshot_messages_from_observation,
 )
 from app.services.message_queue_service import append_message, append_messages
-from app.services.outbound_safety import prohibited_outbound_reason
 
 
 PLACEHOLDER_SHOP_NAMES = {
@@ -89,6 +88,10 @@ def _metadata_text(metadata: dict, key: str) -> str | None:
 
 
 def _conversation_read(conversation: Conversation, db: Session | None = None) -> ConversationRead:
+    from app.services.qianniu_transfer_service import current_operation
+    from app.services.douyin_transfer_service import current_operation as douyin_operation
+    from app.services.pdd_auto_transfer import state as pdd_operation
+    from app.services.qianniu_shop_profile import shop_name as qianniu_shop_name
     account = conversation.platform_account
     platform_name = (
         account.platform_name
@@ -104,6 +107,9 @@ def _conversation_read(conversation: Conversation, db: Session | None = None) ->
         or _metadata_text(account_metadata, "logo_url")
     )
     shop_service_username = _metadata_text(account_metadata, "cs_username")
+    if conversation.platform_code == 'qianniu':
+        shop_name = qianniu_shop_name(account) or '待识别店铺'
+        shop_service_username = _metadata_text(account_metadata, 'service_account_name') or (account.account_name if account else None)
     shop_is_mall_owner = account_metadata.get("is_mall_owner") is True
     metadata = conversation.metadata_json or {}
     if not shop_name:
@@ -140,6 +146,11 @@ def _conversation_read(conversation: Conversation, db: Session | None = None) ->
                 .limit(1)
             )
     return ConversationRead.model_validate(conversation).model_copy(update={
+        "metadata_json": ({**metadata, "qianniu_transfer": current_operation(db, conversation)}
+            if db is not None and conversation.platform_code == 'qianniu' else
+            {**metadata, 'douyin_transfer': douyin_operation(db, conversation)}
+            if db is not None and conversation.platform_code == 'douyin' else
+            {**metadata, 'auto_transfer': pdd_operation(conversation)} if conversation.platform_code == 'pinduoduo' else metadata),
         "platform_name": platform_name,
         "shop_name": shop_name,
         "shop_logo_url": shop_logo_url,
@@ -659,11 +670,19 @@ def list_messages(
             items=[MessageRead.model_validate(item) for item in ordered[start:end]],
             meta=PageMeta(total=total, limit=limit, offset=offset),
         )
-    # Page backwards from the permanent queue tail, then restore chat order.
+    order = [desc(Message.conversation_sequence)]
+    if conversation.platform_code in {"qianniu", "douyin"}:
+        # Late history belongs at its platform time; permanent sequences still define clearing.
+        order = [
+            desc(func.coalesce(Message.platform_sent_at, Message.collected_at)),
+            desc(Message.conversation_sequence),
+            desc(Message.id),
+        ]
+    # Select the newest page in display order, then return it oldest first.
     stmt = (
         select(Message)
         .where(visible_messages)
-        .order_by(desc(Message.conversation_sequence))
+        .order_by(*order)
         .offset(offset)
         .limit(limit)
     )
@@ -716,17 +735,36 @@ def create_send_task(
     idempotency_key: str | None = None,
     source: str = "desktop",
     task_status: str = "queued",
+    automation_context: dict[str, str] | None = None,
 ) -> SendMessageResponse:
+    conversation = db.get(Conversation, request.conversation_id)
+    if not conversation or conversation.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     if source != "desktop":
-        prohibited_reason = prohibited_outbound_reason(request.content)
+        from app.services.qianniu_product_links import outbound_reason
+        prohibited_reason = outbound_reason(db, conversation, request.content)
         if prohibited_reason:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Outbound content contains prohibited platform contact/link content: {prohibited_reason}",
             )
-    conversation = db.get(Conversation, request.conversation_id)
-    if not conversation or conversation.user_id != user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if conversation.platform_code == 'qianniu' and source != 'desktop':
+        from app.services.outbound_safety import qianniu_outbound_reason
+        reason = qianniu_outbound_reason(request.content)
+        if reason:
+            raise HTTPException(422, reason)
+    from app.services.qianniu_transfer_service import transfer_blocked
+    from app.services.qianniu_transfer_service import current_operation
+    op = (current_operation(db, conversation) or {}) if conversation.platform_code == 'qianniu' else {}
+    if source != 'desktop' and conversation.human_required and op.get('source') == 'automation' and op.get('status') == 'failed':
+        raise HTTPException(409, '千牛自动转接失败，该会话需要人工处理')
+    ack_creation = (source == 'automation' and request.content == '为您转接中'
+        and op.get('status') == 'ack_queued' and (automation_context or {}).get('qianniu_auto_operation_id') == op.get('id')
+        and idempotency_key == 'qn-transfer-ack:' + str(op.get('id')))
+    if transfer_blocked(conversation) and not ack_creation:
+        raise HTTPException(409, '千牛会话正在转接、已转接或结果待确认，已阻止发送')
+    if conversation.platform_code == "douyin" and request.client_message_id:
+        idempotency_key = f"douyin-manual:{user.id}:{conversation.id}:{request.client_message_id}"
     if idempotency_key:
         existing_task = db.scalar(select(RpaTask).where(
             RpaTask.user_id == user.id,
@@ -735,6 +773,8 @@ def create_send_task(
         if existing_task and existing_task.message_id:
             existing_message = db.get(Message, existing_task.message_id)
             if existing_message:
+                if conversation.platform_code == "douyin" and existing_message.content != request.content:
+                    raise HTTPException(status_code=409, detail="发送请求标识已用于另一条文本")
                 return SendMessageResponse(
                     message=MessageRead.model_validate(existing_message),
                     task_id=existing_task.id,
@@ -743,7 +783,55 @@ def create_send_task(
                     follow_up_messages=[],
                 )
 
+    if conversation.platform_code == 'pinduoduo':
+        from app.services.pdd_auto_transfer import blocked as pdd_blocked, state as pdd_state
+        pdd_op = pdd_state(conversation)
+        pdd_ack = (source == 'automation' and request.content == '为您转接中'
+            and pdd_op.get('status') == 'ack_queued'
+            and idempotency_key == 'pdd-transfer-ack:' + str(pdd_op.get('id'))
+            and (automation_context or {}).get('pdd_auto_operation_id') == pdd_op.get('id'))
+        if pdd_blocked(conversation) and not pdd_ack:
+            raise HTTPException(409, '会话正在转接、已转出或结果待核对，已暂停发送')
     platform_code = request.platform_code or conversation.platform_code
+    if "douyin" in {conversation.platform_code, platform_code}:
+        from app.services.douyin_transfer_service import transfer_blocked as douyin_transfer_blocked
+        from app.services.douyin_auto_transfer import ack_creation_allowed
+        douyin_ack = ack_creation_allowed(db, conversation, request.content, source,
+                                         idempotency_key, automation_context or {})
+        if douyin_transfer_blocked(conversation) and not douyin_ack:
+            raise HTTPException(409, '会话正在转接、已转出或结果待核对，已暂停发送')
+        account = conversation.platform_account
+        metadata = (account.metadata_json or {}) if account else {}
+        suffix = f":{account.external_account_id}::2:1:pigeon" if account else ""
+        cid = conversation.external_conversation_id or ""
+        if (conversation.platform_code != "douyin" or platform_code != "douyin" or source not in {"desktop", "automation"}
+            or follow_up or follow_up_products or request.quote_message_id
+            or conversation.deleted_at is not None or not account or account.user_id != user.id
+            or account.platform_code != "douyin" or not account.is_active or not account.external_account_id
+            or account.login_status != "online" or not account.last_rpa_node_id
+            or metadata.get("message_send_enabled") is not True or metadata.get("im_ready") is not True
+            or not cid.endswith(suffix) or not cid[:-len(suffix)] or ":" in cid[:-len(suffix)]):
+            raise HTTPException(status_code=409, detail="抖店当前仅支持已登录店铺的纯文本发送，请检查飞鸽客服工作台")
+        if source == "automation" and not douyin_ack:
+            from app.models import Robot
+            from app.services.douyin_automation import reply_block_reason
+            context = automation_context or {}
+            robot_id = context.get("automation_robot_id")
+            source_id = context.get("automation_source_message_id")
+            reason = reply_block_reason(db, conversation,
+                db.get(Message, source_id) if source_id else None,
+                db.get(Robot, robot_id) if robot_id else None, sending=True)
+            if reason:
+                raise HTTPException(status_code=409, detail=reason)
+        if not request.content.strip() or len(request.content) > 4000:
+            raise HTTPException(status_code=422, detail="文本不能为空且不能超过 4000 个字符")
+        pending = db.scalar(select(RpaTask).where(
+            RpaTask.conversation_id == conversation.id,
+            RpaTask.task_type.notin_(['refresh_product_details', 'refresh_customer_orders', 'douyin_manual_transfer']),
+            RpaTask.status.in_(["queued", "dispatched", "acknowledged", "confirmation_pending"]),
+        ))
+        if pending:
+            raise HTTPException(status_code=409, detail="该会话仍有消息发送中或待确认，请先在原平台核对")
     now = utcnow()
     raw_payload = {
         **({"quote_msg_id": request.quote_message_id} if request.quote_message_id else {}),
@@ -848,6 +936,7 @@ def create_send_task(
         follow_up_product_messages.append(product_message)
     task = RpaTask(
         user_id=user.id,
+        node_id=conversation.platform_account.last_rpa_node_id if platform_code == "douyin" else None,
         platform_account_id=conversation.platform_account_id,
         conversation_id=conversation.id,
         message_id=message.id,
@@ -863,6 +952,7 @@ def create_send_task(
             "content": request.content,
             "sender_name": request.sender_name or user.display_name,
             "source": source,
+            **(automation_context or {}),
             **({"follow_up_message_id": follow_up_message.id} if follow_up_message else {}),
             **({
                 "follow_up_message_ids": [item.id for item in follow_up_messages]

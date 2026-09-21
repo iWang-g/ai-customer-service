@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import re
+import logging
 from typing import Any
 import unicodedata
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, desc, or_, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import Settings, get_settings
+from app.services.qianniu_transfer_service import transfer_blocked, receive_return_notice
+from app.services.qianniu_transfer_notice import is_transfer_reply_source
 from app.core.security import create_token, utcnow
 from app.models import (
     AutomationReplyRun,
@@ -137,7 +140,7 @@ def get_or_create_desktop_ingest_node(db: Session, user: User) -> RpaNode:
             node_key=node_key,
             hostname="desktop-electron",
             machine_name="desktop-electron",
-            supported_platforms=["pinduoduo", "wechat"],
+            supported_platforms=["pinduoduo", "wechat", "qianniu", "douyin"],
             app_version="desktop-ingest",
             status="online",
             last_heartbeat_at=now,
@@ -193,6 +196,57 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
                 status_code=status.HTTP_404_NOT_FOUND, detail="Platform account not found"
             )
 
+    if request.platform_code == "qianniu" and (
+        platform_account is None or platform_account.platform_code != "qianniu"
+    ):
+        raise HTTPException(status_code=400, detail="Qianniu platform account mismatch")
+    if request.event_type == "douyin_send_result":
+        task = db.get(RpaTask, request.payload_json.get("task_id"))
+        result = request.payload_json
+        if (request.platform_code != "douyin" or not task or task.user_id != user.id
+            or task.platform_code != "douyin" or task.task_type != "send_message"
+            or task.platform_account_id != request.platform_account_id or task.node_id != node.id
+            or (task.payload_json or {}).get("external_conversation_id") != request.conversation_external_id
+            or result.get("status") not in {"completed", "failed", "confirmation_pending"}):
+            raise HTTPException(status_code=400, detail="Invalid Douyin send result")
+        if result["status"] == "completed" and (
+            not isinstance(result.get("platform_message_id"), str) or not result["platform_message_id"]
+            or len(result["platform_message_id"]) > 128 or result.get("text_sent") is not True
+            or result.get("response_status") != "0" or result.get("check_code") != "0"
+        ):
+            raise HTTPException(status_code=400, detail="Missing Douyin send confirmation")
+        if task.status not in {"completed", "failed"}:
+            complete_task(db, task, TaskCompleteRequest(status=result["status"], result_json=result,
+                error_message=result.get("error")))
+            reconcile_douyin_send_echo(db, task)
+        event = RpaEvent(user_id=user.id, node_id=node.id, platform_account_id=request.platform_account_id,
+            event_id=request.event_id, dedup_key=request.dedup_key or request.event_id,
+            event_type=request.event_type, platform_code="douyin", conversation_external_id=request.conversation_external_id,
+            payload_json=result, received_at=request.received_at or utcnow(), processed_at=utcnow(), status="processed")
+        db.add(event)
+        db.commit()
+        return event, [], [db.get(Conversation, task.conversation_id)]
+    if request.platform_code == "douyin" and request.event_type in {"customer_message", "agent_message", "message_received", "message_sent"}:
+        if platform_account is None or platform_account.platform_code != "douyin":
+            raise HTTPException(status_code=400, detail="Douyin platform account mismatch")
+        if not request.platform_message_id or not request.conversation_external_id:
+            raise HTTPException(status_code=400, detail="Douyin message identity missing")
+        shop_id = platform_account.external_account_id
+        if not shop_id or not request.conversation_external_id.endswith(f":{shop_id}::2:1:pigeon"):
+            raise HTTPException(status_code=400, detail="Douyin conversation belongs to a different shop")
+        from app.services.douyin_message_context import sanitize_inbound
+        request.payload_json = sanitize_inbound(request.payload_json)
+    if request.event_type == "qianniu_message_snapshot" and (
+        request.platform_code != "qianniu" or not request.platform_message_id
+        or not request.conversation_external_id or request.payload_json.get("qianniu_media_version") != 1
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Qianniu message snapshot")
+
+    if request.platform_code == 'pinduoduo':
+        from app.services.pdd_message_context import sanitize_inbound as sanitize_pdd
+        payload = request.payload_json
+        if request.event_type != 'message_snapshot':
+            request.payload_json = sanitize_pdd(payload)
     event = RpaEvent(
         user_id=user.id,
         node_id=node.id,
@@ -211,12 +265,23 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
     db.add(event)
     messages: list[Message] = []
     conversations: list[Conversation] = []
+    if request.event_type == "store_product_detail_snapshot":
+        if request.platform_code != "qianniu" or platform_account is None:
+            raise HTTPException(400, "Product detail requires a Qianniu account")
+        from app.services.qianniu_product_detail_service import apply_detail
+        apply_detail(db, platform_account, request.payload_json)
+        # Keep only the validated product projection in the event audit as well.
+        event.payload_json = {key: request.payload_json.get(key) for key in ("source", "product_id", "observed_at")}
+        db.commit()
+        return event, [], []
     if request.event_type == "store_products_snapshot":
         if platform_account is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Store product snapshot requires a platform account",
             )
+        if platform_account.platform_code != request.platform_code:
+            raise HTTPException(status_code=400, detail="Product platform account mismatch")
         saved_count = apply_store_products_snapshot(
             db,
             platform_account,
@@ -224,7 +289,7 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
             request.received_at,
         )
         event.payload_json = {
-            **event.payload_json,
+            **(request.payload_json if request.platform_code == "douyin" else event.payload_json),
             "store_product_write_mode": "store",
             "saved_product_count": saved_count,
         }
@@ -284,7 +349,13 @@ def create_event(db: Session, user: User, node: RpaNode, request: RpaEventCreate
         if request.event_type == "customer_products_snapshot":
             apply_products_snapshot(db, conversation, request.payload_json, request.received_at)
     message, is_new_reply_source = _upsert_message_from_event(db, user.id, conversation, request)
-    if conversation and message:
+    if conversation and message and request.platform_code == "douyin" and message.sender_role == "agent":
+        for pending_task in db.scalars(select(RpaTask).where(
+            RpaTask.conversation_id == conversation.id, RpaTask.platform_code == "douyin",
+            RpaTask.status == "confirmation_pending",
+        )).all():
+            reconcile_douyin_send_echo(db, pending_task)
+    if conversation and message and request.event_type != "qianniu_message_snapshot":
         _refresh_awaiting_reply(db, conversation)
     if message and is_new_reply_source:
         messages.append(message)
@@ -357,6 +428,11 @@ def select_inbound_reply_source(
     """
     if not messages:
         return None
+    if request.platform_code == "douyin":
+        from app.services.douyin_automation import live_reply_source
+        message = messages[0]
+        return message if message.sender_role == "customer" and live_reply_source(
+            message.raw_payload or {}, message.platform_message_id) else None
     if request.event_type in {"customer_message", "message_received"}:
         return messages[0]
     if request.event_type != "message_snapshot":
@@ -391,6 +467,9 @@ def select_inbound_reply_source(
 
 
 def _active_robot_for_conversation(db: Session, user: User, conversation: Conversation) -> Robot | None:
+    # Entry welcome messages are outside the Douyin text-reply milestone.
+    if conversation.platform_code == "douyin":
+        return None
     robots = list(db.scalars(
         select(Robot)
         .where(Robot.user_id == user.id, Robot.enabled.is_(True), Robot.status == "online")
@@ -447,6 +526,8 @@ def maybe_queue_entry_welcome(
         return None
     conversation = db.get(Conversation, source_message.conversation_id)
     if conversation is None:
+        return None
+    if transfer_blocked(conversation):
         return None
     metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
     state = metadata.get(ENTRY_WELCOME_METADATA_KEY)
@@ -547,6 +628,17 @@ def _upsert_conversation_from_event(
         )
     )
     payload_unread_count = _payload_unread_count(payload)
+    douyin_message_event = request.platform_code == "douyin" and request.event_type in {
+        "customer_message", "agent_message", "message_received", "message_sent",
+    }
+    if douyin_message_event and conversation is not None and request.platform_message_id:
+        existing_message = db.scalar(select(Message.id).where(
+            Message.conversation_id == conversation.id,
+            Message.platform_message_id == request.platform_message_id,
+        ).limit(1))
+        if existing_message:
+            return conversation, False
+    event_time = (_payload_datetime(payload, "platform_sent_at") if douyin_message_event else None) or request.received_at or utcnow()
     conversation_metadata = dict(payload.get("conversation_metadata") or {})
     avatar_url = str(payload.get("avatar_url") or "").strip()
     if avatar_url:
@@ -572,7 +664,7 @@ def _upsert_conversation_from_event(
             customer_name=payload.get("customer_name"),
             title=payload.get("title") or payload.get("customer_name") or external_id,
             latest_message_text=payload.get("content"),
-            latest_message_at=request.received_at or utcnow(),
+            latest_message_at=event_time,
             unread_count=(
                 payload_unread_count
                 if payload_unread_count is not None
@@ -594,15 +686,19 @@ def _upsert_conversation_from_event(
         db.flush()
         return conversation, True
 
+    if request.platform_code == "qianniu" and request.event_type in {"customer_orders_snapshot", "qianniu_message_snapshot"}:
+        return conversation, False
+
     conversation.customer_name = payload.get("customer_name") or conversation.customer_name
     conversation.title = payload.get("title") or conversation.title
     history_is_cleared = (
         conversation.messages_cleared_sequence >= conversation.last_message_sequence
         and request.event_type == "conversation_snapshot"
     )
-    if not history_is_cleared:
+    if not history_is_cleared and (not douyin_message_event or conversation.latest_message_at is None
+        or _as_utc_naive(event_time) >= _as_utc_naive(conversation.latest_message_at)):
         conversation.latest_message_text = payload.get("content") or conversation.latest_message_text
-        conversation.latest_message_at = request.received_at or utcnow()
+        conversation.latest_message_at = event_time
     if (
         request.event_type in {"customer_message", "message_received"}
         and (
@@ -637,13 +733,16 @@ def _payload_unread_count(payload: dict[str, Any]) -> int | None:
 
 
 def _refresh_awaiting_reply(db: Session, conversation: Conversation) -> None:
+    ordering = [desc(Message.conversation_sequence)]
+    if conversation.platform_code == "douyin":
+        ordering = [desc(func.coalesce(Message.platform_sent_at, Message.collected_at)), *ordering]
     latest = db.scalar(
         select(Message)
         .where(
             Message.conversation_id == conversation.id,
             Message.message_status == "sent",
         )
-        .order_by(desc(Message.conversation_sequence))
+        .order_by(*ordering)
         .limit(1)
     )
     if latest is None:
@@ -656,7 +755,7 @@ def _refresh_awaiting_reply(db: Session, conversation: Conversation) -> None:
     except (TypeError, ValueError):
         cleared_sequence = 0
     conversation.awaiting_reply = (
-        latest.sender_role == "customer"
+        (latest.sender_role == "customer" or is_transfer_reply_source(latest))
         and int(latest.conversation_sequence or 0) > cleared_sequence
     )
     db.add(conversation)
@@ -675,6 +774,38 @@ def _refresh_conversation_summary(db: Session, conversation: Conversation) -> No
     conversation.latest_message_text = latest.content if latest else None
     conversation.latest_message_at = latest.collected_at if latest else None
     db.add(conversation)
+
+
+def reconcile_douyin_send_echo(db: Session, task: RpaTask) -> bool:
+    """Only a receipt tied to this SDK call can match an independently collected echo."""
+    if task.platform_code != "douyin" or task.status != "confirmation_pending":
+        return False
+    result = task.result_json or {}
+    server_id = result.get("sdk_platform_message_id")
+    client_id = result.get("sdk_client_message_id")
+    if not any(isinstance(value, str) and value and len(value) <= 128 for value in (server_id, client_id)):
+        return False
+    matches = []
+    for message in db.scalars(select(Message).where(
+        Message.conversation_id == task.conversation_id, Message.sender_role == "agent",
+        Message.message_status == "sent", Message.platform_message_id.is_not(None),
+        Message.id != task.message_id,
+    )).all():
+        structured = (message.raw_payload or {}).get("structured_payload") or {}
+        if (structured.get("sender_biz_role") == "CurrentServer"
+            and message.content == (task.payload_json or {}).get("content")
+            and (server_id and message.platform_message_id == server_id
+                 or client_id and structured.get("client_message_id") == client_id)):
+            matches.append(message)
+    if len(matches) != 1:
+        return False
+    echo = matches[0]
+    complete_task(db, task, TaskCompleteRequest(status="completed", result_json={
+        **result, "status": "completed", "text_sent": True, "platform_message_id": echo.platform_message_id,
+        "confirmation_method": "sdk_identity_and_platform_echo", "echo_message_id": echo.id,
+        "platform_sent_at": echo.platform_sent_at.isoformat() if echo.platform_sent_at else None,
+    }), verified_douyin_echo=True)
+    return True
 
 
 def _merge_task_message_with_platform_echo(
@@ -910,6 +1041,10 @@ def _payload_non_negative_int(payload: dict[str, Any], key: str) -> int | None:
 
 
 def _is_live_reply_source(payload: dict[str, Any], request: RpaEventCreate) -> bool:
+    if request.platform_code == "qianniu" and (request.event_type == "qianniu_message_snapshot"
+            or payload.get("automation_mode") == "ignore" or (payload.get("sender_role") == "platform"
+                and payload.get('qianniu_transfer_notice_accepted') is not True)):
+        return False
     platform_sent_at = _payload_datetime(payload, "platform_sent_at")
     observed_at = _payload_datetime(payload, "observed_at") or request.received_at
     if not platform_sent_at or not observed_at:
@@ -1091,11 +1226,19 @@ def _upsert_message_from_event(
     conversation: Conversation | None,
     request: RpaEventCreate,
 ) -> tuple[Message | None, bool]:
-    payload = request.payload_json
+    payload = dict(request.payload_json)
+    if request.platform_code == 'qianniu':
+        payload.pop('qianniu_transfer_notice_accepted', None)
     content = payload.get("content")
     message_event_types = {"customer_message", "message_received", "agent_message", "message_sent"}
+    if request.platform_code == "qianniu":
+        message_event_types.add("qianniu_message_snapshot")
     if not conversation or not content or request.event_type not in message_event_types:
         return None, False
+    if request.platform_code == "qianniu" and payload.get("qianniu_media_version") == 1:
+        from app.services.qianniu_message_service import merge_media_payload
+        payload = merge_media_payload({}, payload)
+        content = payload["content"]
     sender_role = payload.get("sender_role") or (
         "customer" if request.event_type in {"customer_message", "message_received"} else "agent"
     )
@@ -1109,6 +1252,14 @@ def _upsert_message_from_event(
             )
         )
         if existing:
+            if request.platform_code == "qianniu" and payload.get("qianniu_media_version") == 1:
+                from app.services.qianniu_message_service import merge_media_payload
+                payload = merge_media_payload(existing.raw_payload or {}, payload)
+                if request.event_type == "qianniu_message_snapshot":
+                    payload["automation_mode"] = (existing.raw_payload or {}).get("automation_mode", "trigger")
+                    if payload.get('qianniu_transfer_notice') and not (existing.raw_payload or {}).get('qianniu_transfer_notice_accepted'):
+                        payload['automation_mode'] = 'ignore'
+                content = payload["content"]
             existing.sender_role = payload.get("sender_role") or existing.sender_role
             existing.sender_name = payload.get("sender_name") or existing.sender_name
             existing.content = content
@@ -1227,7 +1378,7 @@ def _upsert_message_from_event(
             db.add(fallback_match)
             db.flush()
             return fallback_match, False
-    if request.event_type in {"agent_message", "message_sent"} and content:
+    if request.platform_code != "douyin" and request.event_type in {"agent_message", "message_sent"} and content:
         outbound_echo = _find_outbound_echo_candidate(db, conversation, payload, content)
         if outbound_echo:
             return _attach_outbound_echo(
@@ -1251,6 +1402,12 @@ def _upsert_message_from_event(
     _apply_collection_metadata(message, payload, request)
     append_message(db, message, collected_at=message.observed_at)
     db.flush()
+    if request.platform_code == 'qianniu' and payload.get('qianniu_transfer_notice'):
+        accepted = receive_return_notice(db, conversation, message, request)
+        if not accepted:
+            message.raw_payload = {**message.raw_payload, 'automation_mode': 'ignore'}
+            message.automation_eligible = False
+        return message, accepted
     return message, _is_live_reply_source(payload, request)
 
 
@@ -1267,7 +1424,46 @@ def get_pending_tasks(db: Session, node: RpaNode, limit: int = 50) -> list[RpaTa
         .order_by(desc(RpaTask.priority), RpaTask.requested_at)
         .limit(limit)
     )
+    from app.services.qianniu_auto_transfer import reconcile_pending
+    qianniu_ready = True
+    try:
+        with db.begin_nested():
+            reconcile_pending(db, node.user_id)
+        db.commit()
+    except Exception:
+        qianniu_ready = False
+        logging.getLogger(__name__).exception('Qianniu transfer reconciliation failed; other platform tasks remain available')
     tasks = list(db.scalars(stmt).all())
+    from app.services.douyin_auto_transfer import reconcile_pending as reconcile_douyin, ack_allowed as douyin_ack_allowed
+    try:
+        with db.begin_nested():
+            reconcile_douyin(db, node.user_id)
+        db.commit()
+        tasks = list(db.scalars(stmt).all())
+    except Exception:
+        logging.getLogger(__name__).exception('Douyin transfer reconciliation failed')
+        tasks = [task for task in tasks if task.platform_code != 'douyin']
+    from app.services.douyin_transfer_service import transfer_blocked as douyin_transfer_blocked
+    tasks = [task for task in tasks if not (task.platform_code == 'douyin' and task.task_type == 'send_message'
+        and douyin_transfer_blocked(db.get(Conversation, task.conversation_id))
+        and not douyin_ack_allowed(db, db.get(Conversation, task.conversation_id), task))]
+    if not qianniu_ready:
+        tasks = [task for task in tasks if task.platform_code != 'qianniu']
+    from app.services.qianniu_auto_transfer import ack_allowed
+    tasks = [task for task in tasks if not (task.platform_code == 'qianniu' and task.task_type == 'send_message'
+        and transfer_blocked(db.get(Conversation, task.conversation_id))
+        and not ack_allowed(db, db.get(Conversation, task.conversation_id), task))]
+    from app.services.pdd_auto_transfer import reconcile_pending as reconcile_pdd, blocked as pdd_blocked, ack_allowed as pdd_ack
+    try:
+        with db.begin_nested():
+            reconcile_pdd(db, node.user_id)
+        db.commit()
+    except Exception:
+        logging.getLogger(__name__).exception('PDD transfer reconciliation failed')
+        tasks = [task for task in tasks if task.platform_code != 'pinduoduo']
+    tasks = [task for task in tasks if task.status in {'queued', 'dispatched'} and not (task.platform_code == 'pinduoduo'
+        and task.task_type in {'send_message', 'send_image'} and pdd_blocked(db.get(Conversation, task.conversation_id))
+        and not pdd_ack(db, db.get(Conversation, task.conversation_id), task))]
     for task in tasks:
         if task.status == "queued":
             task.status = "dispatched"
@@ -1279,7 +1475,30 @@ def get_pending_tasks(db: Session, node: RpaNode, limit: int = 50) -> list[RpaTa
 
 
 def acknowledge_task(db: Session, task: RpaTask) -> RpaTask:
-    task.status = "acknowledged"
+    from app.services.pdd_auto_transfer import blocked as pdd_blocked, ack_allowed as pdd_ack
+    if task.platform_code == 'pinduoduo' and (task.status not in {'queued', 'dispatched'} or
+        (task.task_type in {'send_message', 'send_image'} and pdd_blocked(db.get(Conversation, task.conversation_id))
+         and not pdd_ack(db, db.get(Conversation, task.conversation_id), task))):
+        return task
+    from app.services.douyin_transfer_service import transfer_blocked as douyin_transfer_blocked
+    from app.services.douyin_auto_transfer import ack_allowed as douyin_ack_allowed
+    if (task.platform_code == 'douyin' and task.task_type == 'send_message'
+            and douyin_transfer_blocked(db.get(Conversation, task.conversation_id))
+            and not douyin_ack_allowed(db, db.get(Conversation, task.conversation_id), task)):
+        return task
+    from app.services.qianniu_auto_transfer import ack_allowed
+    if task.platform_code == 'qianniu' and (task.status not in {'queued', 'dispatched'} or
+        (task.task_type == 'send_message' and transfer_blocked(db.get(Conversation, task.conversation_id))
+            and not ack_allowed(db, db.get(Conversation, task.conversation_id), task))):
+        return task
+    if task.platform_code == "douyin" and task.status not in {"queued", "dispatched"}:
+        return task
+    task.status = "confirmation_pending" if task.platform_code == "douyin" and task.task_type == "send_message" else "acknowledged"
+    if task.platform_code == "douyin" and task.message_id:
+        message = db.get(Message, task.message_id)
+        if message:
+            message.message_status = "confirmation_pending"
+            db.add(message)
     task.acked_at = utcnow()
     db.add(task)
     db.commit()
@@ -1351,13 +1570,89 @@ def _queue_transfer_task_after_send(db: Session, task: RpaTask) -> None:
     db.add(conversation)
 
 
-def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> RpaTask:
+def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest, *, verified_douyin_echo: bool = False) -> RpaTask:
+    if task.platform_code == 'pinduoduo' and (task.payload_json or {}).get('pdd_auto_operation_id') and task.status in {'completed', 'failed', 'confirmation_pending'}:
+        return task
+    if (task.platform_code == 'pinduoduo' and task.task_type == 'send_message'
+            and (task.payload_json or {}).get('pdd_auto_operation_id') and request.status == 'completed'
+            and (request.result_json.get('text_sent') is not True or not request.result_json.get('platform_message_id'))):
+        request = request.model_copy(update={'status': 'confirmation_pending', 'error_message': '缺少转接提示的发送业务回执'})
+    if task.platform_code == 'pinduoduo' and (task.result_json or {}).get('cancelled_by_transfer'):
+        return task
+    if task.platform_code == 'douyin' and task.task_type in {'douyin_transfer_prepare', 'douyin_transfer_execute'}:
+        if task.status in {'completed', 'failed'}:
+            return task
+        if request.status not in {'completed', 'failed'}:
+            raise HTTPException(400, 'Invalid transfer task status')
+        task.status = request.status
+        task.result_json = request.result_json
+        task.error_message = request.error_message
+        task.completed_at = utcnow()
+        from app.services.douyin_auto_transfer import completed
+        db.flush(); completed(db, task); db.commit(); db.refresh(task)
+        return task
+    if task.platform_code == 'douyin' and task.task_type == 'refresh_customer_orders':
+        from app.services.douyin_order_service import complete_orders
+        return complete_orders(db, task, request)
+    if task.platform_code == 'douyin' and task.task_type == 'refresh_product_details':
+        if task.status in {'completed', 'failed'}:
+            return task
+        if request.status not in {'completed', 'failed'}:
+            raise HTTPException(400, 'Invalid product detail task status')
+        if request.status == 'completed':
+            from app.services.douyin_product_detail_service import apply_detail
+            account = db.get(PlatformAccount, task.platform_account_id)
+            details = request.result_json.get('product_details')
+            expected = (task.payload_json or {}).get('product_ids')
+            if (not account or account.user_id != task.user_id or not isinstance(details, list)
+                    or not isinstance(expected, list) or len(expected) != 1 or len(details) != 1
+                    or not isinstance(details[0], dict) or details[0].get('product_id') != expected[0]):
+                raise HTTPException(400, 'Product detail task identity mismatch')
+            apply_detail(db, account, details[0])
+        task.status = request.status
+        task.result_json = {'product_ids': (task.payload_json or {}).get('product_ids', []),
+                            'details_saved': request.status == 'completed'}
+        task.error_message = '商品详情暂不可用' if request.status == 'failed' else None
+        task.completed_at = utcnow()
+        db.add(task); db.commit(); db.refresh(task)
+        return task
+    if (task.platform_code == 'qianniu' and (task.payload_json or {}).get('qianniu_auto_operation_id')
+            and task.status in {'completed', 'failed'}):
+        return task
+    if (task.platform_code == 'qianniu' and task.task_type == 'send_message'
+            and (task.payload_json or {}).get('qianniu_auto_operation_id') and request.status == 'completed'
+            and (request.result_json.get('text_sent') is not True or not request.result_json.get('platform_message_id'))):
+        request = request.model_copy(update={'status': 'confirmation_pending', 'error_message': '缺少转接提示的发送业务回执'})
+    if task.platform_code == 'qianniu' and (task.result_json or {}).get('cancelled_by_transfer'):
+        return task
+    if task.platform_code == "douyin":
+        if task.status in {"completed", "failed"}:
+            return task
+        result = request.result_json
+        if request.status == "completed" and (
+            not isinstance(result.get("platform_message_id"), str) or not result["platform_message_id"]
+            or len(result["platform_message_id"]) > 128 or result.get("text_sent") is not True
+            or (not verified_douyin_echo
+                and (result.get("response_status") != "0" or result.get("check_code") != "0"))
+        ):
+            raise HTTPException(status_code=400, detail="Missing Douyin send confirmation")
+        if request.status != "completed" and result.get("text_sent"):
+            raise HTTPException(status_code=400, detail="Invalid Douyin send state")
     was_completed = task.status == "completed"
     result_json = dict(request.result_json or {})
     task.status = request.status
     task.result_json = result_json
     task.error_message = request.error_message
     task.completed_at = utcnow()
+    if task.task_type == "send_message" and (task.payload_json or {}).get("email_workflow_prompt_id"):
+        from app.services.email_workflow_service import reconcile_email_prompt_task
+
+        reconcile_email_prompt_task(
+            db,
+            task,
+            delivered=request.status == "completed" or request.result_json.get("text_sent") is True,
+            confirmation_pending=request.status == "confirmation_pending",
+        )
     if task.idempotency_key and task.idempotency_key.startswith("auto-timeout:"):
         _, robot_id, source_message_id = task.idempotency_key.split(":", 2)
         deferred_reply = db.scalar(
@@ -1423,9 +1718,13 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
             if merged_from_message_id:
                 result_json["merged_from_message_id"] = merged_from_message_id
                 task.result_json = result_json
-            message.message_status = "sent" if request.status == "completed" or text_sent else "failed"
+            message.message_status = ("sent" if request.status == "completed" or text_sent else
+                "confirmation_pending" if request.status == "confirmation_pending" else "failed")
             if request.result_json.get("platform_message_id"):
                 message.platform_message_id = request.result_json["platform_message_id"]
+            if task.platform_code == "douyin":
+                message.platform_sent_at = _payload_datetime(result_json, "platform_sent_at") or message.platform_sent_at
+                message.raw_payload = {**(message.raw_payload or {}), "send_result": result_json}
             db.add(message)
             db.flush()
             if message.message_status == "sent":
@@ -1438,7 +1737,7 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
                 conversation = db.get(Conversation, task.conversation_id)
                 if conversation:
                     _refresh_conversation_summary(db, conversation)
-    if task.task_type == "transfer_conversation":
+    if task.task_type == "transfer_conversation" and not (task.payload_json or {}).get("pdd_auto_operation_id"):
         conversation = db.get(Conversation, task.conversation_id) if task.conversation_id else None
         if conversation:
             if request.status == "completed":
@@ -1505,11 +1804,20 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
         and task.task_type == "send_message"
         and isinstance(task.payload_json, dict)
     ):
-        if task.payload_json.get("source") == "automation" or task.idempotency_key and task.idempotency_key.startswith("auto-reply:"):
+        suppressed = False
+        if task.platform_code == "douyin" and result_json.get("auto_send_suppressed") is True:
+            from app.services.douyin_automation import task_block_reason
+            suppressed = bool(task_block_reason(db, task))
+        if (not suppressed and not task.payload_json.get('douyin_auto_operation_id') and not task.payload_json.get('pdd_auto_operation_id')
+                and (task.payload_json.get("source") == "automation" or task.idempotency_key and task.idempotency_key.startswith("auto-reply:"))):
             conversation = db.get(Conversation, task.conversation_id) if task.conversation_id else None
             if conversation:
                 conversation.human_required = True
-                conversation.human_required_reason = "auto_reply_send_failed"
+                conversation.human_required_reason = (
+                    "email_prompt_send_failed"
+                    if task.payload_json.get("email_workflow_prompt_id")
+                    else "auto_reply_send_failed"
+                )
                 conversation.human_required_word = None
                 conversation.human_required_at = utcnow()
                 db.add(conversation)
@@ -1589,6 +1897,17 @@ def complete_task(db: Session, task: RpaTask, request: TaskCompleteRequest) -> R
     task.result_json = dict(result_json)
     flag_modified(task, "result_json")
     db.add(task)
+    if task.platform_code == 'qianniu':
+        from app.services.qianniu_auto_transfer import completed
+        db.flush()
+        completed(db, task)
+    if task.platform_code == 'douyin' and (task.payload_json or {}).get('douyin_auto_operation_id'):
+        from app.services.douyin_auto_transfer import completed as douyin_completed
+        db.flush()
+        douyin_completed(db, task)
+    from app.services.pdd_auto_transfer import completed as pdd_completed
+    db.flush()
+    pdd_completed(db, task)
     db.commit()
     db.refresh(task)
     return task

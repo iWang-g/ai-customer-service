@@ -69,9 +69,11 @@ def _upsert_store_products(
     platform_account: PlatformAccount,
     products: list[Any],
     observed: datetime,
+    *,
+    max_products: int = 100,
 ) -> int:
     saved_count = 0
-    for item in products[:100]:
+    for item in products[:max_products]:
         if not isinstance(item, dict):
             continue
         platform_product_id = _text(item.get("product_id") or item.get("platform_product_id"), 128)
@@ -103,7 +105,14 @@ def _upsert_store_products(
         product.sold_quantity_30d = _int(item.get("sold_quantity_30d"))
         product.source = _text(item.get("source"), 64)
         product.last_observed_at = observed
-        product.raw_payload = item.get("raw_payload") if isinstance(item.get("raw_payload"), dict) else item
+        raw = item.get("raw_payload") if isinstance(item.get("raw_payload"), dict) else item
+        if platform_account.platform_code in {"qianniu", "douyin"}:
+            detail_key = f"{platform_account.platform_code}_detail"
+            previous_detail = (product.raw_payload or {}).get(detail_key)
+            raw = {key: value for key, value in raw.items() if key != detail_key}
+            if previous_detail:
+                raw[detail_key] = previous_detail
+        product.raw_payload = raw
         db.add(product)
         saved_count += 1
     return saved_count
@@ -116,6 +125,12 @@ def apply_store_products_snapshot(
     observed_at: datetime | None,
 ) -> int:
     """Persist a shop-level recommendGoods response without creating a customer conversation."""
+    if platform_account.platform_code == "douyin":
+        from app.services.douyin_product_service import apply_snapshot
+        return apply_snapshot(db, platform_account, payload, observed_at)
+    if platform_account.platform_code == "qianniu":
+        from app.services.qianniu_product_service import apply_snapshot
+        return apply_snapshot(db, platform_account, payload, observed_at)
     collection_status = str(payload.get("collection_status") or "unavailable")
     if collection_status not in COLLECTION_STATUSES:
         collection_status = "unavailable"
@@ -257,6 +272,8 @@ def match_store_products(
     limit: int = 2,
 ) -> list[dict[str, Any]]:
     """Match store-level products for an explicit product recommendation request."""
+    if conversation.platform_code in {"qianniu", "douyin"}:
+        return []
     if not conversation.platform_account_id or not message.strip():
         return []
     normalized = " ".join(message.casefold().split())
@@ -318,6 +335,12 @@ def customer_products_response(
     conversation = db.get(Conversation, conversation_id)
     if not conversation or conversation.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if conversation.platform_code == "douyin":
+        from app.services.douyin_product_service import products_response
+        return products_response(db, conversation)
+    if conversation.platform_code == "qianniu":
+        from app.services.qianniu_product_service import products_response
+        return products_response(db, conversation)
     summary = (conversation.metadata_json or {}).get("customer_products")
     if not isinstance(summary, dict):
         summary = {}

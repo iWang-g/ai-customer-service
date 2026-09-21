@@ -21,6 +21,7 @@ from app.schemas.rpa import TaskCompleteRequest
 from app.services.order_service import (
     apply_orders_snapshot,
     maybe_create_order_follow_up,
+    order_prompt_context,
     schedule_due_outreach_rechecks,
 )
 from app.services.rpa_service import complete_task
@@ -77,6 +78,68 @@ class OrderServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.engine.dispose()
+
+    def test_qianniu_orders_are_read_only_and_stale_snapshots_cannot_replace_latest(self) -> None:
+        from app.services.order_service import customer_orders_response
+        self.account.platform_code = "qianniu"
+        self.account.external_account_id = "qianniu:123"
+        self.conversation.platform_code = "qianniu"
+        scope = self.db.scalar(select(RobotPlatformScope))
+        scope.platform_code = "all"
+        self.db.flush()
+        now = datetime.now(timezone.utc)
+        payload = {"identity_verified": True, "shop_uid": "123", "cid": self.conversation.external_conversation_id,
+                   "collection_status": "success", "orders": [{"platform_order_id": "2145790274051222188",
+                   "status": "signed", "products": [{"title": "fixture", "sku": "red", "quantity": 1}]}]}
+        apply_orders_snapshot(self.db, self.conversation, payload, now)
+        self.db.commit()
+        self.assertEqual(self.db.query(CustomerOutreachRun).count(), 0)
+        self.assertEqual(schedule_due_outreach_rechecks(self.db), 0)
+        self.assertEqual(len(customer_orders_response(self.db, self.user, self.conversation.id).orders), 1)
+        self.assertIsNone(self.db.scalar(select(CustomerOrder)).signed_at)
+        context = order_prompt_context(self.db, self.conversation)
+        self.assertEqual(len(context["recent_orders"]), 1)
+        self.assertEqual(context["recent_orders"][0]["products"][0]["sku"], "red")
+        self.assertTrue(context["dynamic_fields_fresh"])
+        self.assertIsNone(context["recent_orders"][0]["paid_amount"])
+        empty = {**payload, "collection_status": "empty", "orders": []}
+        apply_orders_snapshot(self.db, self.conversation, empty, now - timedelta(seconds=1))
+        self.assertEqual(len(customer_orders_response(self.db, self.user, self.conversation.id).orders), 1)
+        apply_orders_snapshot(self.db, self.conversation, empty, now + timedelta(seconds=1))
+        self.db.commit()
+        self.assertEqual(customer_orders_response(self.db, self.user, self.conversation.id).orders, [])
+        self.assertIsNone(maybe_create_order_follow_up(self.db, self.conversation, self.robot, None, {}))
+        self.assertEqual(self.db.query(RpaTask).count(), 0)
+
+    def test_qianniu_orders_reject_mismatched_account_before_writing(self) -> None:
+        from fastapi import HTTPException
+        self.conversation.platform_code = "qianniu"
+        with self.assertRaises(HTTPException):
+            apply_orders_snapshot(self.db, self.conversation, {"identity_verified": True, "shop_uid": "other",
+                "cid": self.conversation.external_conversation_id, "orders": [], "collection_status": "empty"}, datetime.now(timezone.utc))
+        self.assertEqual(self.db.query(CustomerOrder).count(), 0)
+
+    def test_qianniu_order_refresh_does_not_change_chat_recency_or_unread(self) -> None:
+        from app.schemas.rpa import RpaEventCreate
+        from app.services.rpa_service import _upsert_conversation_from_event
+        self.conversation.platform_code = "qianniu"
+        self.conversation.latest_message_at = datetime(2026, 9, 1, 12, 0)
+        self.conversation.latest_message_text = "customer message"
+        self.conversation.unread_count = 2
+        self.db.flush()
+        request = RpaEventCreate(
+            event_id="order-display-test", dedup_key="order-display-test",
+            event_type="customer_orders_snapshot", platform_code="qianniu",
+            platform_account_id=self.account.id,
+            conversation_external_id=self.conversation.external_conversation_id,
+            received_at=datetime.now(timezone.utc),
+            payload_json={"customer_name": "orders buyer", "content": "not a message", "unread_count": 9},
+        )
+        conversation, created = _upsert_conversation_from_event(self.db, self.user.id, request)
+        self.assertFalse(created)
+        self.assertEqual(conversation.latest_message_at, datetime(2026, 9, 1, 12, 0))
+        self.assertEqual(conversation.latest_message_text, "customer message")
+        self.assertEqual(conversation.unread_count, 2)
 
     def test_empty_snapshot_is_distinct_from_unavailable(self) -> None:
         apply_orders_snapshot(

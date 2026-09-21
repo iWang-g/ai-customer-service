@@ -32,7 +32,7 @@ class CustomerProductRead(BaseModel):
 class CustomerProductsResponse(BaseModel):
     conversation_id: str
     status: Literal["collected", "failed"] = "collected"
-    method: Literal["api_recommend_goods"] | None = "api_recommend_goods"
+    method: Literal["api_recommend_goods", "qianniu_onsale", "douyin_product_list"] | None = "api_recommend_goods"
     conversation_key: str | None = None
     customer_name: str | None = None
     collection_status: ProductCollectionStatus = "not_collected"

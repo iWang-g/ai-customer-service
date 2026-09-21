@@ -55,6 +55,7 @@ class SendMessageRequest(BaseModel):
     platform_code: str | None = None
     sender_name: str | None = None
     quote_message_id: str | None = Field(default=None, max_length=128)
+    client_message_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SendMessageResponse(BaseModel):

@@ -14,6 +14,9 @@ class ReplyRequest(BaseModel):
     customer_name: str = Field(default="", max_length=128)
     customer_orders: dict[str, Any] = Field(default_factory=dict)
     platform_context: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    product_details: list[dict[str, Any]] = Field(default_factory=list, max_length=3)
+    product_card_only: bool = False
+    product_link_candidates: list[dict[str, str]] = Field(default_factory=list, max_length=12)
     qa_base_ids: list[str] = Field(default_factory=list, max_length=32)
     product_base_ids: list[str] = Field(default_factory=list, max_length=32)
     tone_base_id: str = Field(default="", max_length=128)
@@ -26,13 +29,13 @@ class ReplyRequest(BaseModel):
 
 class ShopSummaryRequest(BaseModel):
     shop_name: str = Field(default="", max_length=128)
-    products: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    products: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     provider_config: dict[str, Any] | None = None
 
 
 class ShopSummaryResponse(BaseModel):
-    shop_intro: str
-    on_sale_products: str
+    shop_intro: str = Field(min_length=1, max_length=60)
+    on_sale_products: str = Field(min_length=1, max_length=160)
     provider: str
 
 
@@ -49,6 +52,12 @@ ReplyRoute = Literal["direct", "retrieve_product", "email_workflow", "human_hand
 
 
 class IntentDecision(BaseModel):
+    attach_product_links: bool = False
+    selected_product_ids: list[str] = Field(default_factory=list, max_length=3)
+    needs_clarification: bool = Field(default=False, strict=True)
+    custom_order_intent: Literal['none', 'consultation', 'proceed', 'unclear'] = 'none'
+    image_request_intent: Literal['none', 'request', 'declined', 'unclear'] = 'none'
+    image_delivery_intent: Literal['none', 'email_link_request', 'photo_request', 'unclear'] = 'none'
     intent: IntentName
     reply_route: ReplyRoute = "retrieve_product"
     direct_reply_text: str = ""
@@ -88,6 +97,7 @@ class ReplyResponse(BaseModel):
     qa_match: dict[str, Any] | None = None
     retrieval: list[dict[str, Any]] = Field(default_factory=list)
     retrieval_status: Literal[
+        "shop_product_detail",
         "not_needed",
         "hit",
         "empty",

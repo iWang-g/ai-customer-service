@@ -42,6 +42,7 @@ from app.core.config import get_settings
 from app.schemas.platform import platform_display_name
 from app.schemas.rpa import PlatformAccountSyncItem
 from app.services.avatar_cache_service import cache_shop_logo
+from app.services.qianniu_shop_profile import merge_profile_metadata, profile_name, shop_name
 
 logger = logging.getLogger(__name__)
 
@@ -106,17 +107,29 @@ def _shop_summary_metadata(account: PlatformAccount) -> dict:
 
 
 def _summary_products(db: Session, account: PlatformAccount) -> list[dict]:
-    products = list(db.scalars(
-        select(StoreProduct)
-        .where(StoreProduct.platform_account_id == account.id)
-        .order_by(StoreProduct.last_observed_at.desc(), StoreProduct.created_at)
-        .limit(200)
-    ).all())
+    from app.services.product_service import _datetime
+    snapshot = (account.metadata_json or {}).get('store_products') or {}
+    stmt = select(StoreProduct).where(StoreProduct.platform_account_id == account.id, StoreProduct.user_id == account.user_id)
+    if snapshot.get('collection_status') == 'empty':
+        return []
+    if isinstance(snapshot.get('product_ids'), list):
+        stmt = stmt.where(StoreProduct.goods_id.in_(snapshot['product_ids']))
+    else:
+        observed = _datetime(snapshot.get('observed_at'))
+        if snapshot.get('collection_status') not in (None, 'success'):
+            return []
+        if observed is None:
+            observed = db.scalar(select(func.max(StoreProduct.last_observed_at)).where(
+                StoreProduct.platform_account_id == account.id, StoreProduct.user_id == account.user_id))
+        if observed is None:
+            return []
+        stmt = stmt.where(StoreProduct.last_observed_at == observed)
+    products = list(db.scalars(stmt.order_by(StoreProduct.created_at, StoreProduct.id).limit(5001)).all())
+    if len(products) > 5000:
+        raise HTTPException(422, '本次摘要最多支持5000件已采集商品，原摘要未修改')
     return [
         {
             "title": str(product.title or "").strip(),
-            "goods_id": str(product.goods_id or "").strip(),
-            "price_label": str(product.price_label or "").strip(),
         }
         for product in products
         if str(product.title or "").strip()
@@ -126,6 +139,9 @@ def _summary_products(db: Session, account: PlatformAccount) -> list[dict]:
 async def generate_shop_summary(db: Session, user: User, account_id: str) -> PlatformAccount:
     account = get_platform_account(db, user, account_id)
     products = _summary_products(db, account)
+    if not products:
+        raise HTTPException(409, '暂无可用的在售商品资料，请先采集商品列表；原摘要未修改')
+    previous_summary = dict(_shop_summary_metadata(account))
     settings = get_settings()
     ai_config = db.scalar(select(AiProviderConfig).where(AiProviderConfig.user_id == user.id))
     provider_config = {
@@ -136,40 +152,26 @@ async def generate_shop_summary(db: Session, user: User, account_id: str) -> Pla
         "enabled": bool(settings.ai_provider_api_key or getattr(ai_config, "api_key", "")),
         "temperature": float(getattr(ai_config, "temperature", 0.2)),
     }
-    generated: dict[str, str] = {}
-    if products and provider_config["enabled"]:
-        try:
-            async with httpx.AsyncClient(
-                base_url=settings.ai_reply_base_url.rstrip("/"),
-                timeout=30,
-                trust_env=False,
-            ) as client:
-                response = await client.post(
-                    "/api/v1/shop-summaries/generate",
-                    json={
-                        "shop_name": account.account_alias or account.account_name,
-                        "products": products,
-                        "provider_config": provider_config,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if isinstance(payload, dict):
-                    generated = {
-                        "shop_intro": str(payload.get("shop_intro") or "").strip(),
-                        "on_sale_products": str(payload.get("on_sale_products") or "").strip(),
-                    }
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning(
-                "shop summary AI generation failed platform_account_id=%s error_type=%s",
-                account.id,
-                type(exc).__name__,
-            )
-    if not generated:
-        generated = {
-            "shop_intro": f"{account.account_alias or account.account_name}主营店铺在售商品。",
-            "on_sale_products": "；".join(item["title"] for item in products),
-        }
+    if not provider_config['enabled']:
+        raise HTTPException(503, '请先配置可用的AI模型；原摘要未修改')
+    try:
+        async with httpx.AsyncClient(base_url=settings.ai_reply_base_url.rstrip('/'), timeout=100, trust_env=False) as client:
+            response = await client.post('/api/v1/shop-summaries/generate', json={
+                'shop_name': shop_name(account), 'products': products, 'provider_config': provider_config})
+            response.raise_for_status()
+            payload = response.json()
+        generated = {}
+        for key, limit in [('shop_intro', 60), ('on_sale_products', 160)]:
+            value = payload.get(key) if isinstance(payload, dict) else None
+            if not isinstance(value, str) or not 0 < len(value.strip()) <= limit:
+                raise ValueError('Invalid short summary')
+            generated[key] = value.strip()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning('shop summary generation failed platform_account_id=%s error_type=%s', account.id, type(exc).__name__)
+        raise HTTPException(502, '简短摘要生成失败或超时，请重试；原摘要未修改') from exc
+    db.refresh(account)
+    if _shop_summary_metadata(account) != previous_summary:
+        raise HTTPException(409, '摘要在生成期间已被修改，请重新生成')
     metadata = dict(account.metadata_json or {})
     metadata["shop_summary"] = {
         **_shop_summary_metadata(account),
@@ -238,6 +240,10 @@ def create_or_sync_platform_account(
         request.metadata_json,
         account.metadata_json if account is not None else None,
     )
+    account_alias = (request.account_alias or request.account_name).strip()
+    if request.platform_code == 'qianniu':
+        metadata_json = merge_profile_metadata(metadata_json, account.metadata_json if account else None, request.local_account_id)
+        account_alias = profile_name(metadata_json, request.local_account_id) or '待识别店铺'
     if account is None:
         account = PlatformAccount(
             user_id=user.id,
@@ -245,7 +251,7 @@ def create_or_sync_platform_account(
             platform_name=platform_display_name(request.platform_code),
             local_account_id=request.local_account_id,
             account_name=request.account_name.strip(),
-            account_alias=(request.account_alias or request.account_name).strip(),
+            account_alias=account_alias,
             external_account_id=request.external_account_id,
             name_source="workspace",
             is_active=True,
@@ -257,12 +263,12 @@ def create_or_sync_platform_account(
     else:
         account.local_account_id = request.local_account_id
         account.account_name = request.account_name.strip()
-        account.account_alias = (request.account_alias or request.account_name).strip()
+        account.account_alias = account_alias
         account.external_account_id = request.external_account_id or account.external_account_id
         account.login_status = request.login_status
         account.last_rpa_node_id = request.last_rpa_node_id or account.last_rpa_node_id
         account.is_active = True
-        account.metadata_json = {**account.metadata_json, **metadata_json}
+        account.metadata_json = metadata_json if request.platform_code == 'qianniu' else {**account.metadata_json, **metadata_json}
         if request.login_status == "online":
             account.last_seen_at = utcnow()
     db.add(account)

@@ -43,6 +43,27 @@ def observe_message_snapshot(
 
 
 class MessageObservationServiceTests(unittest.TestCase):
+    def test_pdd_card_sanitization_keeps_wire_hash_and_deduplication(self):
+        messages = [{'dom_sequence': 0, 'sender_role': 'customer', 'message_type': 'unknown',
+            'content': '帮我退款', 'platform_message_id': 'pdd-card-1', 'automation_mode': 'trigger',
+            'structured_payload': {'from_role': 'user', 'raw_type': 999, 'message_core': {'version': 1,
+                'fields': [{'path': 'info.description', 'value': '退货规则是什么'},
+                           {'path': 'info.buttons.text', 'value': '帮我退款'},
+                           {'path': 'info.token', 'value': 'secret'}]}}}]
+        request = self.request('pdd-core-hash', messages=messages, message_count=1,
+            payload_hash=snapshot_payload_hash(messages), source_snapshot_id='pdd-api-list-core')
+        settings = Settings(_env_file=None, PDD_MESSAGE_SNAPSHOT_WRITE_ENABLED=True)
+        with patch('app.services.rpa_service.get_settings', return_value=settings):
+            event, rows, _ = create_event(self.db, self.user, self.node, request)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].content, '[非文本消息，请在原平台查看]')
+            self.assertNotIn('secret', str(rows[0].raw_payload))
+            self.assertNotIn('帮我退款', str(rows[0].raw_payload))
+            self.assertIn('退货规则是什么', str(rows[0].raw_payload))
+            self.assertIsNotNone(select_inbound_reply_source(self.db, request, rows))
+            _, repeated, _ = create_event(self.db, self.user, self.node, request)
+            self.assertEqual(repeated, [])
+
     def setUp(self) -> None:
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)

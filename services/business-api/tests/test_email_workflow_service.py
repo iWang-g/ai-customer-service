@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import smtplib
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
 from sqlalchemy import create_engine, select
@@ -17,16 +18,19 @@ from app.models import (
     Message,
     PlatformAccount,
     Robot,
+    RpaTask,
     User,
 )
 from app.services.email_service import decrypt_recipient, encrypt_secret, send_template_email
 from app.services.email_workflow_service import (
     ASK_EMAIL_TEXT,
-    FAILURE_TEXT,
     MISSING_TEMPLATE_TEXT,
     SUCCESS_TEXT,
     active_workflow,
+    bind_email_prompt_task,
+    email_unavailable,
     extract_email,
+    reconcile_email_prompt_task,
     sandbox_email_result,
     start_or_resume_email_workflow,
     template_metadata,
@@ -98,6 +102,115 @@ class EmailWorkflowServiceTests(unittest.TestCase):
 
     def test_extract_email_normalizes_address(self) -> None:
         self.assertEqual(extract_email("请发到 Customer.Name+1@Example.COM，谢谢"), "customer.name+1@example.com")
+
+    def test_email_unavailable_requires_a_mailbox_refusal(self) -> None:
+        for text in ("没有邮箱", "我无法提供电子邮箱", "邮箱号给不了"):
+            with self.subTest(text=text):
+                self.assertTrue(email_unavailable(text))
+        self.assertFalse(email_unavailable("没有收到邮件"))
+        self.assertFalse(email_unavailable("邮箱是 customer@example.com"))
+
+    def test_active_workflow_keeps_latest_and_supersedes_duplicates(self) -> None:
+        first = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            missing_slots_json=["email"],
+        )
+        self.db.add(first)
+        self.db.commit()
+        first.updated_at = first.updated_at - timedelta(seconds=1)
+        self.db.commit()
+        second = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            missing_slots_json=["email"],
+        )
+        self.db.add(second)
+        self.db.commit()
+
+        selected = active_workflow(self.db, self.user, self.conversation, self.robot)
+
+        self.db.refresh(first)
+        self.db.refresh(second)
+        self.assertEqual(selected.id, second.id)
+        self.assertEqual(first.status, "cancelled_superseded")
+        self.assertEqual(second.status, "waiting_for_email")
+
+    def test_email_prompt_waits_for_send_confirmation_and_failure_closes_workflow(self) -> None:
+        workflow = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            missing_slots_json=["email"],
+        )
+        task = RpaTask(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            task_type="send_message",
+            platform_code="qianniu",
+            payload_json={},
+        )
+        self.db.add_all([workflow, task])
+        self.db.commit()
+
+        self.assertTrue(bind_email_prompt_task(self.db, workflow.id, task))
+        self.db.refresh(workflow)
+        self.db.refresh(task)
+        self.assertEqual(workflow.status, "prompt_pending")
+        self.assertEqual(task.payload_json["email_workflow_prompt_id"], workflow.id)
+
+        self.assertTrue(reconcile_email_prompt_task(self.db, task, delivered=False))
+        self.db.commit()
+        self.db.refresh(workflow)
+        self.db.refresh(self.conversation)
+        self.assertEqual(workflow.status, "failed")
+        self.assertTrue(self.conversation.human_required)
+        self.assertEqual(self.conversation.human_required_reason, "email_prompt_send_failed")
+
+    def test_confirmed_email_prompt_enters_waiting_state(self) -> None:
+        workflow = ConversationWorkflow(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            robot_id=self.robot.id,
+            workflow_type="collect_email_for_link",
+            status="waiting_for_email",
+            intent="email_link_request",
+            missing_slots_json=["email"],
+        )
+        task = RpaTask(
+            user_id=self.user.id,
+            conversation_id=self.conversation.id,
+            task_type="send_message",
+            platform_code="qianniu",
+            payload_json={},
+        )
+        self.db.add_all([workflow, task])
+        self.db.commit()
+
+        self.assertTrue(bind_email_prompt_task(self.db, workflow.id, task))
+        self.assertTrue(reconcile_email_prompt_task(self.db, task, delivered=True))
+        self.db.commit()
+        self.db.refresh(workflow)
+
+        self.assertEqual(workflow.status, "waiting_for_email")
+
+    def test_default_customer_messages_match_the_email_collection_flow(self) -> None:
+        self.assertEqual(ASK_EMAIL_TEXT, "亲，请发送一下完整邮箱号哦~")
+        self.assertEqual(
+            SUCCESS_TEXT,
+            "亲，已发送到您的邮箱，陌生邮件可能存放垃圾邮件里，请注意查收哦~",
+        )
 
     def test_template_metadata_excludes_body_and_secret(self) -> None:
         metadata = template_metadata([self.template])
@@ -225,8 +338,39 @@ class EmailWorkflowServiceTests(unittest.TestCase):
             )
 
         self.db.refresh(workflow)
-        self.assertEqual(result["text"], FAILURE_TEXT)
+        self.assertEqual(result["text"], "")
         self.assertNotEqual(result["text"], SUCCESS_TEXT)
+        self.assertEqual(result["decision"], "needs_human")
+        self.assertEqual(result["action_plan"]["workflow"], "human_review")
+        self.assertEqual(result["action_plan"]["next_action"], "email_failed")
+        self.assertIn("email_send_failed", result["risk_flags"])
+        self.assertIn("retry_email", result["action_plan"]["blocked_actions"])
+        self.assertEqual(workflow.status, "failed")
+
+    def test_non_sent_email_task_requires_human_without_failure_reply(self) -> None:
+        source = self.customer_message("customer@example.com")
+
+        with patch(
+            "app.services.email_workflow_service.send_template_email",
+            return_value=type("Task", (), {"status": "failed", "id": "failed-task"})(),
+        ):
+            result = start_or_resume_email_workflow(
+                self.db,
+                self.user,
+                self.conversation,
+                self.robot,
+                message=source.content,
+                source_message=source,
+                templates=[self.template],
+            )
+
+        workflow = self.db.scalar(select(ConversationWorkflow).where(
+            ConversationWorkflow.conversation_id == self.conversation.id,
+        ))
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["decision"], "needs_human")
+        self.assertEqual(result["email_task_id"], "failed-task")
+        self.assertIn("email_send_failed", result["risk_flags"])
         self.assertEqual(workflow.status, "failed")
 
     def test_idempotent_template_send_does_not_send_twice(self) -> None:

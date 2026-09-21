@@ -34,8 +34,10 @@ from app.services.rpa_service import (
 )
 from app.services.platform_account_service import sync_platform_accounts_for_node
 from app.services.realtime import realtime_manager
-from app.services.automation_service import schedule_debounced_inbound_reply
+from app.services.automation_service import inbound_reply_debounce_seconds, schedule_debounced_inbound_reply
 from app.services.settings_service import auto_reply_enabled
+from app.services.qianniu_transfer_notice import is_transfer_reply_source
+from app.services.qianniu_send_guard import check_qianniu_send_guard
 
 router = APIRouter(prefix="/rpa", tags=["rpa"])
 
@@ -49,7 +51,7 @@ def _schedule_inbound_reply(
 ) -> None:
     if request.event_type not in {"customer_message", "message_received", "message_snapshot"}:
         return
-    if source_message.sender_role != "customer":
+    if source_message.sender_role != "customer" and not is_transfer_reply_source(source_message):
         return
     maybe_queue_entry_welcome(db, user, source_message)
     if not auto_reply_enabled(db, user):
@@ -59,6 +61,7 @@ def _schedule_inbound_reply(
         source_message.conversation_id,
         source_message.id,
         source_event_id,
+        delay_seconds=inbound_reply_debounce_seconds(source_message),
     )
 
 
@@ -250,6 +253,31 @@ async def ack_task(
     return TaskAckResponse(task=updated)
 
 
+@router.get("/tasks/{task_id}/qianniu-send-guard")
+def qianniu_task_send_guard(
+    task_id: str,
+    platform_account_id: str,
+    cid: str,
+    node=Depends(get_current_rpa_node),
+    db: Session = Depends(get_db_session),
+) -> dict[str, bool]:
+    task = db.get(RpaTask, task_id)
+    if not task or task.user_id != node.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    if task.node_id != node.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Task belongs to another node")
+    user = db.get(User, node.user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return check_qianniu_send_guard(db, user, platform_account_id, cid, task_id)
+
+
+@router.post('/tasks/{task_id}/pdd-execution-guard')
+def pdd_execution_guard(task_id: str, user=Depends(get_current_user), db: Session = Depends(get_db_session)):
+    from app.services.pdd_auto_transfer import validate
+    return validate(db, user, db.get(RpaTask, task_id))
+
+
 @router.post("/tasks/{task_id}/complete", response_model=TaskAckResponse)
 async def complete_task_route(
     task_id: str,
@@ -269,4 +297,10 @@ async def complete_task_route(
         node.user_id,
         {"type": "rpa.task.completed", "task": updated.model_dump(mode="json")},
     )
+    if ((task.platform_code == 'douyin' and (task.payload_json or {}).get('douyin_auto_operation_id'))
+            or (task.platform_code == 'qianniu' and (task.payload_json or {}).get('qianniu_auto_operation_id'))
+            or (task.platform_code == 'pinduoduo' and (task.payload_json or {}).get('pdd_auto_operation_id'))):
+        from app.services.message_service import get_conversation
+        await realtime_manager.broadcast(node.user_id, {'type': 'conversation.updated',
+            'conversation': get_conversation(db, db.get(User, node.user_id), task.conversation_id).model_dump(mode='json')})
     return TaskAckResponse(task=updated)

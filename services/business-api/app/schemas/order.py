@@ -45,5 +45,8 @@ class CustomerOrdersResponse(BaseModel):
     customer_key: str = ""
     total_count: int = 0
     has_more: bool = False
+    query_coverage: str | None = None
+    last_attempt_task_id: str | None = None
+    last_attempt_at: datetime | None = None
     orders: list[CustomerOrderRead] = Field(default_factory=list)
     outreach: list[OutreachStatusRead] = Field(default_factory=list)

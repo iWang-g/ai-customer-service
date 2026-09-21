@@ -14,6 +14,7 @@ from app.services.email_service import (
     delete_template,
     decrypt_secret,
     encrypt_secret,
+    get_config,
     list_templates,
     mask_email,
     provider_defaults,
@@ -124,18 +125,51 @@ class EmailServiceTests(unittest.TestCase):
         saved = save_config(self.db, self.user, request)
         row = self.db.scalar(select(EmailProviderConfig).where(EmailProviderConfig.user_id == self.user.id))
         self.assertTrue(saved.auth_code_saved)
-        self.assertEqual(saved.trigger_scenarios, "客户想要定制")
+        self.assertEqual(saved.trigger_scenarios, "")
         self.assertEqual(saved.ask_email_text, "亲，请提供邮箱")
         self.assertEqual(saved.success_text, "亲，邮件已发送")
         self.assertEqual(saved.missing_template_text, "亲，转人工处理")
         self.assertIsNotNone(row)
         self.assertNotIn("smtp-secret", row.auth_secret_encrypted)
         encrypted = row.auth_secret_encrypted
+        self.assertEqual(row.trigger_scenarios, "")
 
         request.auth_code = ""
         save_config(self.db, self.user, request)
         self.db.refresh(row)
         self.assertEqual(row.auth_secret_encrypted, encrypted)
+
+    def test_legacy_trigger_scenarios_are_hidden_and_cleared_on_save(self) -> None:
+        config = EmailProviderConfig(
+            user_id=self.user.id,
+            enabled=False,
+            provider="qq",
+            sender_email="sender@example.com",
+            smtp_host="smtp.qq.com",
+            smtp_port=465,
+            security="ssl",
+            trigger_scenarios="客户想要定制",
+        )
+        self.db.add(config)
+        self.db.commit()
+
+        self.assertEqual(get_config(self.db, self.user).trigger_scenarios, "")
+        save_config(
+            self.db,
+            self.user,
+            EmailConfigUpdate(
+                enabled=False,
+                provider="qq",
+                sender_email="sender@example.com",
+                smtp_host="smtp.qq.com",
+                smtp_port=465,
+                security="ssl",
+                trigger_scenarios="仍然不应生效",
+            ),
+        )
+
+        self.db.refresh(config)
+        self.assertEqual(config.trigger_scenarios, "")
 
     def test_template_crud_is_scoped_to_user(self) -> None:
         created = create_template(

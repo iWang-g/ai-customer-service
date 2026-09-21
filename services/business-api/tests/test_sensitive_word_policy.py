@@ -106,6 +106,53 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.intent, "human_handoff")
         self.assertEqual(run.qa_match_type, "sensitive_word")
 
+    def prepare_transfer_account(self):
+        from app.models import PlatformAccount, UserSettings
+        self.db.add(PlatformAccount(id='pdd-account-1', user_id=self.user.id,
+            platform_code='pinduoduo', platform_name='拼多多', account_name='shop', login_status='online'))
+        setting = self.db.scalar(select(UserSettings).where(UserSettings.user_id == self.user.id))
+        if setting:
+            setting.auto_reply_enabled = True
+        else:
+            self.db.add(UserSettings(user_id=self.user.id, auto_reply_enabled=True))
+        self.db.commit()
+
+    async def test_transfer_strategy_directly_transfers_on_sensitive_word(self) -> None:
+        self.prepare_transfer_account()
+        self.conversation.platform_account_id = "pdd-account-1"
+        self.robot.config_json = {
+            "allow_auto_send": True,
+            "inbound_sensitive_words": ["投诉", "差评"],
+            "human_handoff_strategy": "transfer_conversation",
+        }
+        self.db.add_all([self.conversation, self.robot])
+        self.db.commit()
+
+        with patch(
+            "app.services.automation_service._decide_reply",
+            new=AsyncMock(),
+        ) as decide_reply:
+            result = await run_reply(
+                self.db,
+                self.user,
+                ReplyRunRequest(
+                    conversation_id=self.conversation.id,
+                    source_message_id=self.source_message.id,
+                    allow_auto_send=True,
+                ),
+            )
+
+        decide_reply.assert_not_awaited()
+        self.db.refresh(self.conversation)
+        self.assertFalse(self.conversation.human_required)
+        self.assertEqual(result['text'], '')
+        self.assertEqual(result['action_plan']['workflow'], 'pdd_auto_transfer')
+        self.assertEqual(self.conversation.metadata_json['auto_transfer']['status'], 'preparing')
+        self.assertEqual(self.conversation.metadata_json['auto_transfer']['reason'], 'sensitive_word')
+        task = self.db.get(RpaTask, result['task_ids'][0])
+        self.assertEqual(task.task_type, 'pdd_transfer_prepare')
+        self.assertEqual(self.db.query(RpaTask).filter_by(task_type='send_message').count(), 0)
+
     async def test_marked_conversation_allows_later_normal_auto_reply(self) -> None:
         self.conversation.human_required = True
         self.conversation.human_required_reason = "sensitive_word"
@@ -313,7 +360,8 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["task_ids"]), 1)
         self.assertFalse(self.conversation.human_required)
 
-    async def test_transfer_strategy_asks_for_confirmation_on_fallback(self) -> None:
+    async def test_transfer_strategy_directly_transfers_on_fallback(self) -> None:
+        self.prepare_transfer_account()
         self.conversation.platform_account_id = "pdd-account-1"
         self.robot.config_json = {
             "allow_auto_send": True,
@@ -354,14 +402,16 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         self.db.refresh(self.conversation)
         self.assertFalse(self.conversation.human_required)
-        self.assertEqual(result["text"], "亲亲，为及时给您解答，是否需要转接给其他客服")
-        task = self.db.scalar(select(RpaTask).where(RpaTask.task_type == "send_message"))
-        self.assertIsNotNone(task)
-        self.assertEqual(task.payload_json["content"], result["text"])
-        self.assertEqual(self.conversation.metadata_json["auto_transfer"]["status"], "confirming")
-        self.assertEqual(self.conversation.metadata_json["auto_transfer"]["reason"], "fallback_reply")
+        self.assertEqual(result['text'], '')
+        self.assertEqual(result['action_plan']['workflow'], 'pdd_auto_transfer')
+        self.assertEqual(self.conversation.metadata_json['auto_transfer']['status'], 'preparing')
+        self.assertEqual(self.conversation.metadata_json['auto_transfer']['reason'], 'fallback_reply')
+        task = self.db.get(RpaTask, result['task_ids'][0])
+        self.assertEqual(task.task_type, 'pdd_transfer_prepare')
+        self.assertEqual(self.db.query(RpaTask).filter_by(task_type='send_message').count(), 0)
 
-    async def test_transfer_confirmation_yes_queues_ack_with_after_send_transfer(self) -> None:
+    async def test_transfer_confirmation_yes_prepares_target_before_notice(self) -> None:
+        self.prepare_transfer_account()
         self.conversation.platform_account_id = "pdd-account-1"
         self.conversation.metadata_json = {
             "auto_transfer": {
@@ -396,14 +446,14 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.db.refresh(self.conversation)
-        self.assertEqual(result["text"], "好的，稍等一下")
-        self.assertEqual(self.conversation.metadata_json["auto_transfer"]["status"], "ack_queued")
-        ack_task = self.db.scalars(select(RpaTask).order_by(RpaTask.requested_at.desc())).first()
-        self.assertIsNotNone(ack_task)
-        self.assertIn("after_send_transfer_conversation", ack_task.payload_json)
-        transfer_payload = ack_task.payload_json["after_send_transfer_conversation"]
-        self.assertEqual(transfer_payload["trans_reason"], "无原因直接转移")
-        self.assertEqual(transfer_payload["external_conversation_id"], "customer-sensitive")
+        self.assertFalse(self.conversation.human_required)
+        self.assertEqual(result['text'], '')
+        self.assertEqual(result['action_plan']['workflow'], 'pdd_auto_transfer')
+        self.assertEqual(self.conversation.metadata_json['auto_transfer']['status'], 'preparing')
+        self.assertEqual(self.conversation.metadata_json['auto_transfer']['reason'], 'fallback_reply')
+        task = self.db.get(RpaTask, result['task_ids'][0])
+        self.assertEqual(task.task_type, 'pdd_transfer_prepare')
+        self.assertEqual(self.db.query(RpaTask).filter_by(task_type='send_message').count(), 0)
 
     async def test_transfer_confirmation_no_clears_state_and_sends_cancel_reply(self) -> None:
         self.conversation.platform_account_id = "pdd-account-1"
@@ -452,6 +502,7 @@ class SensitiveWordPolicyTests(unittest.IsolatedAsyncioTestCase):
         task = self.db.scalars(select(RpaTask).order_by(RpaTask.requested_at.desc())).first()
         self.assertIsNotNone(task)
         self.assertEqual(task.payload_json["content"], "好的亲亲，有需要随时告诉我")
+        self.assertNotIn("quote_message_id", task.payload_json)
         self.assertNotIn("after_send_transfer_conversation", task.payload_json)
 
 

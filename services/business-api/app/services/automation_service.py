@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.pdd_message_context import prompt_context as pdd_message_context
+
 import logging
 import asyncio
 import re
@@ -15,6 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.services.qianniu_transfer_service import transfer_blocked
+from app.services.qianniu_transfer_notice import is_transfer_reply_source, transfer_prompt
+from app.services.qianniu_shop_profile import conversation_shop_name
 from app.models import (
     AiProviderConfig,
     AutomationReplyRun,
@@ -31,7 +36,12 @@ from app.schemas.automation import ReplyRunRequest, TestReplyRequest
 from app.schemas.message import MessageRead, SendMessageRequest
 from app.services.email_workflow_service import (
     active_workflow,
+    bind_email_prompt_task,
+    cancel_email_workflow,
+    email_unavailable,
+    email_unavailable_result,
     enabled_templates,
+    extract_email,
     sandbox_email_result,
     start_or_resume_email_workflow,
     template_metadata,
@@ -41,9 +51,12 @@ from app.services.message_service import create_send_task
 from app.services.order_service import order_prompt_context
 from app.services.order_service import maybe_create_order_follow_up
 from app.services.product_service import match_store_products
+from app.services.qianniu_product_links import append_reply_links, reply_candidates, outbound_reason
 from app.services.model_call_service import persist_model_calls
-from app.services.outbound_safety import prohibited_outbound_reason
+from app.services.outbound_safety import prohibited_outbound_reason, qianniu_outbound_reason
 from app.services.robot_service import _knowledge_access_token, serialize_robot
+from app.services.douyin_automation import robot_matches, reply_block_reason
+from app.services.douyin_message_context import prompt_context as douyin_message_context
 
 
 logger = logging.getLogger(__name__)
@@ -54,17 +67,45 @@ DEFAULT_TIMEOUT_SECONDS = 10
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 60
 INBOUND_REPLY_DEBOUNCE_SECONDS = 3.0
+INBOUND_REPLY_FAST_DEBOUNCE_SECONDS = 1.2
+INBOUND_REPLY_MEDIUM_DEBOUNCE_SECONDS = 1.5
 ORDER_CONTEXT_REFRESH_TIMEOUT_SECONDS = 6.0
 ORDER_CONTEXT_REFRESH_POLL_SECONDS = 0.4
 MAX_SENSITIVE_WORDS = 200
 MAX_SENSITIVE_WORD_LENGTH = 64
 AUTO_REPLY_MESSAGE_TYPES = {"text", "product", "order"}
 _pending_inbound_reply_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+
+
+def inbound_reply_debounce_seconds(message: Message) -> float:
+    raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    message_type = str(raw_payload.get("message_type") or "text")
+    if message_type in {"product", "image", "order"} or (getattr(message, 'platform_code', None) == 'douyin' and message_type == 'unknown'):
+        return INBOUND_REPLY_FAST_DEBOUNCE_SECONDS
+    text = re.sub(r"\s+", "", message.content or "").strip()
+    if not text:
+        return INBOUND_REPLY_DEBOUNCE_SECONDS
+    normalized = re.sub(r"[，。！？、,.!?~～]+$", "", text).casefold()
+    if normalized in {
+        "你好", "您好", "嗨", "哈喽", "hello", "hi", "在吗", "在不在", "处吗",
+        "好的", "好", "嗯", "行", "可以", "需要", "谢谢", "感谢", "收到", "明白了",
+    }:
+        return INBOUND_REPLY_FAST_DEBOUNCE_SECONDS
+    if re.search(r"[。！？!?]$", text) or re.search(
+        r"(?:吗|么|呢|什么|怎么|如何|为什么|多少|多久|哪(?:个|款|种|里)?|有没有|能否|是否)",
+        normalized,
+    ):
+        return INBOUND_REPLY_FAST_DEBOUNCE_SECONDS
+    if normalized.endswith(("我想", "想问", "请问", "就是", "然后", "还有", "但是", "不过", "这个", "那个", "帮我")):
+        return INBOUND_REPLY_DEBOUNCE_SECONDS
+    if len(normalized) >= 6:
+        return INBOUND_REPLY_MEDIUM_DEBOUNCE_SECONDS
+    return INBOUND_REPLY_DEBOUNCE_SECONDS
 DEFAULT_HUMAN_REQUIRED_REPLY_TEXT = "亲，已收到这条消息，我这边先标记给人工客服查看。"
 DEFAULT_SENSITIVE_WORD_REPLY_TEXT = "亲亲，已收到您的消息，正在为您核实，请稍等~"
 DEFAULT_PRODUCT_CARD_ACK_TEXT = "亲亲，关于这款商品有什么想要了解的吗"
 DEFAULT_TRANSFER_CONFIRM_TEXT = "亲亲，为及时给您解答，是否需要转接给其他客服"
-DEFAULT_TRANSFER_ACK_TEXT = "好的，稍等一下"
+DEFAULT_TRANSFER_ACK_TEXT = "亲亲，为给您解答，稍等一下，将为您转客服~"
 DEFAULT_TRANSFER_CANCEL_TEXT = "好的亲亲，有需要随时告诉我"
 TRANSFER_REASON_TEXT = "无原因直接转移"
 AUTO_TRANSFER_METADATA_KEY = "auto_transfer"
@@ -83,6 +124,10 @@ def _active_robot(db: Session, user: User, conversation: Conversation) -> Robot 
         .order_by(desc(Robot.updated_at))
     ).all())
     for robot in robots:
+        if conversation.platform_code == "douyin":
+            if robot_matches(db, robot, conversation):
+                return robot
+            continue
         scopes = list(db.scalars(
             select(RobotPlatformScope).where(RobotPlatformScope.robot_id == robot.id)
         ).all())
@@ -294,15 +339,6 @@ def _human_required_reply_text(robot: Robot | None, reason: str) -> str:
     return text or DEFAULT_HUMAN_REQUIRED_REPLY_TEXT
 
 
-def _quote_platform_message_id(message: Message | None) -> str | None:
-    if message is None:
-        return None
-    if _message_type(message) not in {"text", "image"}:
-        return None
-    value = str(getattr(message, "platform_message_id", None) or "").strip()
-    return value[:128] if value else None
-
-
 def _mark_human_required(
     conversation: Conversation,
     *,
@@ -359,9 +395,18 @@ async def _refresh_order_context_before_reply(
     *,
     enabled: bool,
     timeout_seconds: float = ORDER_CONTEXT_REFRESH_TIMEOUT_SECONDS,
+    message_text: str | None = None,
 ) -> dict[str, Any]:
     if not enabled:
         return {"attempted": False, "reason": "auto_send_disabled"}
+    if conversation.platform_code == 'douyin':
+        from app.services.douyin_order_context import refresh_before_reply
+        return await refresh_before_reply(db, user, conversation, source_message,
+                                          text=message_text, timeout_seconds=timeout_seconds)
+    if conversation.platform_code == "qianniu":
+        from app.services.qianniu_order_context import refresh_before_reply
+        return await refresh_before_reply(db, user, conversation, source_message,
+                                          text=message_text, timeout_seconds=timeout_seconds)
     if not _can_refresh_order_context(conversation):
         return {"attempted": False, "reason": "conversation_not_refreshable"}
     previous_observed_at = _order_summary_observed_at(conversation)
@@ -440,7 +485,7 @@ def _transfer_conversation_enabled(robot: Robot | None, conversation: Conversati
     return bool(
         auto_send_allowed
         and _human_handoff_strategy(robot) == HUMAN_HANDOFF_STRATEGY_TRANSFER
-        and conversation.platform_code == "pinduoduo"
+        and conversation.platform_code in {"pinduoduo", "qianniu", "douyin"}
         and conversation.platform_account_id
         and external_id
         and not external_id.startswith("name:")
@@ -463,6 +508,9 @@ def _transfer_cancel_text(robot: Robot | None) -> str:
 
 
 def _auto_transfer_state(conversation: Conversation) -> dict[str, Any]:
+    if conversation.platform_code == 'pinduoduo':
+        from app.services.pdd_auto_transfer import state
+        return state(conversation)
     metadata = conversation.metadata_json if isinstance(conversation.metadata_json, dict) else {}
     state = metadata.get(AUTO_TRANSFER_METADATA_KEY)
     return state if isinstance(state, dict) else {}
@@ -722,7 +770,26 @@ def _queue_reply_task(
 ) -> str | None:
     if not _should_create_send_task(result, auto_send_allowed=auto_send_allowed):
         return None
-    prohibited_reason = prohibited_outbound_reason(str(result.get("text") or ""))
+    if conversation.platform_code == 'qianniu':
+        db.refresh(conversation)
+        from app.services.qianniu_transfer_service import current_operation
+        operation = current_operation(db, conversation) or {}
+        if transfer_blocked(conversation) or (conversation.human_required
+                and operation.get('source') == 'automation' and operation.get('status') == 'failed'):
+            result.update(decision='no_reply', suppression_reason='qianniu_transfer')
+            return None
+    if conversation.platform_code == "douyin":
+        db.refresh(conversation)
+        db.refresh(robot)
+        if conversation.platform_account:
+            db.refresh(conversation.platform_account)
+        reason = reply_block_reason(db, conversation, source_message, robot, sending=True)
+        if reason:
+            result.update(decision="no_reply", suppression_reason=reason)
+            return None
+    prohibited_reason = outbound_reason(db, conversation, str(result.get("text") or ""))
+    if conversation.platform_code == 'qianniu':
+        prohibited_reason = prohibited_reason or qianniu_outbound_reason(str(result.get('text') or ''))
     if prohibited_reason:
         result["decision"] = "needs_human"
         result["text"] = ""
@@ -762,6 +829,11 @@ def _queue_reply_task(
     )
     if not isinstance(follow_up_products, list):
         follow_up_products = []
+    if conversation.platform_code == "douyin":
+        image_media = None
+        follow_up_products = []
+        result["media"] = []
+        result["product_recommendation"] = {"enabled": False, "products": []}
     timeout_task = db.scalar(
         select(RpaTask).where(
             RpaTask.idempotency_key == f"auto-timeout:{robot.id}:{source_message.id}"
@@ -778,7 +850,7 @@ def _queue_reply_task(
             conversation_id=conversation.id,
             content=str(result["text"]),
             platform_code=conversation.platform_code,
-            quote_message_id=str(result.get("quote_message_id") or "")[:128] or None,
+            quote_message_id=None,
         ),
         follow_up=(
             {"type": "image", "url": str(image_media["url"])}
@@ -788,6 +860,8 @@ def _queue_reply_task(
         follow_up_products=follow_up_products,
         idempotency_key=f"auto-reply:{robot.id}:{source_message.id}:text",
         source="automation",
+        automation_context={"automation_robot_id": robot.id, "automation_source_message_id": source_message.id}
+        if conversation.platform_code == "douyin" else None,
         task_status="waiting_timeout" if should_wait_for_timeout else "queued",
     )
     task = db.get(RpaTask, response.task_id)
@@ -826,7 +900,7 @@ def _queue_human_required_notice_task(
             conversation_id=conversation.id,
             content=text,
             platform_code=conversation.platform_code,
-            quote_message_id=_quote_platform_message_id(source_message),
+            quote_message_id=None,
         ),
         idempotency_key=f"auto-human-required:{robot.id}:{source_message.id}:{idempotency_suffix}",
         source="automation",
@@ -855,7 +929,7 @@ def _queue_sensitive_word_notice_task(
             conversation_id=conversation.id,
             content=text,
             platform_code=conversation.platform_code,
-            quote_message_id=_quote_platform_message_id(source_message),
+            quote_message_id=None,
         ),
         idempotency_key=f"auto-sensitive-word:{robot.id}:{source_message.id}:text",
         source="automation",
@@ -928,7 +1002,7 @@ def _queue_transfer_confirmation_task(
             conversation_id=conversation.id,
             content=text,
             platform_code=conversation.platform_code,
-            quote_message_id=_quote_platform_message_id(source_message),
+            quote_message_id=None,
         ),
         idempotency_key=f"auto-transfer-confirm:{robot.id}:{source_message.id}:{reason}",
         source="automation",
@@ -957,6 +1031,15 @@ def _queue_transfer_ack_task(
     *,
     reason: str,
 ) -> dict[str, Any]:
+    if conversation.platform_code == 'pinduoduo':
+        from app.services.pdd_auto_transfer import queue
+        return queue(db, user, conversation, robot, source_message, reason)
+    if conversation.platform_code == 'douyin':
+        from app.services.douyin_auto_transfer import queue
+        return queue(db, user, conversation, robot, source_message, reason)
+    if conversation.platform_code == 'qianniu':
+        from app.services.qianniu_auto_transfer import queue
+        return queue(db, user, conversation, robot, source_message, reason)
     text = _transfer_ack_text(robot)
     result = _transfer_prompt_result(
         source_message.id,
@@ -972,7 +1055,7 @@ def _queue_transfer_ack_task(
             conversation_id=conversation.id,
             content=text,
             platform_code=conversation.platform_code,
-            quote_message_id=_quote_platform_message_id(source_message),
+            quote_message_id=None,
         ),
         idempotency_key=f"auto-transfer-ack:{robot.id}:{source_message.id}",
         source="automation",
@@ -1011,7 +1094,6 @@ async def _queue_transfer_cancel_task(
         next_action="cancel_transfer_confirmation",
         reason=reason,
     )
-    result["quote_message_id"] = _quote_platform_message_id(source_message)
     task_id = await _queue_reply_task_ordered(
         db,
         user,
@@ -1114,6 +1196,8 @@ def _queue_timeout_notice(
             return None
         if conversation.human_required:
             return None
+        if transfer_blocked(conversation):
+            return None
         reply_run = db.scalar(
             select(AutomationReplyRun).where(
                 AutomationReplyRun.robot_id == robot.id,
@@ -1182,6 +1266,27 @@ def _release_timeout_gated_reply(db: Session, robot_id: str, source_message_id: 
     return formal_task
 
 
+def _product_context_data(message: Message) -> list[dict[str, str]]:
+    if (getattr(message, "platform_code", None) not in {"douyin", "qianniu"}
+            or message.sender_role not in {"customer", "agent"}
+            or getattr(message, "message_status", "sent") == "failed"):
+        return []
+    payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    if payload.get("message_type") in {"system", "unknown"}:
+        return []
+    structured = payload.get("structured_payload")
+    structured = structured if isinstance(structured, dict) else {}
+    parts = structured.get("parts")
+    if message.platform_code == "qianniu" and isinstance(parts, list):
+        products = [part for part in parts[:32] if isinstance(part, dict) and part.get("kind") == "product"]
+    else:
+        products = [structured] if payload.get("message_type") == "product" else []
+    # Only product background belongs in the prompt, never image signatures,
+    # platform identities or executable card fields. Keep each mixed-message card.
+    return [{key: value[:512] for key in ("title", "product_id", "price_label")
+             if isinstance(value := product.get(key), str) and value.strip()} for product in products]
+
+
 def _message_history(
     rows: list[Message],
     *,
@@ -1198,11 +1303,85 @@ def _message_history(
             getattr(item, "id", None) not in excluded
             and
             getattr(item, "message_status", "sent") != "failed"
+            and not (getattr(item, 'platform_code', None) in {'douyin', 'qianniu', 'pinduoduo'}
+                     and getattr(item, 'message_status', 'sent') in {'queued', 'cancelled', 'confirmation_pending'})
             and item.sender_role in {"customer", "agent", "assistant", "bot"}
-            and (getattr(item, "raw_payload", {}) or {}).get("automation_mode", "trigger") == "trigger"
+            and not (
+                getattr(item, "platform_code", None) == "qianniu"
+                and isinstance(getattr(item, "raw_payload", None), dict)
+                and (item.raw_payload or {}).get("message_type") == "unknown"
+            )
+            and ((getattr(item, "raw_payload", {}) or {}).get("automation_mode", "trigger") == "trigger"
+                 or (getattr(item, 'platform_code', None) == 'douyin'
+                     and (getattr(item, 'raw_payload', {}) or {}).get('message_type') == 'text')
+                 or bool(_product_context_data(item)) or bool(douyin_message_context(item))
+                 or bool(_qianniu_image_context(item)) or bool(pdd_message_context(item))
+                 or (getattr(item, 'platform_code', None) in {'qianniu', 'pinduoduo'}
+                     and item.sender_role in {'agent', 'assistant', 'bot'}
+                     and (getattr(item, 'raw_payload', {}) or {}).get('message_type', 'text') == 'text'))
             and item.content.strip()
         )
     ]
+
+
+def _bounded_untrusted_context(value: Any, budget: list[int], depth: int = 0) -> Any:
+    if budget[0] <= 0 or depth > 9:
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        clipped = value[:min(256, budget[0])]
+        budget[0] -= len(clipped)
+        return clipped
+    if isinstance(value, list):
+        return [_bounded_untrusted_context(item, budget, depth + 1)
+                for item in value[:12] if budget[0] > 0]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for raw_key, item in list(value.items())[:24]:
+            key = str(raw_key)[:64]
+            if not key or budget[0] <= 0:
+                break
+            budget[0] -= len(key)
+            result[key] = _bounded_untrusted_context(item, budget, depth + 1)
+        return result
+    return str(value)[:min(128, budget[0])]
+
+
+def _qianniu_image_context(message: Message) -> dict[str, Any] | None:
+    if getattr(message, 'platform_code', None) != 'qianniu' or message.sender_role != 'customer':
+        return None
+    payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    structured = payload.get('structured_payload') or {}
+    parts = structured.get('parts') if isinstance(structured, dict) else None
+    if (payload.get('message_type') != 'image' and not payload.get('image_url')
+            and not (isinstance(parts, list) and any(isinstance(p, dict) and p.get('kind') == 'image' for p in parts))):
+        return None
+    return {'type': 'qianniu_unread_image', 'sender_role': 'customer',
+            'message_id': getattr(message, 'id', None), 'content': '[图片，未识图]',
+            'data': {'vision_available': False, 'untrusted': True}}
+
+
+def _unsupported_qianniu_context(message: Message) -> dict[str, Any] | None:
+    if getattr(message, "platform_code", None) != "qianniu" or message.sender_role != "customer":
+        return None
+    raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
+    if raw_payload.get("context_eligible") is not True or raw_payload.get("message_type") != "unknown":
+        return None
+    raw = raw_payload.get("qianniu_raw")
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "type": "unsupported_qianniu_message",
+        "content": message.content,
+        "sender_role": "customer",
+        "data": {
+            "untrusted": True,
+            **(_bounded_untrusted_context(raw, [3072]) or {}),
+        },
+    }
 
 
 def _customer_trigger_batch_tail(db: Session, source_message: Message) -> list[Message]:
@@ -1230,13 +1409,25 @@ def _customer_trigger_batch_tail(db: Session, source_message: Message) -> list[M
 def _message_type(message: Message) -> str:
     raw_payload = message.raw_payload if isinstance(message.raw_payload, dict) else {}
     message_type = str(raw_payload.get("message_type") or raw_payload.get("media_type") or "").strip()
+    if getattr(message, "platform_code", None) == "qianniu" and message_type in {"text", "product"}:
+        structured = raw_payload.get("structured_payload")
+        parts = structured.get("parts") if isinstance(structured, dict) else None
+        if (isinstance(parts, list) and parts
+                and all(isinstance(part, dict) and part.get("kind") == "product" for part in parts)):
+            return "product"
     if message_type == "image" or raw_payload.get("image_url"):
         return "image"
     return message_type or "text"
 
 
 def _unsupported_reply_reason(message: Message) -> str | None:
+    if pdd_message_context(message) or douyin_message_context(message):
+        return None
+    if is_transfer_reply_source(message):
+        return None
     message_type = _message_type(message)
+    if getattr(message, "platform_code", None) == "qianniu" and message_type in {"unknown", "image"}:
+        return None
     if message_type in AUTO_REPLY_MESSAGE_TYPES:
         return None
     if message_type == "image":
@@ -1249,6 +1440,8 @@ def _snapshot_customer_batch_size(db: Session, source_message: Message) -> int:
 
 
 def _current_customer_message(batch_messages: list[Message]) -> str:
+    if len(batch_messages) == 1 and is_transfer_reply_source(batch_messages[0]):
+        return transfer_prompt(batch_messages[0])
     usable = [item.content.strip() for item in batch_messages if item.content.strip()]
     if len(usable) <= 1:
         return usable[0] if usable else ""
@@ -1279,6 +1472,29 @@ def _platform_context(rows: list[Message], limit: int = 10) -> list[dict[str, An
     items: list[dict[str, Any]] = []
     for item in reversed(rows):
         raw_payload = item.raw_payload if isinstance(item.raw_payload, dict) else {}
+        pdd_context = pdd_message_context(item)
+        if pdd_context:
+            items.append(pdd_context)
+            continue
+        image_context = _qianniu_image_context(item)
+        if image_context:
+            items.append(image_context)
+            if _message_type(item) == 'image':
+                continue
+        douyin_context = douyin_message_context(item)
+        if douyin_context:
+            items.append(douyin_context)
+            continue
+        unsupported = _unsupported_qianniu_context(item)
+        if unsupported:
+            items.append(unsupported)
+            continue
+        products = _product_context_data(item)
+        if products:
+            for product in products:
+                items.append({"type": "product", "content": item.content,
+                              "sender_role": item.sender_role, "data": product})
+            continue
         automation_mode = raw_payload.get("automation_mode")
         message_type = raw_payload.get("message_type") or "context"
         is_triggering_customer_card = (
@@ -1315,6 +1531,9 @@ async def _decide_reply(
     platform_context: list[dict[str, Any]] | None = None,
     shop_product_summary: dict[str, str] | None = None,
     platform_rule_scene: dict[str, Any] | None = None,
+    product_details: list[dict[str, Any]] | None = None,
+    product_card_only: bool = False,
+    product_link_candidates: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     config = _robot_config(robot)
     payload = {
@@ -1326,6 +1545,9 @@ async def _decide_reply(
         "customer_name": customer_name,
         "customer_orders": customer_orders or {"collection_status": "not_collected"},
         "platform_context": platform_context or [],
+        "product_details": product_details or [],
+        "product_card_only": product_card_only,
+        "product_link_candidates": product_link_candidates or [],
         "shop_product_summary": shop_product_summary or {},
         "qa_base_ids": robot_read.qa_knowledge_base_ids,
         "product_base_ids": robot_read.product_knowledge_base_ids,
@@ -1340,7 +1562,6 @@ async def _decide_reply(
             "advanced_instruction": str(config.get("advanced_instruction") or ""),
             "prohibited_content_instruction": str(config.get("prohibited_content_instruction") or ""),
             "fallback_reply_text": str(config.get("fallback_reply_text") or ""),
-            "email_trigger_scenarios": str(getattr(email_config, "trigger_scenarios", "") or ""),
             "platform_rule_scene": platform_rule_scene or {},
         },
         "provider_config": {
@@ -1407,11 +1628,28 @@ async def _execute_bound_reply(
     elif unsupported_matches:
         pending_human_required = (unsupported_matches[0][1], None)
 
-    if is_product_card_only_batch:
+    detail_refresh = {"attempted": False, "product_ids": []}
+    product_details = []
+    if conversation.platform_code in {"qianniu", "douyin"} and reply_batch_messages and not pending_human_required:
+        if conversation.platform_code == "douyin":
+            from app.services.douyin_product_detail_service import ensure_details, prompt_details
+        else:
+            from app.services.qianniu_product_detail_service import ensure_details, prompt_details
+        try:
+            detail_refresh = await ensure_details(db, user, conversation, source_message,
+                enabled=_auto_send_allowed(robot, requested=request.allow_auto_send))
+            product_details = prompt_details(db, conversation, detail_refresh["product_ids"],
+                _current_customer_message(reply_batch_messages))
+        except Exception as exc:
+            logger.warning("Product detail unavailable platform=%s error_type=%s", conversation.platform_code, type(exc).__name__)
+            db.rollback()
+
+    if is_product_card_only_batch and not product_details:
         result = _product_card_ack_result(
             source_message.id,
             _product_card_ack_text(robot),
         )
+        result['product_detail_refresh'] = detail_refresh
         task_id = await _queue_reply_task_ordered(
             db,
             user,
@@ -1439,7 +1677,7 @@ async def _execute_bound_reply(
     pre_reply_task_ids: list[str] = []
     transfer_state = _auto_transfer_state(conversation)
     transfer_status = str(transfer_state.get("status") or "")
-    if transfer_status in {"ack_queued", "transferring", "transferred"}:
+    if conversation.platform_code != 'qianniu' and transfer_status in {"preparing", "ack_queued", "ready", "transferring", "transferred", "confirmation_pending"}:
         return _transfer_suppressed_result(source_message.id, transfer_status)
     if (
         transfer_status == "confirming"
@@ -1472,21 +1710,19 @@ async def _execute_bound_reply(
 
     if sensitive_matches and not reply_batch_messages:
         if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
-            return _queue_transfer_confirmation_task(
+            return _queue_transfer_ack_task(
                 db,
                 user,
                 conversation,
                 robot,
                 sensitive_matches[0][0],
                 reason="sensitive_word",
-                word=sensitive_matches[0][1],
             )
         result = _sensitive_word_result(
             source_message.id,
             sensitive_matches[0][1],
             _sensitive_word_reply_text(robot),
         )
-        result["quote_message_id"] = _quote_platform_message_id(sensitive_matches[0][0])
         task_id = await _queue_reply_task_ordered(
             db,
             user,
@@ -1518,14 +1754,13 @@ async def _execute_bound_reply(
     if not reply_batch_messages:
         reason, word = pending_human_required or ("unsupported_message", None)
         if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
-            return _queue_transfer_confirmation_task(
+            return _queue_transfer_ack_task(
                 db,
                 user,
                 conversation,
                 robot,
                 unsupported_matches[0][0] if unsupported_matches else source_message,
                 reason=reason,
-                word=word,
             )
         _mark_human_required(conversation, reason=reason, word=word)
         notice_task_id = _queue_human_required_notice_task(
@@ -1572,14 +1807,13 @@ async def _execute_bound_reply(
     if pending_human_required is not None:
         reason, word = pending_human_required
         if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
-            return _queue_transfer_confirmation_task(
+            return _queue_transfer_ack_task(
                 db,
                 user,
                 conversation,
                 robot,
                 sensitive_matches[0][0] if sensitive_matches else unsupported_matches[0][0],
                 reason=reason,
-                word=word,
             )
         _mark_human_required(conversation, reason=reason, word=word)
         db.add(conversation)
@@ -1620,7 +1854,8 @@ async def _execute_bound_reply(
             .where(
                 Message.conversation_id == conversation.id,
                 Message.conversation_sequence <= source_message.conversation_sequence,
-                Message.message_status != "failed",
+                (Message.message_status.notin_(["failed", "cancelled", "queued", "confirmation_pending"])
+                 if conversation.platform_code in {'douyin', 'qianniu', 'pinduoduo'} else Message.message_status != 'failed'),
             )
             .order_by(desc(Message.conversation_sequence))
             # The source message is part of the query, while context_length
@@ -1635,7 +1870,7 @@ async def _execute_bound_reply(
     )
     settings = get_settings()
     ai_config = db.query(AiProviderConfig).filter(AiProviderConfig.user_id == user.id).first()
-    email_template_rows = enabled_templates(db, user)
+    email_template_rows = enabled_templates(db, user) if conversation.platform_code != "douyin" else []
     email_config = get_config(db, user)
     order_context_refresh = await _refresh_order_context_before_reply(
         db,
@@ -1643,8 +1878,11 @@ async def _execute_bound_reply(
         conversation,
         source_message,
         enabled=auto_send_allowed,
+        message_text=message,
     )
     customer_orders = order_prompt_context(db, conversation)
+    if conversation.platform_code in {"qianniu", "douyin"} and order_context_refresh.get("current_state_unverified"):
+        customer_orders = {**customer_orders, "dynamic_fields_fresh": False, "current_state_unverified": True}
     platform_context = _platform_context(history_rows)
     account_metadata = (
         conversation.platform_account.metadata_json
@@ -1659,7 +1897,16 @@ async def _execute_bound_reply(
         "success_text": email_config.success_text,
         "missing_template_text": email_config.missing_template_text,
     }
-    workflow = active_workflow(db, user, conversation, robot)
+    workflow = active_workflow(db, user, conversation, robot) if conversation.platform_code != "douyin" else None
+    workflow_result = None
+    if conversation.platform_code == "qianniu" and workflow is not None:
+        if email_unavailable(message):
+            workflow_result = email_unavailable_result(db, workflow)
+        elif not extract_email(message):
+            # A pending email collection must not capture later product questions or
+            # image/custom-order intents. A new explicit request can start a new flow.
+            cancel_email_workflow(db, workflow, status="cancelled_interrupted")
+            workflow = None
     platform_rule_scene = (
         None
         if workflow is not None or not auto_send_allowed
@@ -1680,7 +1927,9 @@ async def _execute_bound_reply(
         context_length,
         auto_send_allowed,
     )
-    if workflow is not None:
+    if workflow_result is not None:
+        result = workflow_result
+    elif workflow is not None:
         if auto_send_allowed:
             result = start_or_resume_email_workflow(
                 db,
@@ -1702,10 +1951,15 @@ async def _execute_bound_reply(
             )
     else:
         generation_started = monotonic()
+        link_candidates = reply_candidates(db, conversation, message) if (
+            conversation.platform_code == 'qianniu' and not is_product_card_only_batch
+            and not pending_human_required and source_message.sender_role == 'customer'
+            and _message_type(source_message) == 'text'
+        ) else []
         result = await _decide_reply(
             settings=settings, user=user, message=message, history=history,
             platform=conversation.platform_code,
-            shop_name=str(conversation.metadata_json.get("shop_name") or ""),
+            shop_name=conversation_shop_name(conversation),
             customer_name=conversation.customer_name or "", robot=robot,
             robot_read=robot_read, ai_config=ai_config,
             auto_send_allowed=auto_send_allowed,
@@ -1714,6 +1968,9 @@ async def _execute_bound_reply(
             customer_orders=customer_orders,
             platform_context=platform_context,
             platform_rule_scene=platform_rule_scene,
+            product_details=product_details,
+            product_card_only=is_product_card_only_batch,
+            product_link_candidates=link_candidates,
             shop_product_summary={
                 "shop_intro": str(shop_product_summary.get("shop_intro") or ""),
                 "on_sale_products": str(shop_product_summary.get("on_sale_products") or ""),
@@ -1722,11 +1979,12 @@ async def _execute_bound_reply(
         result["reply_generation_duration_ms"] = max(
             0, round((monotonic() - generation_started) * 1000)
         )
+        append_reply_links(db, conversation, result, link_candidates)
         intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
         action_plan = result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}
         if intent.get("intent") == "email_link_request" or action_plan.get("workflow") == "collect_email_for_link":
             suggested_template_id = str(intent.get("template_id") or intent.get("template_key") or "")
-            if auto_send_allowed:
+            if auto_send_allowed and conversation.platform_code != "douyin":
                 result = start_or_resume_email_workflow(
                     db,
                     user,
@@ -1748,6 +2006,7 @@ async def _execute_bound_reply(
                 )
 
     result["order_context_refresh"] = order_context_refresh
+    result["product_detail_refresh"] = detail_refresh
     if platform_rule_scene is not None:
         result["platform_rule_scene"] = platform_rule_scene
         _mark_pdd_custom_order_scene_applied(
@@ -1758,10 +2017,16 @@ async def _execute_bound_reply(
             platform_rule_scene,
             result,
         )
+    if conversation.platform_code == 'pinduoduo':
+        db.refresh(conversation)
+        from app.services.pdd_auto_transfer import reply_blocked as pdd_blocked
+        if pdd_blocked(conversation):
+            return {'decision': 'no_reply', 'text': '', 'task_ids': [], 'suppression_reason': 'pdd_transfer_or_human'}
     product_recommend_enabled, product_recommend_text = _product_recommendation_config(robot)
     qa_match = result.get("qa_match") if isinstance(result.get("qa_match"), dict) else {}
     should_recommend_products = (
         auto_send_allowed
+        and conversation.platform_code not in {"douyin", "qianniu"}
         and product_recommend_enabled
         and _wants_product_recommendation(result)
         and not bool(result.get("product_card_ack"))
@@ -1799,12 +2064,37 @@ async def _execute_bound_reply(
         reason, _ = pending_human_required
         _mark_reply_run_human_required(result, reason=reason)
 
+    result_risks = result.get("risk_flags") if isinstance(result.get("risk_flags"), list) else []
+    if "email_send_failed" in result_risks:
+        reason = "email_send_failed"
+        if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
+            transfer_result = _queue_transfer_ack_task(
+                db,
+                user,
+                conversation,
+                robot,
+                source_message,
+                reason=reason,
+            )
+            transfer_result["order_context_refresh"] = order_context_refresh
+            transfer_result["product_detail_refresh"] = detail_refresh
+            return transfer_result
+        result.update(decision="needs_human", text="", media=[])
+        _mark_human_required(conversation, reason=reason)
+        _mark_reply_run_human_required(result, reason=reason)
+        db.add(conversation)
+        db.commit()
+        return result
+
     if (
         _is_fallback_reply(result)
-        and _fallback_marks_human_required(robot)
         and _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed)
+        and (
+            conversation.platform_code in {"qianniu", "douyin", "pinduoduo"}
+            or _fallback_marks_human_required(robot)
+        )
     ):
-        transfer_result = _queue_transfer_confirmation_task(
+        transfer_result = _queue_transfer_ack_task(
             db,
             user,
             conversation,
@@ -1815,6 +2105,21 @@ async def _execute_bound_reply(
         transfer_result["order_context_refresh"] = order_context_refresh
         return transfer_result
 
+    if conversation.platform_code in {'qianniu', 'douyin', 'pinduoduo'}:
+        blocked = (qianniu_outbound_reason(str(result.get('text') or '')) if conversation.platform_code == 'qianniu'
+                   else outbound_reason(db, conversation, str(result.get('text') or '')) if conversation.platform_code == 'douyin' else None)
+        human = (result.get('action_plan') or {}).get('workflow') == 'human_review' or result.get('decision') == 'needs_human'
+        if human or blocked:
+            reason = blocked or (result.get('intent') or {}).get('reason') or 'human_handoff'
+            if _transfer_conversation_enabled(robot, conversation, auto_send_allowed=auto_send_allowed):
+                transfer_result = _queue_transfer_ack_task(db, user, conversation, robot, source_message, reason=reason)
+                if conversation.platform_code == 'douyin':
+                    return {**result, **transfer_result, 'order_context_refresh': order_context_refresh,
+                            'product_detail_refresh': detail_refresh}
+                return transfer_result
+            result.update(decision='needs_human', text='', media=[])
+            _mark_human_required(conversation, reason=reason)
+            db.commit()
     task_ids: list[str] = [*pre_reply_task_ids]
     task_id = await _queue_reply_task_ordered(
         db,
@@ -1830,6 +2135,10 @@ async def _execute_bound_reply(
     if task_id:
         task_ids.append(task_id)
         action_plan = result.get("action_plan") if isinstance(result.get("action_plan"), dict) else {}
+        if action_plan.get("next_action") == "ask_email" and result.get("workflow_id"):
+            prompt_task = db.get(RpaTask, task_id)
+            if prompt_task is not None:
+                bind_email_prompt_task(db, str(result["workflow_id"]), prompt_task)
         if action_plan.get("workflow") == "human_review":
             result_risks = result.get("risk_flags") if isinstance(result.get("risk_flags"), list) else []
             reason = "missing_email_template" if "missing_bound_email_template" in result_risks else "human_handoff"
@@ -1863,7 +2172,10 @@ async def _execute_bound_reply(
                 robot.id,
                 task_id,
             )
-    outreach = maybe_create_order_follow_up(db, conversation, robot, source_message, result)
+    outreach = (
+        maybe_create_order_follow_up(db, conversation, robot, source_message, result)
+        if conversation.platform_code != "douyin" else None
+    )
     if outreach is not None:
         db.add(outreach)
         db.commit()
@@ -1917,7 +2229,7 @@ async def run_reply(
             status_code=status.HTTP_409_CONFLICT,
             detail="Source message does not belong to the conversation",
         )
-    if source_message.sender_role != "customer":
+    if source_message.sender_role != "customer" and not is_transfer_reply_source(source_message):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Source message is not a customer message",
@@ -1932,12 +2244,27 @@ async def run_reply(
         if not source_event:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source event not found")
 
+    if conversation.platform_code == 'pinduoduo':
+        from app.services.pdd_auto_transfer import reply_blocked as pdd_blocked
+        if pdd_blocked(conversation):
+            return {'decision': 'no_reply', 'text': '', 'task_ids': [], 'suppression_reason': 'pdd_transfer_or_human'}
     robot = _active_robot(db, user, conversation)
     if not robot:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="No online robot is assigned to this platform account",
         )
+    if conversation.platform_code == 'qianniu':
+        from app.services.qianniu_transfer_service import current_operation
+        operation = current_operation(db, conversation) or {}
+        if transfer_blocked(conversation) or (conversation.human_required
+                and operation.get('source') == 'automation' and operation.get('status') in {'failed', 'unavailable'}):
+            return {'decision': 'no_reply', 'text': '', 'task_ids': [], 'suppression_reason': 'qianniu_transfer'}
+    if conversation.platform_code == "douyin":
+        reason = reply_block_reason(db, conversation, source_message, robot)
+        if reason:
+            return {"decision": "no_reply", "text": "", "task_ids": [], "suppression_reason": reason,
+                    "confidence": 1.0, "provider": "business-rule", "trace_id": f"douyin-skipped-{source_message.id}"}
     reply_run = AutomationReplyRun(
         user_id=user.id,
         conversation_id=conversation.id,
@@ -2036,6 +2363,10 @@ async def run_reply(
         if task_id:
             send_task = db.get(RpaTask, task_id)
             persisted_run.reply_message_id = send_task.message_id if send_task else None
+            if send_task and conversation.platform_code == "douyin" and result.get("human_required_marked"):
+                send_task.payload_json = {**(send_task.payload_json or {}),
+                    "automation_human_required_at": conversation.human_required_at.isoformat()
+                    if conversation.human_required_at else None}
         persisted_run.completed_at = utcnow()
         db.commit()
         reply_message = (
@@ -2188,6 +2519,8 @@ async def process_inbound_reply(
         )
         if not conversation:
             return None
+        if transfer_blocked(conversation):
+            return None
         robot = _active_robot(db, user, conversation)
         if not robot:
             return None
@@ -2195,7 +2528,7 @@ async def process_inbound_reply(
         timeout_deadline: asyncio.Event | None = None
         timeout_ordering_lock: asyncio.Lock | None = None
         timeout_enabled, timeout_seconds, timeout_text = _timeout_config(robot)
-        if _auto_send_allowed(robot, requested=True) and timeout_enabled and timeout_text:
+        if conversation.platform_code != "douyin" and _auto_send_allowed(robot, requested=True) and timeout_enabled and timeout_text:
             timeout_deadline = asyncio.Event()
             timeout_ordering_lock = asyncio.Lock()
             timeout_task = asyncio.create_task(

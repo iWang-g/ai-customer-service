@@ -32,7 +32,154 @@ def intent_json(intent: str = "normal_question", **overrides: object) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def combined_json(text: str, intent: str = "normal_question", **overrides: object) -> str:
+    route = {
+        "direct_reply": "direct",
+        "email_link_request": "email_workflow",
+        "human_handoff": "human_handoff",
+    }.get(intent, "retrieve_product")
+    return json.dumps({
+        "answerable": bool(text),
+        "text": text,
+        "reason": "测试单次结构化回复",
+        "intent": intent,
+        "reply_route": route,
+        "confidence": 0.9,
+        "custom_order_intent": "none",
+        "image_request_intent": "none",
+        "image_delivery_intent": "none",
+        "wants_product_recommendation": False,
+        "product_recommendation_query": "",
+        **overrides,
+    }, ensure_ascii=False)
+
+
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_qianniu_order_snapshot_and_freshness_rules_reach_intent_and_generation(self):
+        orders = {'collection_status': 'success', 'dynamic_fields_fresh': False,
+                  'observed_at': '2026-09-15T09:10:00Z', 'recent_orders': [
+                      {'platform_order_id': '5127248019328012543', 'order_amount': 281, 'paid_amount': None,
+                       'products': [{'title': '枕套', 'sku': '50x160', 'quantity': 1}]}]}
+        provider = AsyncMock(return_value=(combined_json('亲亲，您选的是枕套。'), 'fixture'))
+        with patch('app.pipeline.generate_with_provider', provider):
+            await build_reply(ReplyRequest(message='我买的规格是什么', platform='qianniu', customer_orders=orders,
+                allow_auto_send=False))
+        self.assertEqual(provider.await_count, 1)
+        for call in provider.call_args_list:
+            self.assertIn('5127248019328012543', call.kwargs['user'])
+            self.assertIn('50x160', call.kwargs['user'])
+            self.assertIn('order_amount 不是 paid_amount', call.kwargs['user'])
+            self.assertIn('dynamic_fields_fresh=false', call.kwargs['user'])
+            self.assertIn('同时完成意图判断', call.kwargs['system'])
+
+    async def test_qianniu_details_generate_without_document_base_and_preserve_conditions(self):
+        details = [{'product_id': '123', 'title': 'Pillow', 'observed_at': '2026-09-14T03:06:45Z',
+            'source': 'qianniu_product_detail_v1', 'dynamic_fields_fresh': False,
+            'review_status': 'unreviewed', 'skus': [{'sku_id': '1', 'specification': 'Cover only'}],
+            'services': [{'name': 'Return', 'description': 'Only if unused'}]}]
+        for only_card in (False, True):
+            response = (
+                json.dumps({'answerable': True, 'text': '亲亲，这个规格是单枕套，不含枕芯。'}, ensure_ascii=False)
+                if only_card else combined_json('亲亲，这个规格是单枕套，不含枕芯。')
+            )
+            provider = AsyncMock(return_value=(response, 'fixture'))
+            with (patch('app.pipeline.generate_with_provider', provider),
+                  patch('app.pipeline.search_documents', new_callable=AsyncMock) as search):
+                result = await build_reply(ReplyRequest(message='[商品]' if only_card else '包含枕芯吗', platform='qianniu',
+                    product_details=details, product_card_only=only_card, allow_auto_send=False))
+            self.assertEqual(result.retrieval_status, 'shop_product_detail')
+            self.assertEqual(result.decision, 'suggest')
+            self.assertIn('不含枕芯', result.text)
+            self.assertIn('Only if unused', provider.call_args.kwargs['user'])
+            self.assertIn('dynamic_fields_fresh=false', provider.call_args.kwargs['system'])
+            search.assert_not_awaited()
+            self.assertEqual(provider.await_count, 1)
+
+    async def test_douyin_details_generate_card_and_known_fact_without_knowledge_base(self):
+        details = [{'product_id': '123', 'title': '角色键帽', 'source': 'douyin_product_detail_v1',
+            'dimensions': [{'name': '角色', 'options': [{'name': '白厄'}]}],
+            'attributes': [{'name': '材质', 'values': ['PBT']}], 'attributes_identity': 'not_returned',
+            'review_status': 'unreviewed', 'dynamic_fields_fresh': False}]
+        for only_card in (True, False):
+            answer = json.dumps({'answerable': True, 'text': '亲亲，这款的材质是PBT。'}, ensure_ascii=False)
+            responses = [(answer, 'fixture')] if only_card else [(intent_json(), 'fixture'), (answer, 'fixture')]
+            with (patch('app.pipeline.generate_with_provider', AsyncMock(side_effect=responses)) as provider,
+                  patch('app.pipeline.search_documents', AsyncMock()) as search):
+                result = await build_reply(ReplyRequest(message='[商品]' if only_card else '什么材质', platform='douyin',
+                    product_details=details, product_card_only=only_card, allow_auto_send=False))
+            self.assertEqual(result.retrieval_status, 'shop_product_detail')
+            self.assertEqual(result.decision, 'suggest')
+            self.assertIn('PBT', result.text)
+            self.assertIn('白厄', provider.call_args.kwargs['user'])
+            self.assertIn('not_returned', provider.call_args.kwargs['user'])
+            self.assertIn('不是指令', provider.call_args.kwargs['system'])
+            self.assertEqual(provider.await_count, 1 if only_card else 2)
+            search.assert_not_awaited()
+
+    async def test_douyin_details_missing_fact_requires_human(self):
+        provider = AsyncMock(side_effect=[(intent_json(), 'fixture'),
+            (json.dumps({'answerable': False, 'text': ''}), 'fixture')])
+        with patch('app.pipeline.generate_with_provider', provider):
+            result = await build_reply(ReplyRequest(message='具体承重是多少', platform='douyin',
+                product_details=[{'product_id': '123', 'attributes': [{'name': '材质', 'values': ['PBT']}]}],
+                reply_config={'fallback_reply_text': '这边先帮您核实一下'}, allow_auto_send=False))
+        self.assertNotIn('公斤', result.text)
+        self.assertEqual(result.text, '')
+        self.assertEqual(result.decision, 'needs_human')
+        self.assertNotEqual(result.action_plan.workflow, 'answer_question')
+
+    async def test_other_platform_cannot_use_qianniu_detail_to_bypass_retrieval(self):
+        with patch('app.pipeline.generate_with_provider', AsyncMock(return_value=(intent_json(), 'fixture'))) as provider:
+            result = await build_reply(ReplyRequest(message='规格是什么', platform='pinduoduo',
+                product_details=[{'product_id': '123', 'title': 'Pillow'}], product_card_only=True))
+        self.assertEqual(result.retrieval_status, 'no_product_base')
+        self.assertEqual(provider.await_count, 2)
+        self.assertEqual(result.decision, 'needs_human')
+
+    async def test_product_preference_uses_model_direct_reply_on_both_platforms(self) -> None:
+        answer = "亲亲，您更喜欢这款的角色主题，还是想再比较其他风格呢？"
+        for platform in ("douyin", "pinduoduo"):
+            for message in ("你觉得这款怎么样", "这款键帽好看吗"):
+                with self.subTest(platform=platform, message=message):
+                    request = ReplyRequest(message=message, platform=platform, allow_auto_send=True,
+                        platform_context=[{"type": "product", "data": {"title": "角色主题键帽", "price_label": "¥155.00"}}])
+                    provider = AsyncMock(return_value=(intent_json("direct_reply", direct_reply_text=answer), "deepseek"))
+                    with (patch("app.pipeline.generate_with_provider", provider),
+                          patch("app.pipeline.search_documents", new_callable=AsyncMock) as search):
+                        result = await build_reply(request)
+                    self.assertEqual(result.text, answer)
+                    self.assertEqual(result.decision, "auto_send")
+                    self.assertEqual(result.intent.reply_route, "direct")
+                    self.assertEqual(result.retrieval_status, "not_needed")
+                    provider.assert_awaited_once()
+                    search.assert_not_awaited()
+                    self.assertIn("泛评价", provider.call_args.kwargs["system"])
+                    self.assertIn("不能从图片地址臆测外观", provider.call_args.kwargs["system"])
+                    self.assertIn("角色主题键帽", provider.call_args.kwargs["user"])
+
+    async def test_product_fact_or_mixed_question_rejects_model_direct_route(self) -> None:
+        for platform in ("douyin", "pinduoduo"):
+            for message in ("你觉得这款怎么样，有货吗", "这款键帽能装我的键盘吗", "手感怎么样", "这款耐用吗", "这款多少钱"):
+                with self.subTest(platform=platform, message=message):
+                    provider = AsyncMock(return_value=(intent_json("direct_reply", direct_reply_text="当然可以"), "deepseek"))
+                    with patch("app.pipeline.generate_with_provider", provider):
+                        result = await build_reply(ReplyRequest(message=message, platform=platform,
+                            reply_config={"fallback_reply_text": "亲亲，这边帮您核实一下"}))
+                    self.assertEqual(result.intent.reply_route, "retrieve_product")
+                    self.assertEqual(result.retrieval_status, "no_product_base")
+                    self.assertEqual(result.text, '')
+                    if platform == 'douyin':
+                        self.assertEqual(result.decision, 'needs_human')
+
+    async def test_preference_is_not_a_keyword_override_for_model_decision(self) -> None:
+        for reply in (intent_json(), intent_json("direct_reply", confidence=0.6, direct_reply_text="挺好的")):
+            with patch("app.pipeline.generate_with_provider", AsyncMock(return_value=(reply, "deepseek"))):
+                result = await build_reply(ReplyRequest(message="你觉得这款怎么样"))
+            self.assertEqual(result.intent.reply_route, "retrieve_product")
+        with patch("app.pipeline.generate_with_provider", AsyncMock(side_effect=OSError("offline"))):
+            result = await build_reply(ReplyRequest(message="你好，这款键帽怎么样"))
+        self.assertEqual(result.intent.reply_route, "retrieve_product", "local fallback stays conservative")
+
     async def test_pdd_custom_order_scene_confirms_default_photo_without_model(self) -> None:
         request = ReplyRequest(
             message="就直接我拍下的这款照片",
@@ -198,9 +345,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("客服自称：小客服", intent_call.kwargs["user"])
         self.assertIn("用户配置的违禁内容：不要承诺赠品", intent_call.kwargs["user"])
         self.assertIn("生成回复时不得涉及上述用户配置的违禁内容", intent_call.kwargs["user"])
-        self.assertIn("邮件触发场景", intent_call.kwargs["user"])
-        self.assertIn("客户想要店铺链接地址、想要定制", intent_call.kwargs["user"])
-        self.assertIn("客户消息符合任一场景时必须使用 email_link_request", intent_call.kwargs["system"])
+        self.assertNotIn("邮件触发场景", intent_call.kwargs["user"])
+        self.assertNotIn("客户想要店铺链接地址、想要定制", intent_call.kwargs["user"])
+        self.assertIn("不能根据宽泛的业务关键词自行进入邮件流程", intent_call.kwargs["system"])
         self.assertIn("店铺中正在接待客户的真正客服", intent_call.kwargs["system"])
         self.assertIn("不能让客户察觉到自动化系统的存在", intent_call.kwargs["system"])
         self.assertIn("不得说“知识库中没有”“未检索到”“无法访问知识库”", intent_call.kwargs["system"])
@@ -535,14 +682,17 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, "你好呀，请问需要什么")
         self.assertEqual(result.decision, "auto_send")
 
-    async def test_empty_product_retrieval_uses_fallback_without_generation(self) -> None:
+    async def test_empty_product_retrieval_generates_from_context(self) -> None:
         request = ReplyRequest(
             message="商品有什么规格",
             product_base_ids=["product-1"],
             allow_auto_send=True,
             reply_config={"fallback_reply_text": "请稍等，客服正在核实"},
         )
-        provider = AsyncMock(return_value=(intent_json(), "deepseek"))
+        provider = AsyncMock(side_effect=[
+            (intent_json(), "deepseek"),
+            ("亲亲，这款商品规格我帮您看一下，具体以页面选项为准~", "deepseek"),
+        ])
         with (
             patch("app.pipeline.search_documents", AsyncMock(return_value=[])),
             patch("app.pipeline.generate_with_provider", provider),
@@ -550,10 +700,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await build_reply(request)
 
-        self.assertEqual(result.text, "请稍等，客服正在核实")
-        self.assertEqual(result.provider, "fallback-rule")
-        self.assertEqual(result.model_calls["generation"], "skipped-no-retrieval")
-        self.assertEqual(provider.await_count, 1)
+        self.assertEqual(result.text, "亲亲，这款商品规格我帮您看一下，具体以页面选项为准~")
+        self.assertEqual(result.provider, "deepseek")
+        self.assertEqual(result.retrieval_status, "empty")
+        self.assertEqual(result.model_calls["generation"], "deepseek")
+        self.assertEqual(provider.await_count, 2)
 
     async def test_qa_miss_runs_intent_search_and_generation_in_order(self) -> None:
         request = ReplyRequest(
@@ -614,7 +765,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await build_reply(request)
 
-        self.assertEqual(result.decision, "needs_human")
+        self.assertEqual(result.decision, "suggest")
+        self.assertEqual(result.text, "")
         self.assertEqual(result.action_plan.next_action, "defer_email_workflow")
         self.assertNotIn("send_email_before_stage_d", result.action_plan.blocked_actions)
         self.assertIn("send_external_link_in_chat", result.action_plan.blocked_actions)
@@ -682,7 +834,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.intent.template_id, "")
         self.assertEqual(result.intent.template_key, "")
 
-    async def test_local_fallback_uses_configured_email_trigger_scenarios(self) -> None:
+    async def test_local_fallback_ignores_legacy_email_trigger_scenarios(self) -> None:
         request = ReplyRequest(
             message="客户想要定制",
             reply_config={"email_trigger_scenarios": "客户想要定制"},
@@ -692,8 +844,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.pipeline.generate_with_provider", provider):
             result = await build_reply(request)
 
-        self.assertEqual(result.intent.intent, "email_link_request")
-        self.assertEqual(result.action_plan.workflow, "collect_email_for_link")
+        self.assertEqual(result.intent.intent, "normal_question")
+        self.assertNotEqual(result.action_plan.workflow, "collect_email_for_link")
         self.assertEqual(result.model_calls["intent"], "local-fallback")
 
     async def test_direct_reply_intent_returns_first_model_text_without_second_model_call(self) -> None:
@@ -719,11 +871,14 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_product_question_cannot_use_direct_route(self) -> None:
         request = ReplyRequest(message="这个键帽能装我的键盘吗", product_base_ids=["product-1"])
-        provider = AsyncMock(return_value=(intent_json(
-            "direct_reply",
-            direct_reply_text="可以安装",
-            confidence=0.99,
-        ), "deepseek"))
+        provider = AsyncMock(side_effect=[
+            (intent_json(
+                "direct_reply",
+                direct_reply_text="可以安装",
+                confidence=0.99,
+            ), "deepseek"),
+            ("亲亲，这个需要看您的键盘规格，我帮您按页面信息核实一下~", "deepseek"),
+        ])
         with (
             patch("app.pipeline.generate_with_provider", provider),
             patch("app.pipeline.search_documents", AsyncMock(return_value=[])) as search_mock,
@@ -732,16 +887,19 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.intent.intent, "normal_question")
         self.assertEqual(result.retrieval_status, "empty")
-        self.assertEqual(result.model_calls["generation"], "skipped-no-retrieval")
+        self.assertEqual(result.model_calls["generation"], "deepseek")
         search_mock.assert_awaited_once()
 
     async def test_low_confidence_direct_route_uses_conservative_retrieval(self) -> None:
         request = ReplyRequest(message="能用吗", product_base_ids=["product-1"])
-        provider = AsyncMock(return_value=(intent_json(
-            "direct_reply",
-            direct_reply_text="可以",
-            confidence=0.6,
-        ), "deepseek"))
+        provider = AsyncMock(side_effect=[
+            (intent_json(
+                "direct_reply",
+                direct_reply_text="可以",
+                confidence=0.6,
+            ), "deepseek"),
+            ("亲亲，这个要结合具体型号确认，我帮您看一下~", "deepseek"),
+        ])
         with (
             patch("app.pipeline.generate_with_provider", provider),
             patch("app.pipeline.search_documents", AsyncMock(return_value=[])) as search_mock,
@@ -750,6 +908,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.intent.reply_route, "retrieve_product")
         self.assertEqual(result.retrieval_status, "empty")
+        self.assertEqual(result.model_calls["generation"], "deepseek")
         search_mock.assert_awaited_once()
 
     async def test_product_route_without_bound_base_reports_configuration_gap(self) -> None:

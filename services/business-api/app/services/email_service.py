@@ -35,9 +35,8 @@ PROVIDER_DEFAULTS = {
     "gmail": {"smtp_host": "smtp.gmail.com", "smtp_port": 587, "security": "starttls"},
     "custom": {"smtp_host": "", "smtp_port": 465, "security": "ssl"},
 }
-DEFAULT_TRIGGER_SCENARIOS = "客户索要不适合在平台聊天中直接发送的内容，例如店铺链接地址、资料地址、下载内容、联系方式或定制沟通入口。"
-DEFAULT_ASK_EMAIL_TEXT = "亲，请提供一下邮箱哦~"
-DEFAULT_EMAIL_SUCCESS_TEXT = "亲，资料已发送到您的邮箱，请注意查收哦~"
+DEFAULT_ASK_EMAIL_TEXT = "亲，请发送一下完整邮箱号哦~"
+DEFAULT_EMAIL_SUCCESS_TEXT = "亲，已发送到您的邮箱，陌生邮件可能存放垃圾邮件里，请注意查收哦~"
 DEFAULT_MISSING_TEMPLATE_TEXT = "亲，这边先为您转接人工客服进一步处理，请稍等~"
 
 
@@ -99,7 +98,7 @@ def read_config(config: EmailProviderConfig | None) -> EmailConfigRead:
             smtp_port=int(defaults["smtp_port"]),
             security=str(defaults["security"]),
             auth_code_saved=False,
-            trigger_scenarios=DEFAULT_TRIGGER_SCENARIOS,
+            trigger_scenarios="",
             ask_email_text=DEFAULT_ASK_EMAIL_TEXT,
             success_text=DEFAULT_EMAIL_SUCCESS_TEXT,
             missing_template_text=DEFAULT_MISSING_TEMPLATE_TEXT,
@@ -113,7 +112,7 @@ def read_config(config: EmailProviderConfig | None) -> EmailConfigRead:
         smtp_port=config.smtp_port,
         security=config.security,
         auth_code_saved=bool(config.auth_secret_encrypted),
-        trigger_scenarios=config.trigger_scenarios or DEFAULT_TRIGGER_SCENARIOS,
+        trigger_scenarios="",
         ask_email_text=config.ask_email_text or DEFAULT_ASK_EMAIL_TEXT,
         success_text=config.success_text or DEFAULT_EMAIL_SUCCESS_TEXT,
         missing_template_text=config.missing_template_text or DEFAULT_MISSING_TEMPLATE_TEXT,
@@ -136,7 +135,9 @@ def save_config(db: Session, user: User, request: EmailConfigUpdate) -> EmailCon
     config.smtp_host = request.smtp_host.strip()
     config.smtp_port = request.smtp_port
     config.security = request.security
-    config.trigger_scenarios = request.trigger_scenarios.strip()
+    # Retain the column for API/database compatibility, but do not allow free-form
+    # trigger text to influence email routing.
+    config.trigger_scenarios = ""
     config.ask_email_text = request.ask_email_text.strip()
     config.success_text = request.success_text.strip()
     config.missing_template_text = request.missing_template_text.strip()
