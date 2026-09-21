@@ -4,9 +4,10 @@
  */
 
 import { AnimatePresence, motion } from 'framer-motion';
-import { LayoutDashboard, LogOut, ShoppingBag } from 'lucide-react';
+import { LayoutDashboard, LayoutGrid, LogOut, ShoppingBag, Store, Music2 } from 'lucide-react';
 import { useState } from 'react';
 import customerServiceAvatar from '../../shared/assets/customer-service-avatar.svg';
+import { MOCK_PLATFORMS } from '../types';
 
 interface PlatformRailProps {
   selectedPlatform: string;
@@ -20,16 +21,23 @@ interface PlatformRailProps {
 }
 
 const platformIcons: Record<string, any> = {
+  all: LayoutGrid,
   pinduoduo: ShoppingBag,
+  qianniu: Store,
+  douyin: Music2,
 };
 
 const platformThemes: Record<string, { bg: string, text: string, shadow: string, glow: string }> = {
+  douyin: { bg: 'bg-slate-900', text: 'text-white', shadow: 'shadow-slate-900/30', glow: 'bg-cyan-500' },
+  all: { bg: 'bg-sky-600', text: 'text-white', shadow: 'shadow-sky-600/30', glow: 'bg-sky-500' },
   pinduoduo: { bg: 'bg-rose-600', text: 'text-white', shadow: 'shadow-rose-600/40', glow: 'bg-rose-500' },
+  qianniu: { bg: 'bg-sky-600', text: 'text-white', shadow: 'shadow-sky-600/30', glow: 'bg-sky-500' },
 };
 
-const railPlatforms = [
-  { id: 'pinduoduo', name: '拼多多' },
-];
+const visiblePlatformIds = ['all', 'pinduoduo', 'douyin', 'qianniu'];
+const railPlatforms = visiblePlatformIds
+  .map((id) => MOCK_PLATFORMS.find((platform) => platform.id === id))
+  .filter((platform): platform is NonNullable<typeof platform> => Boolean(platform));
 
 export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpenAdmin, onLogout, userName, userId, userRole, lang }: PlatformRailProps) {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -61,10 +69,10 @@ export default function PlatformRail({ selectedPlatform, onPlatformSelect, onOpe
               key={p.id}
               onClick={() => onPlatformSelect(p.id)}
               onContextMenu={(event) => {
-                if (p.id !== 'pinduoduo' && p.id !== 'wechat') return;
+                if (!['pinduoduo', 'wechat', 'qianniu', 'douyin'].includes(p.id)) return;
                 event.preventDefault();
                 void window.desktopBridge
-                  ?.showPlatformContextMenu({ platformCode: p.id as 'pinduoduo' | 'wechat', userId })
+                  ?.showPlatformContextMenu({ platformCode: p.id as 'pinduoduo' | 'wechat' | 'qianniu' | 'douyin', userId })
                   .catch((error) => console.error('打开平台菜单失败:', error));
               }}
               className={`group relative flex flex-col items-center gap-1.5 transition-all focus:outline-none w-full`}

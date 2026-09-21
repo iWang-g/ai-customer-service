@@ -175,7 +175,7 @@ function mapRobot(
   const accountNames = new Map(accounts.map((account) => [account.id, account.account_alias || account.account_name]));
   const knowledgeBaseNames = new Map(knowledgeBases.map((base) => [base.id, base.name]));
   const scopes = robot.platform_scopes.map((scope) => {
-    const platform = scope.platform_code;
+    const platform = ({ pinduoduo: '拼多多', qianniu: '千牛', douyin: '抖店', all: '全部平台' } as Record<string, string>)[scope.platform_code] || scope.platform_code;
     const account = scope.platform_account_id ? accountNames.get(scope.platform_account_id) : null;
     return `${platform} · ${scope.all_accounts ? '全部店铺' : account || scope.platform_account_id || '未指定店铺'}`;
   });
@@ -475,7 +475,7 @@ export function useAdminController() {
           smtp_port: config.smtp_port,
           security: config.security,
           auth_code: '',
-          trigger_scenarios: config.trigger_scenarios,
+          trigger_scenarios: '',
           ask_email_text: config.ask_email_text,
           success_text: config.success_text,
           missing_template_text: config.missing_template_text,
@@ -527,7 +527,7 @@ export function useAdminController() {
     setIsSavingEmail(true);
     setEmailNotice('');
     try {
-      const saved = await saveEmailConfig(emailConfig);
+      const saved = await saveEmailConfig({ ...emailConfig, trigger_scenarios: '' });
       setEmailAuthCodeSaved(saved.auth_code_saved);
       setEmailConfig((prev) => ({ ...prev, auth_code: '' }));
       setEmailNotice('邮件配置已保存');

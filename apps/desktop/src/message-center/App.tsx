@@ -56,6 +56,7 @@ export default function App() {
       dataError={controller.dataError}
       onSendMessage={controller.handleSendMessage}
       onSendImage={controller.handleSendImage}
+      onSyncRecentMessages={controller.handleSyncQianniuMessages}
       onListTransferCs={controller.handleListTransferCs}
       onTransferConversation={controller.handleTransferConversation}
       quickReplies={controller.quickReplies}

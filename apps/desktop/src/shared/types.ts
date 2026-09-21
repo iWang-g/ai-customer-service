@@ -10,7 +10,7 @@ export interface Message {
   sender: 'user' | 'bot' | 'agent' | 'platform';
   content: string;
   timestamp: string;
-  deliveryStatus?: 'sending' | 'sent' | 'failed';
+  deliveryStatus?: 'sending' | 'sent' | 'failed' | 'confirmation_pending' | 'cancelled';
   quote?: {
     platformMessageId?: string | null;
     sender: 'user' | 'bot' | 'agent' | 'platform';
@@ -28,6 +28,16 @@ export interface Message {
     type: 'text' | 'image' | 'product' | 'order' | 'system' | 'context' | 'time' | 'unknown';
     displayMode: 'bubble' | 'card' | 'separator' | 'notice' | 'hidden';
     data?: {
+      parts?: Array<{
+        index: number;
+        kind: 'text' | 'image' | 'product' | 'unsupported';
+        text?: string;
+        url?: string | null;
+        title?: string | null;
+        product_id?: string | null;
+        image_url?: string | null;
+        price_label?: string | null;
+      }>;
       title?: string;
       product_id?: string | null;
       price?: number | null;
@@ -52,6 +62,9 @@ export interface Message {
 }
 
 export interface Conversation {
+  pddTransfer?: { status: string; targetNick: string } | null;
+  qianniuTransfer?: { status: string; targetNick: string } | null;
+  douyinTransfer?: { status: string; targetNick: string } | null;
   id: string;
   userName: string;
   avatarUrl?: string | null;

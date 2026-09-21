@@ -339,6 +339,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [emailTestRecipient, setEmailTestRecipient] = useState('');
   const [emailTestTemplateId, setEmailTestTemplateId] = useState('');
   const [emailTemplateModalId, setEmailTemplateModalId] = useState<string | null | undefined>(undefined);
+  const [emailTemplatePlatformCode, setEmailTemplatePlatformCode] = useState('');
   const emptyEmailTemplate: EmailTemplateInput = {
     template_key: null, name: '', scene: 'email_service', aliases: [], subject: '', body: '', enabled: true, platform_account_id: null,
   };
@@ -383,21 +384,27 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   const [productRecommendText, setProductRecommendText] = useState(DEFAULT_PRODUCT_RECOMMEND_TEXT);
   const [productCardAckText, setProductCardAckText] = useState(DEFAULT_PRODUCT_CARD_ACK_TEXT);
   const [selectedToneKB, setSelectedToneKB] = useState('');
-  const platformOptions = ['拼多多'];
+  const platformOptions = ['拼多多', '千牛', '抖店'];
   const platformCodeByLabel: Record<string, string> = {
     拼多多: 'pinduoduo',
+    千牛: 'qianniu',
+    抖店: 'douyin',
+    全部平台: 'all',
   };
   const platformLabelByCode = Object.fromEntries(
     Object.entries(platformCodeByLabel).map(([label, code]) => [code, label]),
   ) as Record<string, string>;
-  const pddAccountNames = platformAccounts
-    .filter((account) => account.platform_code === 'pinduoduo' && account.is_active)
-    .map((account) => account.account_alias || account.account_name);
-  const platformShopOptions: Record<string, string[]> = {
-    拼多多: [...pddAccountNames, '全部店铺'],
+  const accountsByPlatform = (platformCode: string) => platformAccounts
+    .filter((account) => account.platform_code === platformCode && account.is_active)
+    .map((account) => ({ id: account.id, label: account.account_alias || account.account_name }));
+  const platformShopOptions: Record<string, Array<{ id: string; label: string }>> = {
+    拼多多: [...accountsByPlatform('pinduoduo'), { id: '全部店铺', label: '全部店铺' }],
+    千牛: [...accountsByPlatform('qianniu'), { id: '全部店铺', label: '全部店铺' }],
+    抖店: [...accountsByPlatform('douyin'), { id: '全部店铺', label: '全部店铺' }],
   };
   const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([]);
   const [selectedShops, setSelectedShops] = useState<Record<string, string[]>>({});
+  const [robotScopeNotice, setRobotScopeNotice] = useState('');
 
   const loadDashboard = async (startDate = dashboardStartDate, endDate = dashboardEndDate) => {
     if (!startDate || !endDate) {
@@ -562,7 +569,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         return;
       }
       const account = platformAccounts.find((item) => item.id === scope.platform_account_id);
-      if (account) shops[label] = [...(shops[label] || []), account.account_alias || account.account_name];
+      if (account) shops[label] = [...(shops[label] || []), account.id];
     });
     setSelectedPlatforms(platforms);
     setSelectedShops(shops);
@@ -620,6 +627,11 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
 
   const handleSaveRobotConfiguration = async () => {
     if (!robotName.trim()) return;
+    if (selectedPlatforms.includes('抖店') && !(selectedShops['抖店'] || []).length) {
+      setRobotScopeNotice('请为抖店勾选具体店铺或“全部店铺”后保存。');
+      return;
+    }
+    setRobotScopeNotice('');
     const existingRobotConfig = { ...(selectedRobot?.api.config_json || {}) };
     delete existingRobotConfig.fallback_transfer_to_human;
     delete existingRobotConfig.outbound_block_rules;
@@ -636,13 +648,13 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
         return;
       }
       const shops = selectedShops[label] || [];
-      if (shops.length === 0 || shops.includes('全部店铺')) {
+      if (shops.includes('全部店铺') || (shops.length === 0 && platformCode !== 'douyin')) {
         platformScopes.push({ platform_code: platformCode, platform_account_id: null, all_accounts: true });
         return;
       }
-      shops.forEach((shopName) => {
+      shops.forEach((shopId) => {
         const account = platformAccounts.find((item) =>
-          item.platform_code === platformCode && (item.account_alias === shopName || item.account_name === shopName));
+          item.platform_code === platformCode && item.id === shopId);
         if (account) platformScopes.push({ platform_code: platformCode, platform_account_id: account.id, all_accounts: false });
       });
     });
@@ -730,6 +742,10 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
   };
   const openEmailTemplateModal = (id: string | null) => {
     const template = id ? emailTemplates.find((item) => item.id === id) : null;
+    const boundAccount = template?.platform_account_id
+      ? platformAccounts.find((account) => account.id === template.platform_account_id)
+      : null;
+    setEmailTemplatePlatformCode(boundAccount?.platform_code || '');
     setEmailTemplateForm(template ? {
       template_key: template.template_key,
       name: template.name,
@@ -752,6 +768,13 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
     });
     setEmailTemplateModalId(undefined);
   };
+  const emailTemplateAccounts = platformAccounts.filter(
+    (account) => account.platform_code === emailTemplatePlatformCode && account.is_active,
+  );
+  const emailTemplatePlatformOptions = [
+    { value: 'pinduoduo', label: '拼多多' },
+    { value: 'qianniu', label: '千牛' },
+  ];
 
   const currentNav = NAV_ITEMS.find(n => n.id === activeTab || n.children?.some(c => c.id === activeTab));
   const currentSubNav = currentNav?.children?.find(c => c.id === activeTab);
@@ -1816,7 +1839,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                             <div className="bg-slate-50/50 p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
                               <div className="space-y-1">
                                 <h3 className="text-base font-bold text-slate-900">转人工处理方式</h3>
-                                <p className="text-sm text-slate-500">当机器人需要人工处理时，选择只在消息中心标记，或在客户确认后调用拼多多转移会话。</p>
+                                <p className="text-sm text-slate-500">当机器人需要人工处理时，可仅标记或转接。抖店、千牛先告知再自动转接，拼多多沿用客户确认流程。</p>
                               </div>
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                                 <button
@@ -1844,7 +1867,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                   <ArrowUpRight className="h-4 w-4 shrink-0" />
                                   <span>
                                     <span className="block text-sm font-bold">转移会话给其他客服</span>
-                                    <span className="block mt-1 text-xs text-slate-400">从拼多多实时客服列表中随机选择可接待客服。</span>
+                                    <span className="block mt-1 text-xs text-slate-400">支持拼多多、千牛和抖店，仅转给同店铺其他可接待客服。没有可接待目标时，本次不转接，新消息仍会自动处理。</span>
                                   </span>
                                 </button>
                               </div>
@@ -2036,7 +2059,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                           <div className="pt-6 border-t border-slate-100 space-y-5">
                             <div>
                               <h4 className="text-sm font-bold text-slate-700">选择平台对应店铺（可多选）</h4>
-                              <p className="text-xs text-slate-400 mt-1">每个平台可选择一个、多个或全部店铺。</p>
+                              <p className="text-xs text-slate-400 mt-1">每个平台可选择一个、多个或全部店铺。抖店需明确勾选店铺，并开启自动发送；当前支持新客户文本的 AI 文本回复。</p>
                             </div>
                             {selectedPlatforms.map((platform) => (
                               <div key={platform} className="space-y-3">
@@ -2046,17 +2069,17 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                                 </div>
                                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pl-8">
                                   {(platformShopOptions[platform] ?? []).map((shop) => (
-                                    <label key={shop} className={cn(
+                                    <label key={shop.id} className={cn(
                                       "flex items-center gap-2 px-3 py-2.5 rounded-lg border cursor-pointer transition-colors",
-                                      (selectedShops[platform] ?? []).includes(shop) ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                                      (selectedShops[platform] ?? []).includes(shop.id) ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
                                     )}>
                                       <input
                                         type="checkbox"
-                                        checked={(selectedShops[platform] ?? []).includes(shop)}
-                                        onChange={() => toggleShop(platform, shop)}
+                                        checked={(selectedShops[platform] ?? []).includes(shop.id)}
+                                        onChange={() => toggleShop(platform, shop.id)}
                                         className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
                                       />
-                                      <span className="text-sm">{shop}</span>
+                                      <span className="text-sm">{shop.label}</span>
                                     </label>
                                   ))}
                                 </div>
@@ -2066,8 +2089,9 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                         )}
 
                         {selectedPlatforms.includes('全部平台') && (
-                          <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-xl text-sm text-indigo-700">已选择全部平台，无需再配置具体店铺。</div>
+                          <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-xl text-sm text-indigo-700">全部平台规则不自动扩展到抖店；如需抖店自动回复，请选择抖店并配置店铺。</div>
                         )}
+                        {robotScopeNotice && <p role="alert" className="text-sm text-amber-700">{robotScopeNotice}</p>}
                         {selectedPlatforms.length === 0 && (
                           <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-500">请至少选择一个生效平台。</div>
                         )}
@@ -2650,9 +2674,8 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
                         <label className="space-y-2"><span className="text-sm font-bold text-slate-700">授权码 / 应用密码</span><input type="password" value={emailConfig.auth_code} onChange={(event) => updateEmailConfig('auth_code', event.target.value)} placeholder={emailAuthCodeSaved ? '已保存，留空保持不变' : '请输入 SMTP 授权码'} autoComplete="new-password" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                       </div>
                       <div className="rounded-xl bg-slate-50 p-4 space-y-4">
-                        <div><h3 className="text-sm font-bold text-slate-900">邮件触发策略</h3><p className="text-xs text-slate-500 mt-1">用于第一轮模型判断是否进入邮件服务分支，命中后由程序发送固定话术。</p></div>
+                        <div><h3 className="text-sm font-bold text-slate-900">邮件回复话术</h3></div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <label className="space-y-2 md:col-span-2"><span className="text-sm font-bold text-slate-700">需要走邮件服务的场景</span><textarea value={emailConfig.trigger_scenarios} onChange={(event) => updateEmailConfig('trigger_scenarios', event.target.value)} placeholder="例如：客户想要店铺链接地址、想要定制、索要不能在平台直接发送的资料" className="w-full h-24 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
                           <label className="space-y-2"><span className="text-sm font-bold text-slate-700">触发时回复的话术</span><textarea value={emailConfig.ask_email_text} onChange={(event) => updateEmailConfig('ask_email_text', event.target.value)} placeholder="亲，请提供一下邮箱哦" className="w-full h-20 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
                           <label className="space-y-2"><span className="text-sm font-bold text-slate-700">邮件发送后回复的话术</span><textarea value={emailConfig.success_text} onChange={(event) => updateEmailConfig('success_text', event.target.value)} placeholder="亲，资料已发送到您的邮箱，请注意查收哦~" className="w-full h-20 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
                           <label className="space-y-2 md:col-span-2"><span className="text-sm font-bold text-slate-700">未绑定模板时回复的话术</span><textarea value={emailConfig.missing_template_text} onChange={(event) => updateEmailConfig('missing_template_text', event.target.value)} placeholder="亲，这边先为您转接人工客服进一步处理，请稍等~" className="w-full h-20 rounded-xl border border-slate-200 p-3 text-sm bg-white resize-none" /></label>
@@ -2669,7 +2692,7 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
 
                     <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
                       <div className="flex items-center justify-between px-6 py-5 border-b border-slate-100"><div><h2 className="text-lg font-bold text-slate-900">邮件模板</h2><p className="text-xs text-slate-500 mt-1">每个店铺最多绑定一个邮件模板，客户提供邮箱后按店铺发送。</p></div><button onClick={() => openEmailTemplateModal(null)} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-bold"><Plus className="w-4 h-4" />新增模板</button></div>
-                      <div className="overflow-x-auto"><table className="w-full text-left"><thead><tr className="bg-slate-50 text-xs text-slate-500"><th className="px-6 py-4">模板名称</th><th className="px-6 py-4">绑定店铺</th><th className="px-6 py-4">邮件主题</th><th className="px-6 py-4">邮件正文</th><th className="px-6 py-4">状态</th><th className="px-6 py-4 text-right">操作</th></tr></thead><tbody className="divide-y divide-slate-100">{emailTemplates.map((template) => { const boundAccount = platformAccounts.find((account) => account.id === template.platform_account_id); return <tr key={template.id}><td className="px-6 py-4"><p className="text-sm font-bold text-slate-900">{template.name}</p></td><td className="px-6 py-4 text-sm text-slate-600">{boundAccount ? (boundAccount.account_alias || boundAccount.account_name) : '未绑定'}</td><td className="px-6 py-4 text-sm text-slate-600 max-w-[220px] truncate">{template.subject}</td><td className="px-6 py-4 text-sm text-slate-600 max-w-[320px] truncate">{template.body}</td><td className="px-6 py-4"><span className={cn('px-2 py-1 rounded-full text-xs font-bold', template.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500')}>{template.enabled ? '启用' : '停用'}</span></td><td className="px-6 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => openEmailTemplateModal(template.id)} className="text-indigo-500 font-bold text-xs">编辑</button><button onClick={() => requestConfirm(`确定删除“${template.name}”吗？`, () => void handleDeleteEmailTemplate(template.id))} className="text-rose-500 font-bold text-xs">删除</button></div></td></tr>; })}{emailTemplates.length === 0 && <tr><td colSpan={6} className="px-6 py-10 text-center text-sm text-slate-400">暂无邮件模板</td></tr>}</tbody></table></div>
+                      <div className="overflow-x-auto"><table className="w-full text-left"><thead><tr className="bg-slate-50 text-xs text-slate-500"><th className="px-6 py-4">模板名称</th><th className="px-6 py-4">绑定店铺</th><th className="px-6 py-4">邮件主题</th><th className="px-6 py-4">邮件正文</th><th className="px-6 py-4">状态</th><th className="px-6 py-4 text-right">操作</th></tr></thead><tbody className="divide-y divide-slate-100">{emailTemplates.map((template) => { const boundAccount = platformAccounts.find((account) => account.id === template.platform_account_id); return <tr key={template.id}><td className="px-6 py-4"><p className="text-sm font-bold text-slate-900">{template.name}</p></td><td className="px-6 py-4 text-sm text-slate-600">{boundAccount ? `${boundAccount.platform_name} · ${boundAccount.account_alias || boundAccount.account_name}` : '未绑定'}</td><td className="px-6 py-4 text-sm text-slate-600 max-w-[220px] truncate">{template.subject}</td><td className="px-6 py-4 text-sm text-slate-600 max-w-[320px] truncate">{template.body}</td><td className="px-6 py-4"><span className={cn('px-2 py-1 rounded-full text-xs font-bold', template.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500')}>{template.enabled ? '启用' : '停用'}</span></td><td className="px-6 py-4 text-right"><div className="flex justify-end gap-3"><button onClick={() => openEmailTemplateModal(template.id)} className="text-indigo-500 font-bold text-xs">编辑</button><button onClick={() => requestConfirm(`确定删除“${template.name}”吗？`, () => void handleDeleteEmailTemplate(template.id))} className="text-rose-500 font-bold text-xs">删除</button></div></td></tr>; })}{emailTemplates.length === 0 && <tr><td colSpan={6} className="px-6 py-10 text-center text-sm text-slate-400">暂无邮件模板</td></tr>}</tbody></table></div>
                     </div>
                   </>
                 )}
@@ -2912,15 +2935,16 @@ export default function AdminWorkspace({ onBack, controller }: AdminWorkspacePro
             <motion.div initial={{ opacity: 0, scale: 0.95, y: 10 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: 10 }} className="bg-white rounded-2xl shadow-xl w-full max-w-2xl overflow-hidden">
               <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100"><h3 className="text-lg font-bold text-slate-900">{emailTemplateModalId ? '编辑邮件模板' : '新增邮件模板'}</h3><button onClick={() => setEmailTemplateModalId(undefined)} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5" /></button></div>
               <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto custom-scrollbar">
+                <label className="space-y-2 block"><span className="text-sm font-bold text-slate-700">模板名称</span><input value={emailTemplateForm.name} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, name: event.target.value }))} placeholder="例如：店铺看图地址" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">模板名称</span><input value={emailTemplateForm.name} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, name: event.target.value }))} placeholder="例如：店铺看图地址" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
-                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">绑定店铺</span><AppSelect value={emailTemplateForm.platform_account_id || ''} onChange={(nextValue) => setEmailTemplateForm((prev) => ({ ...prev, platform_account_id: nextValue || null }))} searchable searchPlaceholder="搜索店铺..." options={[{ value: '', label: '未绑定店铺' }, ...platformAccounts.filter((account) => account.platform_code === 'pinduoduo' && account.is_active).map((account) => ({ value: account.id, label: account.account_alias || account.account_name }))]} /></label>
+                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">平台</span><AppSelect value={emailTemplatePlatformCode} onChange={(nextValue) => { setEmailTemplatePlatformCode(nextValue); setEmailTemplateForm((prev) => ({ ...prev, platform_account_id: null })); }} placeholder="请选择平台" options={emailTemplatePlatformOptions} /></label>
+                  <label className="space-y-2"><span className="text-sm font-bold text-slate-700">绑定店铺</span><AppSelect value={emailTemplateForm.platform_account_id || ''} onChange={(nextValue) => setEmailTemplateForm((prev) => ({ ...prev, platform_account_id: nextValue || null }))} disabled={!emailTemplatePlatformCode || emailTemplateAccounts.length === 0} searchable searchPlaceholder="搜索店铺..." placeholder={!emailTemplatePlatformCode ? '请先选择平台' : emailTemplateAccounts.length === 0 ? '该平台暂无可用店铺' : '请选择店铺'} options={emailTemplateAccounts.map((account) => ({ value: account.id, label: account.account_alias || account.account_name }))} /></label>
                 </div>
                 <label className="space-y-2 block"><span className="text-sm font-bold text-slate-700">邮件主题</span><input value={emailTemplateForm.subject} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, subject: event.target.value }))} className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm" /></label>
                 <label className="space-y-2 block"><span className="text-sm font-bold text-slate-700">邮件正文</span><textarea value={emailTemplateForm.body} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, body: event.target.value }))} className="w-full h-48 rounded-xl border border-slate-200 p-4 text-sm resize-none" /></label>
                 <label className="flex items-center gap-3 text-sm font-bold text-slate-700"><input type="checkbox" checked={emailTemplateForm.enabled} onChange={(event) => setEmailTemplateForm((prev) => ({ ...prev, enabled: event.target.checked }))} className="w-4 h-4 accent-indigo-600" />启用模板</label>
               </div>
-              <div className="flex items-center justify-end gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100"><button onClick={() => setEmailTemplateModalId(undefined)} className="px-4 py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-sm font-bold">取消</button><button onClick={() => void submitEmailTemplate()} disabled={isSavingEmail || !emailTemplateForm.name || !emailTemplateForm.subject || !emailTemplateForm.body} className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold disabled:opacity-50">{isSavingEmail ? '保存中...' : '保存模板'}</button></div>
+              <div className="flex items-center justify-end gap-3 px-6 py-4 bg-slate-50 border-t border-slate-100"><button onClick={() => setEmailTemplateModalId(undefined)} className="px-4 py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-sm font-bold">取消</button><button onClick={() => void submitEmailTemplate()} disabled={isSavingEmail || !emailTemplateForm.name || !emailTemplateForm.subject || !emailTemplateForm.body || (emailTemplateForm.enabled && (!emailTemplatePlatformCode || !emailTemplateForm.platform_account_id))} className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold disabled:opacity-50">{isSavingEmail ? '保存中...' : '保存模板'}</button></div>
             </motion.div>
           </motion.div>
         )}

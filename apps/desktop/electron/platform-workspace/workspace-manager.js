@@ -1,4 +1,5 @@
-﻿import { BrowserWindow, WebContentsView, session, shell, nativeImage } from 'electron';
+﻿import { preparePddTransfer } from './pinduoduo/auto-transfer.js';
+import { BrowserWindow, WebContentsView, session, shell, nativeImage } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -1165,11 +1166,21 @@ export class PddWorkspaceManager {
       api_status: apiResult?.status || 'failed',
       api_error: apiResult?.error || null,
       api_reason: apiResult?.reason || null,
+      response_preview: apiResult?.response_preview || null,
+      diagnostics: apiResult?.diagnostics || {},
     }, apiResult?.reason === 'conversation_key_without_uid' ? 'debug' : 'warn');
     if (apiResult?.reason === 'conversation_key_without_uid') {
       throw new Error('PDD send_message API requires customer uid');
     }
-    throw new Error(apiResult?.error || 'PDD send_message API failed');
+    const error = new Error(apiResult?.error || 'PDD send_message API failed');
+    error.resultJson = {
+      method: 'api_send_message',
+      text_sent: false,
+      send_error: apiResult?.error || null,
+      response_preview: apiResult?.response_preview || null,
+      diagnostics: apiResult?.diagnostics || {},
+    };
+    throw error;
   }
 
   async #sendMessageViaApi(account, view, externalConversationId, customerName, content, quoteMessageId = null) {
@@ -1204,6 +1215,8 @@ export class PddWorkspaceManager {
       return {
         status: result?.status || 'failed',
         error: result?.error || null,
+        diagnostics: result?.diagnostics || {},
+        response_preview: result?.response_preview || null,
         reason: 'api_result_not_sent',
       };
     } catch (error) {
@@ -1215,7 +1228,7 @@ export class PddWorkspaceManager {
     }
   }
 
-  async #transferConversationNow(account, externalConversationId, customerName, transReason, setState = () => {}, targetCsid = '') {
+  async #transferConversationNow(account, externalConversationId, customerName, transReason, setState = () => {}, targetCsid = '', autoTransfer = false) {
     if (!this.window || this.window.isDestroyed()) await this.#createWindow();
     const view = this.#ensureView(account);
     await this.#waitForViewReady(view.webContents);
@@ -1227,7 +1240,9 @@ export class PddWorkspaceManager {
       customerName,
       transReason,
       targetCsid,
+      autoTransfer,
     );
+    if (autoTransfer) return apiResult;
     if (apiResult?.status === 'transferred') {
       this.#markSessionActivity(account.id);
       return apiResult;
@@ -1244,7 +1259,7 @@ export class PddWorkspaceManager {
     throw new Error(apiResult?.error || 'PDD move_conversation API failed');
   }
 
-  async #transferConversationViaApi(account, view, externalConversationId, customerName, transReason, targetCsid = '') {
+  async #transferConversationViaApi(account, view, externalConversationId, customerName, transReason, targetCsid = '', autoTransfer = false) {
     if (!externalConversationId) {
       return { status: 'skipped', reason: 'conversation_key_without_uid' };
     }
@@ -1269,9 +1284,10 @@ export class PddWorkspaceManager {
           customerName: String(customerName || '').slice(0, 128),
           transReason: String(transReason || '无原因直接转移').slice(0, 128),
           targetCsid: String(targetCsid || '').slice(0, 128),
+          autoTransfer,
         });
       });
-      if (result?.status === 'transferred') return result;
+      if (result?.status === 'transferred' || autoTransfer) return result;
       return {
         status: result?.status || 'failed',
         error: result?.error || null,
@@ -1341,11 +1357,21 @@ export class PddWorkspaceManager {
       api_status: apiResult?.status || 'failed',
       api_error: apiResult?.error || null,
       api_reason: apiResult?.reason || null,
+      response_preview: apiResult?.response_preview || null,
+      diagnostics: apiResult?.diagnostics || {},
     }, apiResult?.reason === 'conversation_key_without_uid' ? 'debug' : 'warn');
     if (apiResult?.reason === 'conversation_key_without_uid') {
       throw new Error('PDD image send API requires customer uid. Import the conversation through latest_conversations/chat/list first.');
     }
-    throw new Error(apiResult?.error || 'PDD send_message image API failed');
+    const error = new Error(apiResult?.error || 'PDD send_message image API failed');
+    error.resultJson = {
+      method: 'api_send_image',
+      image_sent: false,
+      image_error: apiResult?.error || null,
+      response_preview: apiResult?.response_preview || null,
+      diagnostics: apiResult?.diagnostics || {},
+    };
+    throw error;
   }
 
   async #sendImageViaApi(account, view, externalConversationId, customerName, imagePayload, quoteMessageId = null) {
@@ -1388,6 +1414,8 @@ export class PddWorkspaceManager {
       return {
         status: result?.status || 'failed',
         error: result?.error || null,
+        diagnostics: result?.diagnostics || {},
+        response_preview: result?.response_preview || null,
         reason: 'api_result_not_sent',
       };
     } catch (error) {
@@ -1836,6 +1864,7 @@ export class PddWorkspaceManager {
 
   #enqueueRpaTask(task) {
     if (!task?.id) return;
+    if (task.platform_code && task.platform_code !== 'pinduoduo') return;
     const platformAccountId = task.platform_account_id || task.payload_json?.platform_account_id;
     const account = this.registry.list(this.userId).find(
       (candidate) => candidate.platformAccountId === platformAccountId
@@ -1852,7 +1881,7 @@ export class PddWorkspaceManager {
       .enqueue(
         task.task_type === 'send_message'
           ? 'send_reply_bundle'
-          : task.task_type === 'transfer_conversation' ? 'transfer_conversation'
+          : ['transfer_conversation', 'pdd_transfer_prepare'].includes(task.task_type) ? 'transfer_conversation'
           : task.task_type === 'refresh_customer_orders' ? 'collect_unread' : 'send_image',
         ({ setState, signal }) => {
         started = true;
@@ -1899,10 +1928,16 @@ export class PddWorkspaceManager {
           payload.follow_up_quote_message_id || payload.quote_message_id || null,
         );
       } catch (error) {
+        const imageFailure = error?.resultJson && typeof error.resultJson === 'object'
+          ? error.resultJson
+          : {};
         error.resultJson = {
+          ...imageFailure,
           text_sent: true,
           image_sent: false,
           image_error: error?.message || String(error),
+          image_response_preview: imageFailure.response_preview || null,
+          image_diagnostics: imageFailure.diagnostics || {},
         };
         throw error;
       }
@@ -1968,7 +2003,18 @@ export class PddWorkspaceManager {
     if (!task?.id || !this.rpaManager) return;
     const payload = task.payload_json || {};
     try {
-      if (task.task_type === 'send_message') {
+      if (['send_message', 'send_image', 'transfer_conversation', 'pdd_transfer_prepare'].includes(task.task_type)) {
+        const response = await fetch(`${this.businessApiUrl}/rpa/tasks/${encodeURIComponent(task.id)}/pdd-execution-guard`, {
+          method: 'POST', headers: { Authorization: `Bearer ${this.rpaManager.accessToken}` }, signal: AbortSignal.timeout(8000),
+        });
+        if (!response.ok || (await response.json()).allowed !== true) throw new Error('拼多多任务已失效或转接状态禁止执行');
+      }
+      if (task.task_type === 'pdd_transfer_prepare') {
+        if (!account) throw new Error('未找到拼多多店铺');
+        const roster = await this.#listTransferCsNow(account, setState);
+        const result = preparePddTransfer(roster);
+        this.rpaManager.completeTask(task.id, 'completed', result);
+      } else if (task.task_type === 'send_message') {
         const result = await this.#sendReplyBundle(task, payload, account, setState, signal);
         this.rpaManager.completeTask(
           task.id,
@@ -2005,8 +2051,11 @@ export class PddWorkspaceManager {
           payload.customer_name || '',
           payload.trans_reason || '无原因直接转移',
           setState,
+          payload.target_csid || '',
+          Boolean(payload.pdd_auto_operation_id),
         );
-        this.rpaManager.completeTask(task.id, 'completed', result);
+        this.rpaManager.completeTask(task.id, ['transferred', 'no_online_target'].includes(result?.status) ? 'completed' :
+          result?.submitted !== false ? 'confirmation_pending' : 'failed', result, result?.error || null);
       } else {
         this.rpaManager.completeTask(task.id, 'failed', {}, 'Unsupported RPA task: ' + task.task_type);
       }
@@ -3485,13 +3534,17 @@ export class PddWorkspaceManager {
             conversation_key: payload.conversation_key || null,
             customer_uid: payload.customer_uid || null,
             error: payload.error || null,
+            response_preview: payload.response_preview || null,
             diagnostics: payload.diagnostics || {},
           }, 'warn');
           pending.resolve({
             status: payload.status || 'failed',
+            submitted: payload.submitted,
             conversation_key: payload.conversation_key || null,
             customer_name: payload.customer_name || null,
             error: payload.error || null,
+            response_preview: payload.response_preview || null,
+            diagnostics: payload.diagnostics || {},
           });
           return;
         }
@@ -3505,6 +3558,8 @@ export class PddWorkspaceManager {
         });
         pending.resolve({
           status: 'transferred',
+          submitted: payload.submitted,
+          result: payload.result,
           method: 'api_move_conversation',
           conversation_key: payload.conversation_key || payload.customer_uid || null,
           customer_name: payload.customer_name || null,
@@ -3543,6 +3598,7 @@ export class PddWorkspaceManager {
         });
         pending.resolve({
           status: 'collected',
+          identity_verified: payload.identity_verified === true,
           method: 'api_get_assign_cs_list',
           cs_list: Array.isArray(payload.cs_list) ? payload.cs_list : [],
           trans_reason: Array.isArray(payload.trans_reason) ? payload.trans_reason : [],
@@ -3561,6 +3617,7 @@ export class PddWorkspaceManager {
             conversation_key: payload.conversation_key || null,
             customer_uid: payload.customer_uid || null,
             error: payload.error || null,
+            response_preview: payload.response_preview || null,
             diagnostics: payload.diagnostics || {},
           }, 'warn');
           pending.resolve({
@@ -3568,6 +3625,8 @@ export class PddWorkspaceManager {
             conversation_key: payload.conversation_key || null,
             customer_name: payload.customer_name || null,
             error: payload.error || null,
+            response_preview: payload.response_preview || null,
+            diagnostics: payload.diagnostics || {},
           });
           return;
         }

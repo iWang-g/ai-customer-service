@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import path from 'node:path';
+import { DailyLogFile } from '../../daily-log-file.js';
 
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 const REDACTED_KEY = /token|cookie|authorization|storage|secret|password/i;
@@ -22,8 +22,11 @@ export class PddDiagnosticLogger {
   constructor(directory, { maxBytes = DEFAULT_MAX_BYTES } = {}) {
     this.directory = directory;
     this.maxBytes = maxBytes;
-    this.filePath = path.join(directory, 'pinduoduo-collector.log');
-    this.rotatedFilePath = `${this.filePath}.1`;
+    this.logFile = new DailyLogFile({
+      directory,
+      baseName: 'pinduoduo-collector',
+      maxBytes,
+    });
     this.pending = Promise.resolve();
     fs.mkdirSync(directory, { recursive: true });
   }
@@ -51,20 +54,6 @@ export class PddDiagnosticLogger {
   }
 
   async #append(line) {
-    let size = 0;
-    try {
-      size = (await fs.promises.stat(this.filePath)).size;
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-    if (size + Buffer.byteLength(line) > this.maxBytes) {
-      await fs.promises.rm(this.rotatedFilePath, { force: true });
-      try {
-        await fs.promises.rename(this.filePath, this.rotatedFilePath);
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
-    }
-    await fs.promises.appendFile(this.filePath, line, 'utf8');
+    await this.logFile.append(line);
   }
 }

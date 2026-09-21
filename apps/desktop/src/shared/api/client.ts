@@ -1,3 +1,4 @@
+import type { MessageNoticeSnapshot } from '../../message-notice/types';
 const API_BASE_URL = (
   window.desktopConfig?.businessApiUrl ||
   import.meta.env.VITE_API_BASE_URL ||
@@ -115,13 +116,23 @@ export interface ApiMessage {
   sent_at: string;
 }
 
+export interface CustomerOrderProduct {
+  goods_id?: string;
+  title?: string;
+  quantity?: number | null;
+  image_url?: string;
+  sku?: string;
+  price?: number | null;
+  sub_order_id?: string;
+}
+
 export interface CustomerOrder {
   id: string;
   platform_order_id: string;
   goods_id: string;
   status: string;
   raw_status: string;
-  products_json: Array<Record<string, unknown>>;
+  products_json: CustomerOrderProduct[];
   order_amount: number | null;
   discount_amount: number | null;
   paid_amount: number | null;
@@ -140,6 +151,9 @@ export interface CustomerOrdersResponse {
   customer_key: string;
   total_count: number;
   has_more: boolean;
+  query_coverage?: string | null;
+  last_attempt_task_id?: string | null;
+  last_attempt_at?: string | null;
   orders: CustomerOrder[];
   outreach: Array<{
     strategy_type: string;
@@ -172,7 +186,7 @@ export interface CustomerProduct {
 export interface CustomerProductsResponse {
   conversation_id: string;
   status: 'collected' | 'failed';
-  method?: 'api_recommend_goods' | null;
+  method?: 'api_recommend_goods' | 'qianniu_onsale' | 'douyin_product_list' | null;
   conversation_key: string | null;
   customer_name: string | null;
   collection_status: 'not_collected' | 'success' | 'empty' | 'unavailable';
@@ -598,6 +612,7 @@ export interface RealtimeEvent {
   follow_up_message?: ApiMessage | null;
   follow_up_messages?: ApiMessage[];
   task?: {
+    platform_code?: string;
     id: string;
     conversation_id: string | null;
     message_id: string | null;
@@ -1227,10 +1242,10 @@ export function listMessages(conversationId: string): Promise<PageResponse<ApiMe
   );
 }
 
-export function sendMessage(conversationId: string, content: string): Promise<{ message: ApiMessage }> {
+export function sendMessage(conversationId: string, content: string, clientMessageId?: string): Promise<{ message: ApiMessage }> {
   return apiRequest<{ message: ApiMessage }>('/messages/send', {
     method: 'POST',
-    body: JSON.stringify({ conversation_id: conversationId, content }),
+    body: JSON.stringify({ conversation_id: conversationId, content, client_message_id: clientMessageId }),
   });
 }
 
@@ -1347,4 +1362,16 @@ export function connectRealtime(
     socket?.close();
     socket = null;
   };
+}
+
+export function listMessageNotices(since: string): Promise<MessageNoticeSnapshot> {
+  return apiRequest<MessageNoticeSnapshot>(`/conversations/message-notices?since=${encodeURIComponent(since)}`);
+}
+
+export function refreshDouyinCustomerOrders(conversationId: string): Promise<{ task_id: string }> {
+  return apiRequest(`/conversations/${encodeURIComponent(conversationId)}/orders/refresh`, { method: 'POST' });
+}
+
+export function getConversation(conversationId: string): Promise<{ conversation: ApiConversation }> {
+  return apiRequest<{ conversation: ApiConversation }>(`/conversations/${encodeURIComponent(conversationId)}`);
 }

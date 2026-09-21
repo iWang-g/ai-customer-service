@@ -16,6 +16,13 @@ import type {
 
 export type { Platform, Message, Conversation, Shop, BotStatus, DesktopWindow, LogEntry, StatusEvent };
 
+export type SendMessageMethod = 'click' | 'enter' | 'api_send_message' | 'qianniu_direct_send' | 'douyin_task';
+
+export interface SendMessageResult {
+  draftOnly: boolean;
+  sendMethod?: SendMessageMethod | null;
+}
+
 export const MOCK_SHOPS: Shop[] = [
   { id: 'all', name: '全部门店' },
   { id: 's1', name: '旗舰店 A' },
@@ -26,7 +33,7 @@ export const MOCK_SHOPS: Shop[] = [
 export const MOCK_PLATFORMS: Platform[] = [
   { id: 'all', name: '全部', icon: 'LayoutGrid' },
   { id: 'qianniu', name: '千牛', icon: 'Store' },
-  { id: 'douyin', name: '抖音', icon: 'Video' },
+  { id: 'douyin', name: '抖店', icon: 'Music2' },
   { id: 'kuaishou', name: '快手', icon: 'Play' },
   { id: 'pinduoduo', name: '拼多多', icon: 'ShoppingBag' },
   { id: 'xiaohongshu', name: '小红书', icon: 'Heart' },
@@ -55,7 +62,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     shopName: '海外代购店 B',
     lastMessage: '视频里的同款链接在哪里？',
     platform: 'douyin',
-    platformName: '抖音',
+    platformName: '抖店',
     status: 'pending',
     awaitingReply: true,
     time: '12:05',
@@ -112,7 +119,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
 
 export const MOCK_DESKTOP_WINDOWS: DesktopWindow[] = [
   { id: 'w1', title: '千牛客服工作台 - 旗舰店 A', platform: 'qianniu', shopName: '旗舰店 A', associatedConversationId: '1' },
-  { id: 'w2', title: '抖音小店商家后台 - 海外代购店 B', platform: 'douyin', shopName: '海外代购店 B', associatedConversationId: '2' },
+  { id: 'w2', title: '抖店商家后台 - 海外代购店 B', platform: 'douyin', shopName: '海外代购店 B', associatedConversationId: '2' },
   { id: 'w3', title: '拼多多商家管理后台 - 旗舰店 A', platform: 'pinduoduo', shopName: '旗舰店 A', associatedConversationId: '3' },
   { id: 'w4', title: '小红书专业号后台 - 社区团购店 C', platform: 'xiaohongshu', shopName: '社区团购店 C', associatedConversationId: '4' },
   { id: 'w5', title: '快手小店工作台 - 海外代购店 B', platform: 'kuaishou', shopName: '海外代购店 B', associatedConversationId: '5' },

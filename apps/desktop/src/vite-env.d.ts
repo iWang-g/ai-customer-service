@@ -1,5 +1,16 @@
 /// <reference types="vite/client" />
 
+interface QianniuProductSyncStatus {
+  platformAccountId: string;
+  status: 'collecting' | 'collected' | 'failed';
+  collected: number;
+  total: number | null;
+  page: number;
+  startedAt: string;
+  observed_at: string | null;
+  error: string | null;
+}
+
 interface PddWorkspaceAccount {
   id: string;
   alias: string;
@@ -18,6 +29,8 @@ interface PddWorkspaceAccount {
   runtimeStatus: 'idle' | 'queued' | 'loading' | 'ready' | 'error' | 'paused';
   collectionStatus: 'idle' | 'watching' | 'collecting' | 'login_required' | 'risk_control' | 'error' | 'paused';
   lastCollectedAt: string | null;
+  statusDetail?: string;
+  imReady?: boolean;
 }
 
 interface PddWorkspaceState {
@@ -41,7 +54,7 @@ interface PddImportCandidate {
   id: string;
   accountId: string;
   platformAccountId: string | null;
-  platformCode: 'pinduoduo' | 'wechat';
+  platformCode: 'pinduoduo' | 'wechat' | 'qianniu';
   platformName: string;
   shopName: string;
   conversationKey: string;
@@ -80,6 +93,7 @@ interface PddCustomerProductsResponse {
 }
 
 interface PddTransferCs {
+  onlineLabel?: string;
   csid: string;
   accountName: string;
   username?: string;
@@ -120,26 +134,27 @@ interface WechatAccount {
 }
 
 interface Window {
+  messageNoticeBridge?: {
+    getState(): Promise<import('./message-notice/types').MessageNoticeState>;
+    onState(listener: (state: import('./message-notice/types').MessageNoticeState) => void): () => void;
+    setCollapsed(collapsed: boolean): Promise<boolean>;
+    openConversation(conversationId: string): Promise<boolean>;
+  };
   desktopConfig?: {
     businessApiUrl: string;
     knowledgeBaseUrl: string;
     websocketUrl: string;
   };
   desktopBridge?: {
-    notifyHumanRequired(payload: {
-      items: Array<{
-        conversationId: string;
-        notificationKey: string;
-        platformName: string;
-        shopName: string;
-        customerName: string;
-      }>;
-      messageCenterVisible: boolean;
-      viewingConversationId: string | null;
+    setMessageNoticeOwner(userId: string | null): Promise<import('./message-notice/types').MessageNoticeState>;
+    publishMessageNotices(payload: {
+      sessionId: string;
+      status: 'connected' | 'connecting' | 'disconnected' | 'error';
+      items?: import('./message-notice/types').MessageNoticeItem[];
+      clockOffset?: number;
     }): Promise<boolean>;
-    clearHumanRequiredNotifications(): Promise<boolean>;
-    onOpenHumanRequiredConversation(listener: (conversationId: string | null) => void): () => void;
-    showPlatformContextMenu(payload: { platformCode: 'pinduoduo' | 'wechat'; userId: string }): Promise<boolean>;
+    onOpenNoticeConversation(listener: (conversationId: string | null, platformCode: string | null) => void): () => void;
+    showPlatformContextMenu(payload: { platformCode: 'pinduoduo' | 'wechat' | 'qianniu' | 'douyin'; userId: string }): Promise<boolean>;
     getWechatAccounts(): Promise<WechatAccount[]>;
     identifyWechatAccounts(payload: { localAccountId?: string; force?: boolean }): Promise<{
       accounts: WechatAccount[];
@@ -168,6 +183,24 @@ interface Window {
       conversation_key: string;
       customer_name: string | null;
     }>;
+    refreshQianniuCustomerOrders(payload: {
+      platformAccountId: string;
+      externalConversationId: string;
+      customerName: string;
+    }): Promise<{ status: 'collected'; conversation_key: string; observed_at: string }>;
+    syncQianniuRecentMessages(payload: {
+      platformAccountId: string;
+      externalConversationId: string;
+    }): Promise<{ count: number; currentCidBefore: string; currentCidAfter: string }>;
+    refreshQianniuStoreProducts(payload: {
+      platformAccountId: string;
+      externalConversationId: string;
+    }): Promise<{ status: 'collected'; observed_at: string }>;
+    refreshDouyinStoreProducts(payload: { platformAccountId: string }): Promise<{ status: 'collected'; observed_at: string }>;
+    probeDouyinProductDetail(payload: { platformAccountId: string; productId: string }): Promise<void>;
+    probeDouyinOrders(payload: { platformAccountId: string; externalConversationId: string; requestId: string }): Promise<void>;
+    cancelDouyinOrderProbe(payload: { requestId: string }): Promise<void>;
+    getQianniuProductSyncStatus(payload: { platformAccountId: string }): Promise<QianniuProductSyncStatus | null>;
     refreshPddCustomerProducts(payload: {
       platformAccountId: string;
       localAccountId?: string | null;
@@ -222,6 +255,30 @@ interface Window {
       pre_msg_id: string | null;
       ts: string | null;
     }>;
+    sendQianniuMessage(payload: {
+      platformAccountId: string;
+      shopUid?: string | null;
+      externalConversationId: string;
+      content: string;
+    }): Promise<{
+      status: 'sent';
+      method: 'qianniu_direct_send';
+      platform_account_id: string | null;
+      shop_uid: string;
+      conversation_key: string;
+      msg_id: string | null;
+      client_id: string | null;
+      request_id: string | null;
+      receipt_status: string | null;
+    }>;
+    listQianniuTransferTargets(payload: { conversationId: string }): Promise<{ status: 'collected'; cs_list: PddTransferCs[]; trans_reason: PddTransferReason[] }>;
+    listDouyinTransferTargets(payload: { conversationId: string }): Promise<{ status: 'collected'; cs_list: PddTransferCs[]; trans_reason: PddTransferReason[] }>;
+    transferDouyinConversation(payload: {
+      conversationId: string; targetCsid: string; reason: string;
+    }): Promise<{ status: 'transferred'; target_cs_id: string; target_cs_username: string; target_cs_nickname: string }>;
+    transferQianniuConversation(payload: {
+      conversationId: string; targetCsid: string; reason: string;
+    }): Promise<{ status: 'transferred'; target_cs_id: string; target_cs_username: string; target_cs_nickname: string }>;
     listPddTransferCs(payload: {
       platformAccountId: string;
       localAccountId?: string | null;
@@ -305,6 +362,9 @@ interface Window {
       ts: string | null;
       image_url: string | null;
     }>;
+  };
+  douyinWorkspace: Omit<Window['pddWorkspace'], 'detectAccountName'> & {
+    detectAccountName(accountId: string): Promise<{ accountName: string; source: 'douyin_currentuser' }>;
   };
   pddWorkspace: {
     getState(): Promise<PddWorkspaceState>;

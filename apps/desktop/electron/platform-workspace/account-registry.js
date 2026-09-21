@@ -30,10 +30,15 @@ function userPartitionKey(userId) {
   return createHash('sha256').update(userId).digest('hex').slice(0, 12);
 }
 
-export class PddAccountRegistry {
-  constructor(userDataPath) {
+export class WebAccountRegistry {
+  constructor(userDataPath, { platformCode, partitionPrefix }) {
+    if (!/^[a-z]+$/.test(platformCode) || !/^[a-z]+$/.test(partitionPrefix)) {
+      throw new Error('Invalid workspace platform');
+    }
+    this.platformCode = platformCode;
+    this.partitionPrefix = partitionPrefix;
     this.directory = path.join(userDataPath, 'platform-workspaces');
-    this.filePath = path.join(this.directory, 'pinduoduo-accounts.json');
+    this.filePath = path.join(this.directory, `${platformCode}-accounts.json`);
     this.data = this.#load();
   }
 
@@ -50,7 +55,7 @@ export class PddAccountRegistry {
     } catch (error) {
       const backupPath = `${this.filePath}.invalid-${Date.now()}`;
       fs.copyFileSync(this.filePath, backupPath);
-      console.error('[PDD Workspace] 账号注册表损坏，已备份并重建:', error);
+      console.error(`[${this.platformCode} Workspace] 账号注册表损坏，已备份并重建:`, error);
       return { version: REGISTRY_VERSION, accounts: [] };
     }
   }
@@ -78,7 +83,7 @@ export class PddAccountRegistry {
       id,
       userId,
       alias: normalizeAlias(alias),
-      partition: `persist:pdd-${userPartitionKey(userId)}-${id}`,
+      partition: `persist:${this.partitionPrefix}-${userPartitionKey(userId)}-${id}`,
       paused: false,
       platformAccountId: null,
       externalAccountId: null,
@@ -106,6 +111,7 @@ export class PddAccountRegistry {
     if (updates.paused !== undefined) account.paused = Boolean(updates.paused);
     if (updates.archivedAt !== undefined) account.archivedAt = updates.archivedAt;
     if (updates.lastOpenedAt !== undefined) account.lastOpenedAt = updates.lastOpenedAt;
+    if (updates.lastUrl !== undefined) account.lastUrl = updates.lastUrl;
     if (updates.platformAccountId !== undefined) account.platformAccountId = updates.platformAccountId;
     if (updates.externalAccountId !== undefined) account.externalAccountId = updates.externalAccountId;
     if (updates.platformAccountName !== undefined) account.platformAccountName = updates.platformAccountName;
@@ -133,5 +139,11 @@ export class PddAccountRegistry {
       platformAccountId,
       ...(loginStatus ? { loginStatus } : {}),
     });
+  }
+}
+
+export class PddAccountRegistry extends WebAccountRegistry {
+  constructor(userDataPath) {
+    super(userDataPath, { platformCode: 'pinduoduo', partitionPrefix: 'pdd' });
   }
 }

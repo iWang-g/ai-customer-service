@@ -607,6 +607,7 @@ function installApiShadowBridge() {
           customer_name: text(payload.customerName, 128),
           result: payload.result && typeof payload.result === 'object' ? payload.result : null,
           error: text(payload.error, 256),
+          response_preview: text(payload.responsePreview, 1000),
           diagnostics: payload.diagnostics && typeof payload.diagnostics === 'object' ? payload.diagnostics : {},
         });
         return;
@@ -614,7 +615,8 @@ function installApiShadowBridge() {
       if (payload.endpoint === 'transfer_conversation') {
         emit('api_conversation_transfer_result', {
           request_id: typeof payload.requestId === 'string' ? payload.requestId.slice(0, 128) : null,
-          status: payload.status === 'transferred' ? 'transferred' : 'failed',
+          status: ['transferred', 'no_online_target', 'confirmation_pending'].includes(payload.status) ? payload.status : 'failed',
+          submitted: payload.submitted === true,
           conversation_key: text(payload.conversationKey, 128),
           customer_uid: text(payload.customerUid, 128),
           customer_name: text(payload.customerName, 128),
@@ -633,6 +635,7 @@ function installApiShadowBridge() {
           request_id: typeof payload.requestId === 'string' ? payload.requestId.slice(0, 128) : null,
           status: payload.status === 'collected' ? 'collected' : 'failed',
           cs_list: Array.isArray(payload.csList) ? payload.csList : [],
+          identity_verified: payload.identityVerified === true,
           trans_reason: Array.isArray(payload.transReason) ? payload.transReason : [],
           error: text(payload.error, 256),
           diagnostics: payload.diagnostics && typeof payload.diagnostics === 'object' ? payload.diagnostics : {},
@@ -649,6 +652,7 @@ function installApiShadowBridge() {
           result: payload.result && typeof payload.result === 'object' ? payload.result : null,
           upload: payload.upload && typeof payload.upload === 'object' ? payload.upload : null,
           error: text(payload.error, 256),
+          response_preview: text(payload.responsePreview, 1000),
           diagnostics: payload.diagnostics && typeof payload.diagnostics === 'object' ? payload.diagnostics : {},
         });
         return;
@@ -2397,6 +2401,23 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
   const postApiClientResult = (payload) => {
     window.postMessage({ source: 'pdd-api-client-result', payload }, '*');
   };
+  const responsePreview = (value) => {
+    try {
+      return JSON.stringify(value).slice(0, 1000);
+    } catch {
+      return null;
+    }
+  };
+  const sendResponseDiagnostics = (payload) => {
+    const result = payload?.result && typeof payload.result === 'object' ? payload.result : {};
+    return {
+      response_success: payload?.success === true,
+      response_error_code: textInPage(payload?.errorCode ?? payload?.error_code, 64),
+      response_error_msg: textInPage(payload?.errorMsg || payload?.error_msg, 256),
+      result_result: textInPage(result.result, 128),
+      response_preview: responsePreview(payload),
+    };
+  };
   window.addEventListener('message', (event) => {
     if (event.source !== window || event.data?.source !== 'pdd-api-shadow-command') return;
     const command = event.data;
@@ -2851,8 +2872,12 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
               has_pre_msg_id: Boolean(result.pre_msg_id),
               has_ts: Boolean(result.ts),
               quote_msg_id_present: Boolean(quoteMessageId),
+              ...(!sent ? sendResponseDiagnostics(payload) : {}),
             },
-            error: sent ? null : 'pdd_response_not_ok',
+            responsePreview: sent ? null : responsePreview(payload),
+            error: sent
+              ? null
+              : textInPage(payload?.errorMsg || payload?.error_msg, 256) || 'pdd_response_not_ok',
           });
         } catch (error) {
           postApiClientResult({
@@ -2876,13 +2901,18 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
           const assignResponse = await window.fetch(assignRequest.url, assignRequest.init);
           if (!assignResponse.ok) throw new Error(`assign HTTP ${assignResponse.status}`);
           const assignPayload = await assignResponse.json();
+          if (assignPayload?.success !== true || !assignPayload?.result?.csList
+              || typeof assignPayload.result.csList !== 'object' || Array.isArray(assignPayload.result.csList)) {
+            throw new Error('assign_cs_list_invalid_response');
+          }
           const csList = assignPayload?.result?.csList;
           const transReason = assignPayload?.result?.transReason;
           postApiClientResult({
             endpoint: 'transfer_cs_list',
             requestId,
             status: 'collected',
-            csList: mapTransferCsListInPage(csList),
+            csList: mapTransferCsListInPage(csList).map((entry) => ({ ...entry, isCurrent: isCurrentTransferCsInPage(entry) })),
+            identityVerified: Boolean(clientState.latestIdentity?.csId || clientState.latestIdentity?.csUid || clientState.latestIdentity?.serviceUsername),
             transReason: mapTransferReasonsInPage(transReason),
             diagnostics: {
               cs_count: csList && typeof csList === 'object' ? Object.keys(csList).length : 0,
@@ -2937,13 +2967,30 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
         return;
       }
       (async () => {
+        let submitted = false;
         try {
           const assignRequest = buildAssignCsListRequest();
           const assignResponse = await window.fetch(assignRequest.url, assignRequest.init);
           if (!assignResponse.ok) throw new Error(`assign HTTP ${assignResponse.status}`);
           const assignPayload = await assignResponse.json();
+          if (assignPayload?.success !== true || !assignPayload?.result?.csList
+              || typeof assignPayload.result.csList !== 'object' || Array.isArray(assignPayload.result.csList)) {
+            throw new Error('assign_cs_list_invalid_response');
+          }
           const csList = assignPayload?.result?.csList;
           const mappedCsList = mapTransferCsListInPage(csList);
+          if (command.autoTransfer === true) {
+            if (!(clientState.latestIdentity?.csId || clientState.latestIdentity?.csUid || clientState.latestIdentity?.serviceUsername)) {
+              throw new Error('current_cs_identity_unavailable');
+            }
+            const candidates = mappedCsList.filter((entry) => !isCurrentTransferCsInPage(entry) && entry.recvUser === 1);
+            if (!candidates.length) {
+              postApiClientResult({ endpoint: 'transfer_conversation', requestId, status: 'no_online_target',
+                submitted: false, conversationKey, customerUid });
+              return;
+            }
+            if (!candidates.some((entry) => entry.csid === targetCsid)) throw new Error('target_cs_no_longer_receivable');
+          }
           const targetCs = targetCsid
             ? mappedCsList.find((entry) => entry.csid === targetCsid)
             : chooseTransferCsInPage(csList);
@@ -2954,6 +3001,7 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
             csid: targetCs.csid,
             transReason,
           });
+          submitted = true;
           const moveResponse = await window.fetch(url, init);
           if (!moveResponse.ok) throw new Error(`move HTTP ${moveResponse.status}`);
           const movePayload = await moveResponse.json();
@@ -2963,6 +3011,7 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
             endpoint: 'transfer_conversation',
             requestId,
             status: transferred ? 'transferred' : 'failed',
+            submitted,
             conversationKey,
             customerUid,
             customerName,
@@ -2988,7 +3037,8 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
           postApiClientResult({
             endpoint: 'transfer_conversation',
             requestId,
-            status: 'failed',
+            status: submitted ? 'confirmation_pending' : 'failed',
+            submitted,
             conversationKey,
             customerUid,
             customerName,
@@ -3091,8 +3141,12 @@ function installApiShadowMainWorld(apiShadowVersion = 'unknown') {
               image_height: height,
               image_size: imageSizeKb,
               quote_msg_id_present: Boolean(quoteMessageId),
+              ...(!sent ? sendResponseDiagnostics(payload) : {}),
             },
-            error: sent ? null : 'pdd_response_not_ok',
+            responsePreview: sent ? null : responsePreview(payload),
+            error: sent
+              ? null
+              : textInPage(payload?.errorMsg || payload?.error_msg, 256) || 'pdd_response_not_ok',
           });
         } catch (error) {
           clientState.internalRequestEndpoint = null;
@@ -5413,7 +5467,7 @@ function listTransferCsViaApi(requestId) {
   }, '*');
 }
 
-function transferConversationViaApi(requestId, targetKey, customerName, transReason = '无原因直接转移', targetCsid = '') {
+function transferConversationViaApi(requestId, targetKey, customerName, transReason = '无原因直接转移', targetCsid = '', autoTransfer = false) {
   const customerUid = apiCustomerUidFromConversationKey(targetKey);
   if (!customerUid) {
     emit('api_conversation_transfer_result', {
@@ -5441,6 +5495,7 @@ function transferConversationViaApi(requestId, targetKey, customerName, transRea
     customerName: customerName.slice(0, 128),
     transReason: text(transReason, 128) || '无原因直接转移',
     targetCsid: text(targetCsid, 128),
+    autoTransfer: autoTransfer === true,
   }, '*');
 }
 
@@ -6004,6 +6059,7 @@ ipcRenderer.on('pdd-adapter:command', (_event, command) => {
       command.customerName.slice(0, 128),
       typeof command.transReason === 'string' ? command.transReason.slice(0, 128) : '无原因直接转移',
       typeof command.targetCsid === 'string' ? command.targetCsid.slice(0, 128) : '',
+      command.autoTransfer === true,
     );
     return;
   }

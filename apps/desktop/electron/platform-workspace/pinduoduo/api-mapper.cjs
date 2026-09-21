@@ -1,5 +1,6 @@
 'use strict';
 
+const { pddMessageCore } = require('./message-core.cjs');
 const MAX_TEXT = 4000;
 const MAX_ID = 128;
 const PDD_CONTEXT_MESSAGE_TYPES = new Set([41]);
@@ -277,7 +278,7 @@ function mapPddMessage(message, domSequence = 0) {
   if (type === 'context') return mapSourceContextCard(message, domSequence);
   const rawContent = cleanMessageText(message.content);
   const imageUrl = type === 'image' ? cleanUrl(message.content) : null;
-  const content = type === 'image' ? '[image]' : rawContent;
+  const content = type === 'image' ? '[图片]' : type === 'unknown' ? '[非文本消息，请在原平台查看]' : rawContent;
   if (!content) return null;
   const platformMessageId = cleanId(message.msg_id);
   return {
@@ -296,6 +297,8 @@ function mapPddMessage(message, domSequence = 0) {
         : 'context',
     structured_payload: {
       ...commonStructuredPayload(message),
+      ...(type === 'unknown' ? { message_core: pddMessageCore(message), raw_info: undefined, biz_context: undefined } : {}),
+      ...(type === 'image' ? { vision_available: false } : {}),
     },
   };
 }

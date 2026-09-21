@@ -7,6 +7,7 @@ import {
   Clock,
   Cpu,
   Edit3,
+  ExternalLink,
   Image as ImageIcon,
   MessageSquareText,
   PackageSearch,
@@ -28,6 +29,13 @@ import type {
   PlatformQuickReply,
   ShopProductSummary,
 } from '../../shared/api/client';
+
+function StoreProductImage({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+  return failed
+    ? <div className="flex h-20 w-20 shrink-0 items-center justify-center border border-dashed border-slate-200 text-[10px] text-slate-400">图片暂不可用</div>
+    : <img src={src} alt="商品" className="h-20 w-20 shrink-0 border border-slate-100 object-cover" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
+}
 
 interface StatusPanelProps {
   bot: BotStatus;
@@ -68,6 +76,12 @@ function formatDuration(value: number | null): string {
   return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${value}ms`;
 }
 
+function collectionErrorMessage(error: unknown, fallback: string): string {
+  const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  const message = raw.replace(/^Error invoking remote method '[^']+':\s*/, '').replace(/^Error:\s*/, '');
+  return /[\u4e00-\u9fff]/.test(message) ? message : fallback;
+}
+
 function formatEventTime(value: string): string {
   const date = parseApiDateTime(value);
   if (Number.isNaN(date.getTime())) return '';
@@ -101,8 +115,13 @@ const orderStatusLabels: Record<string, string> = {
   unknown: '状态未知',
 };
 
-function formatOrderTime(value: string | null): string {
+function formatOrderTime(value: string | null, useLocalTime = false): string {
   if (!value) return '--';
+  if (useLocalTime) {
+    const date = parseApiDateTime(value);
+    if (Number.isNaN(date.getTime())) return '--';
+    return date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+  }
   const matched = value.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
   return matched ? `${matched[1]}/${matched[2]}/${matched[3]} ${matched[4]}:${matched[5]}` : value;
 }
@@ -241,7 +260,7 @@ export default function StatusPanel({
   onViewLogs,
   connectionStatus,
   isLoadingConversations,
-  customerOrders,
+  customerOrders: suppliedCustomerOrders,
   isLoadingCustomerOrders,
   onRefreshCustomerOrders,
   customerProducts,
@@ -269,7 +288,11 @@ export default function StatusPanel({
   const [summaryNotice, setSummaryNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [refreshError, setRefreshError] = useState('');
   const [productRefreshError, setProductRefreshError] = useState('');
+  const [productSync, setProductSync] = useState<QianniuProductSyncStatus | null>(null);
   const [sendingProductId, setSendingProductId] = useState('');
+  const [detailProbe, setDetailProbe] = useState<{ shopId: string; productId: string } | null>(null);
+  const [orderProbeId, setOrderProbeId] = useState<string | null>(null);
+  const orderProbeRef = useRef<string | null>(null);
   const [productPage, setProductPage] = useState(1);
   const [copiedOrderId, setCopiedOrderId] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
@@ -282,15 +305,49 @@ export default function StatusPanel({
     return () => document.removeEventListener('mousedown', closeMenu);
   }, [isModelMenuOpen]);
 
+  const isPinduoduoConversation = conversation?.platform === 'pinduoduo';
+  const supportsOrders = isPinduoduoConversation || conversation?.platform === 'qianniu' || conversation?.platform === 'douyin';
+  const supportsProducts = isPinduoduoConversation || conversation?.platform === 'qianniu' || conversation?.platform === 'douyin';
+  useEffect(() => {
+    setProductSync(null);
+    const accountId = conversation?.shopId;
+    if (conversation?.platform !== 'qianniu' || !accountId || !window.desktopBridge?.getQianniuProductSyncStatus) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const state = await window.desktopBridge!.getQianniuProductSyncStatus({ platformAccountId: accountId });
+        if (!stopped) setProductSync(state);
+      } catch { /* A stopped desktop worker must not hide the last saved list. */ }
+      finally { if (!stopped) timer = setTimeout(poll, 1000); }
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [conversation?.platform, conversation?.shopId]);
+  const currentProductSync = conversation?.platform === 'qianniu' && productSync?.platformAccountId === conversation.shopId ? productSync : null;
+  const productSyncing = currentProductSync?.status === 'collecting';
+  const productSyncError = currentProductSync?.status === 'failed'
+    ? collectionErrorMessage(currentProductSync.error, '商品同步失败，原有列表未更新') : '';
+  const customerOrders = suppliedCustomerOrders?.conversation_id === conversation?.id ? suppliedCustomerOrders : null;
+  const orderConversationRef = useRef(conversation?.id);
+  orderConversationRef.current = conversation?.id;
+  useEffect(() => { setRefreshError(''); setProductRefreshError(''); }, [conversation?.id]);
+  useEffect(() => {
+    setOrderProbeId(null);
+    return () => {
+      const requestId = orderProbeRef.current;
+      orderProbeRef.current = null;
+      if (requestId) void window.desktopBridge?.cancelDouyinOrderProbe?.({ requestId }).catch(() => {});
+    };
+  }, [conversation?.id]);
   const productPageSize = 10;
-  const productItems = customerProducts?.products || [];
+  const productItems = supportsProducts && customerProducts?.conversation_id === conversation?.id ? customerProducts?.products || [] : [];
   const productPageCount = Math.max(1, Math.ceil(productItems.length / productPageSize));
   const normalizedProductPage = Math.min(productPage, productPageCount);
   const visibleProducts = productItems.slice(
     (normalizedProductPage - 1) * productPageSize,
     normalizedProductPage * productPageSize,
   );
-  const isPinduoduoConversation = conversation?.platform === 'pinduoduo';
 
   useEffect(() => {
     setProductPage(1);
@@ -307,7 +364,7 @@ export default function StatusPanel({
     };
     setSummaryDraft(nextDraft);
     setSummaryNotice(null);
-    setIsSummaryOpen(!nextDraft.shop_intro && !nextDraft.on_sale_products);
+    setIsSummaryOpen(false);
   }, [conversation?.shopId, shopSummary.shop_intro, shopSummary.on_sale_products]);
 
   const connectionLabel = {
@@ -343,7 +400,7 @@ export default function StatusPanel({
         shop_intro: nextSummary.shop_intro || '',
         on_sale_products: nextSummary.on_sale_products || '',
       });
-      setSummaryNotice({ type: 'success', text: '已生成，可继续编辑后保存' });
+      setSummaryNotice({ type: 'success', text: '已生成并保存，可继续编辑' });
     } catch (error) {
       setSummaryNotice({ type: 'error', text: error instanceof Error ? error.message : '生成失败' });
     }
@@ -438,7 +495,7 @@ export default function StatusPanel({
               <textarea
                 value={summaryDraft.shop_intro}
                 onChange={(event) => setSummaryDraft((current) => ({ ...current, shop_intro: event.target.value }))}
-                placeholder="例如：主营二次元抱枕、枕套和周边定制。"
+                placeholder="例如：主营二次元主题抱枕、枕套及相关周边。"
                 className="mt-1 h-16 w-full resize-none rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-[10px] leading-[15px] text-slate-700 outline-none focus:border-sky-300 focus:bg-white"
               />
             </label>
@@ -450,7 +507,7 @@ export default function StatusPanel({
               <textarea
                 value={summaryDraft.on_sale_products}
                 onChange={(event) => setSummaryDraft((current) => ({ ...current, on_sale_products: event.target.value }))}
-                placeholder="当前店铺在售商品：商品标题一；商品标题二；..."
+                placeholder="例如：抱枕、枕套、挂画和钥匙扣，涵盖不同角色主题与规格。"
                 className="mt-1 h-28 w-full resize-none rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-[10px] leading-[15px] text-slate-700 outline-none focus:border-sky-300 focus:bg-white"
               />
             </label>
@@ -489,31 +546,51 @@ export default function StatusPanel({
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-bold text-slate-800">商品列表</h2>
-            <p className="mt-1 text-[10px] text-slate-400">来自拼多多 recommendGoods</p>
+            <p className="mt-1 text-[10px] text-slate-400">
+              {isPinduoduoConversation ? '来自拼多多 recommendGoods' : conversation?.platform === 'qianniu' ? '千牛店铺在售商品' : conversation?.platform === 'douyin' ? '抖店店铺商品' : '暂无商品列表数据'}
+            </p>
           </div>
           <button
             onClick={() => {
+              if (!supportsProducts) return;
               setProductRefreshError('');
-              void onRefreshCustomerProducts().catch((error) => setProductRefreshError(error instanceof Error ? error.message : '商品刷新失败'));
+              const targetId = conversation?.id;
+              void onRefreshCustomerProducts().catch((error) => {
+                if (orderConversationRef.current === targetId) setProductRefreshError(collectionErrorMessage(error, '商品刷新失败，原有列表未更新'));
+              });
             }}
-            disabled={isLoadingCustomerProducts}
+            disabled={!supportsProducts || isLoadingCustomerProducts || productSyncing}
             className="rounded-lg border border-slate-200 bg-white p-2 text-slate-500 hover:text-indigo-600 disabled:opacity-50"
             title="刷新商品列表"
           >
-            <RefreshCw size={15} className={isLoadingCustomerProducts ? 'animate-spin' : ''} />
+            <RefreshCw size={15} className={isLoadingCustomerProducts || productSyncing ? 'animate-spin' : ''} />
           </button>
         </div>
 
-        {productRefreshError && <div className="rounded-xl border border-rose-100 bg-rose-50 p-3 text-xs text-rose-600">{productRefreshError}</div>}
-        {isLoadingCustomerProducts && !customerProducts && <div className="py-16 text-center text-xs text-slate-400">正在读取商品列表...</div>}
-        {!isLoadingCustomerProducts && (!customerProducts || customerProducts.collection_status === 'not_collected' || customerProducts.collection_status === 'unavailable') && (
+        {!supportsProducts && (
+          <div className="rounded-2xl border border-dashed border-slate-200 bg-white py-12 text-center">
+            <PackageSearch size={28} className="mx-auto text-slate-300" />
+            <p className="mt-3 text-xs font-semibold text-slate-500">暂无商品信息</p>
+          </div>
+        )}
+        {supportsProducts && !productSyncing && (productRefreshError || productSyncError) && <div className="break-words rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs text-rose-600">{productRefreshError || productSyncError}</div>}
+        {productSyncing && <div className="space-y-2 text-xs text-sky-700" role="status" aria-live="polite">
+          <p>{currentProductSync.total === null ? '正在查询商品总数...' : `已采集 ${currentProductSync.collected} / 共 ${currentProductSync.total} 件`}</p>
+          <progress className="h-1 w-full accent-sky-500" max={Math.max(1, currentProductSync.total || 1)}
+            value={currentProductSync.total === null ? undefined : currentProductSync.collected} />
+        </div>}
+        {currentProductSync?.status === 'collected' && currentProductSync.observed_at &&
+          (!customerProducts?.observed_at || Date.parse(customerProducts.observed_at) < Date.parse(currentProductSync.observed_at)) &&
+          <p className="text-xs text-slate-500" role="status">已采集 {currentProductSync.collected} 件，等待保存确认</p>}
+        {supportsProducts && isLoadingCustomerProducts && !customerProducts && <div className="py-16 text-center text-xs text-slate-400">正在读取商品列表...</div>}
+        {supportsProducts && !isLoadingCustomerProducts && !productSyncing && !productRefreshError && !productSyncError && (!customerProducts || customerProducts.collection_status === 'not_collected' || customerProducts.collection_status === 'unavailable') && (
           <div className="rounded-2xl border border-dashed border-slate-200 bg-white py-12 text-center">
             <PackageSearch size={28} className="mx-auto text-slate-300" />
             <p className="mt-3 text-xs font-semibold text-slate-500">尚未采集商品列表</p>
             <p className="mt-1 text-[10px] text-slate-400">可点击右上角刷新</p>
           </div>
         )}
-        {customerProducts?.collection_status === 'empty' && (
+        {supportsProducts && customerProducts?.collection_status === 'empty' && (
           <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 text-center text-xs font-semibold text-slate-600">未读取到商品信息</div>
         )}
         {visibleProducts.map((product, index) => {
@@ -523,7 +600,7 @@ export default function StatusPanel({
             <article key={productKey} className="border border-slate-200 bg-white p-2.5 shadow-sm">
               <div className="flex gap-3">
                 {product.image_url ? (
-                  <img src={product.image_url} alt="商品" className="h-20 w-20 shrink-0 border border-slate-100 object-cover" referrerPolicy="no-referrer" />
+                  <StoreProductImage key={product.image_url} src={product.image_url} />
                 ) : (
                   <div className="flex h-20 w-20 shrink-0 items-center justify-center border border-dashed border-slate-200 bg-slate-50 text-slate-300">
                     <PackageSearch size={22} />
@@ -532,7 +609,35 @@ export default function StatusPanel({
                 <div className="flex min-w-0 flex-1 flex-col items-start">
                   <p className="line-clamp-2 text-[11px] font-semibold leading-5 text-slate-700">{product.title || '商品信息暂缺'}</p>
                   {product.price_label && <p className="mt-1 text-xs font-bold text-rose-500">{product.price_label}</p>}
-                  <button
+                  {['qianniu', 'douyin'].includes(conversation?.platform || '') && <p className="mt-1 break-all text-[10px] text-slate-400">商品 ID：{product.product_id}</p>}
+                  {conversation?.platform === 'douyin' && <button type="button"
+                    disabled={!!detailProbe || !product.product_id}
+                    className="mt-2 text-xs text-sky-600 disabled:text-slate-400"
+                    onClick={() => {
+                      const conversationId = conversation.id;
+                      const shopId = conversation.shopId;
+                      const productId = product.product_id;
+                      if (!productId) return;
+                      setProductRefreshError('');
+                      if (!window.desktopBridge?.probeDouyinProductDetail) {
+                        setProductRefreshError('请重启桌面端后使用商品详情探测');
+                        return;
+                      }
+                      setDetailProbe({ shopId, productId });
+                      void window.desktopBridge.probeDouyinProductDetail({ platformAccountId: shopId, productId })
+                        .catch((error) => {
+                          if (orderConversationRef.current === conversationId)
+                            setProductRefreshError(error instanceof Error ? error.message : '商品详情探测失败');
+                        })
+                        .finally(() => setDetailProbe(null));
+                    }}>
+                    {detailProbe?.shopId === conversation.shopId && detailProbe.productId === product.product_id ? '正在探测详情…' : '探测商品详情'}
+                  </button>}
+                  {conversation?.platform === 'qianniu' && product.link_url && <a href={product.link_url} target="_blank" rel="noreferrer"
+                    className="mt-2 inline-flex items-center gap-1 text-xs text-sky-600" title="查看商品">
+                    <ExternalLink size={13} />查看商品
+                  </a>}
+                  {isPinduoduoConversation && <button
                     type="button"
                     disabled={isSending || !product.product_id}
                     onClick={() => {
@@ -547,13 +652,13 @@ export default function StatusPanel({
                     <span className="block origin-center scale-75 text-[15px] font-medium">
                       {isSending ? '发送中' : '发送商品'}
                     </span>
-                  </button>
+                  </button>}
                 </div>
               </div>
             </article>
           );
         })}
-        {customerProducts?.collection_status === 'success' && productItems.length > productPageSize && (
+        {supportsProducts && customerProducts?.collection_status === 'success' && productItems.length > productPageSize && (
           <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500">
             <button
               type="button"
@@ -579,20 +684,23 @@ export default function StatusPanel({
             </button>
           </div>
         )}
-        {customerProducts?.observed_at && <p className="text-center text-[9px] text-slate-400">最近采集：{new Date(customerProducts.observed_at).toLocaleString('zh-CN')}</p>}
+        {conversation?.platform === 'douyin' && customerProducts?.has_more && <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-700">已读取前 {productItems.length} 件，平台当前筛选共 {customerProducts.total_count} 件。当前版本仅读取第一页，其余商品请在原平台查看。</p>}
+        {supportsProducts && customerProducts?.observed_at && <p className="text-center text-[9px] text-slate-400">共 {productItems.length} 件 · 最近采集：{parseApiDateTime(customerProducts.observed_at)?.toLocaleString('zh-CN')}</p>}
       </div> : activeView === 'quickReplies' ? (
         <div className="flex-1 overflow-y-auto p-5">
           <div className="mb-4 flex items-center justify-between gap-3">
             <div className="min-w-0">
               <h2 className="text-sm font-bold text-slate-800">快捷回复</h2>
-              <p className="mt-1 truncate text-[10px] text-slate-400">来自当前拼多多店铺的平台话术</p>
+              <p className="mt-1 truncate text-[10px] text-slate-400">
+                {isPinduoduoConversation ? '来自当前拼多多店铺的平台话术' : '暂无平台话术数据'}
+              </p>
             </div>
           </div>
 
           {!isPinduoduoConversation ? (
             <div className="rounded-xl border border-dashed border-slate-200 bg-white px-4 py-12 text-center">
               <MessageSquareText size={28} className="mx-auto text-slate-300" />
-              <p className="mt-3 text-xs font-semibold text-slate-500">当前平台暂不支持快捷回复</p>
+              <p className="mt-3 text-xs font-semibold text-slate-500">暂无快捷回复</p>
             </div>
           ) : (
             <>
@@ -695,14 +803,20 @@ export default function StatusPanel({
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-bold text-slate-800">客户订单信息</h2>
-            <p className="mt-1 text-[10px] text-slate-400">来自拼多多“最新订单 / 个人订单”</p>
+            <p className="mt-1 text-[10px] text-slate-400">
+              {isPinduoduoConversation ? '来自拼多多“最新订单 / 个人订单”' : conversation?.platform === 'qianniu' ? '千牛客户订单' : conversation?.platform === 'douyin' ? '抖店客户订单 · 首页最多 5 单' : ''}
+            </p>
           </div>
           <button
             onClick={() => {
+              if (!supportsOrders) return;
               setRefreshError('');
-              void onRefreshCustomerOrders().catch((error) => setRefreshError(error instanceof Error ? error.message : '订单刷新失败'));
+              const id = conversation?.id;
+              void onRefreshCustomerOrders().catch((error) => {
+                if (orderConversationRef.current === id) setRefreshError(collectionErrorMessage(error, '订单刷新失败，请稍后重试'));
+              });
             }}
-            disabled={isLoadingCustomerOrders}
+            disabled={!supportsOrders || isLoadingCustomerOrders}
             className="rounded-lg border border-slate-200 bg-white p-2 text-slate-500 hover:text-indigo-600 disabled:opacity-50"
             title="刷新客户订单"
           >
@@ -710,20 +824,52 @@ export default function StatusPanel({
           </button>
         </div>
 
-        {refreshError && <div className="rounded-xl border border-rose-100 bg-rose-50 p-3 text-xs text-rose-600">{refreshError}</div>}
-        {isLoadingCustomerOrders && !customerOrders && <div className="py-16 text-center text-xs text-slate-400">正在读取客户订单...</div>}
-        {!isLoadingCustomerOrders && (!customerOrders || customerOrders.collection_status === 'not_collected') && (
+        {conversation?.platform === 'douyin' && (
+          <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4 text-xs">
+            <p className="text-slate-600">点击右上角刷新读取订单。需要排查时，可探测并导出样本。</p>
+            <button type="button" disabled={Boolean(orderProbeId) || !conversation.externalConversationId}
+              className="rounded border border-sky-200 px-3 py-2 text-sky-700 disabled:text-slate-400"
+              onClick={() => {
+                const targetId = conversation.id;
+                const externalConversationId = conversation.externalConversationId;
+                if (!externalConversationId) return;
+                setRefreshError('');
+                if (!window.desktopBridge?.probeDouyinOrders) {
+                  setRefreshError('请重启桌面端后使用客户订单探测'); return;
+                }
+                const requestId = crypto.randomUUID();
+                orderProbeRef.current = requestId;
+                setOrderProbeId(requestId);
+                void window.desktopBridge.probeDouyinOrders({ platformAccountId: conversation.shopId, externalConversationId, requestId })
+                  .catch((error) => {
+                    if (orderConversationRef.current === targetId && orderProbeRef.current === requestId)
+                      setRefreshError(collectionErrorMessage(error, '订单探测失败'));
+                  }).finally(() => {
+                    if (orderProbeRef.current === requestId) { orderProbeRef.current = null; setOrderProbeId(null); }
+                  });
+              }}>{orderProbeId ? '正在探测客户订单…' : '探测客户订单'}</button>
+          </div>
+        )}
+        {!supportsOrders && conversation?.platform !== 'douyin' && (
+          <div className="rounded-2xl border border-dashed border-slate-200 bg-white py-12 text-center">
+            <PackageSearch size={28} className="mx-auto text-slate-300" />
+            <p className="mt-3 text-xs font-semibold text-slate-500">暂无订单信息</p>
+          </div>
+        )}
+        {supportsOrders && refreshError && <div className="rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs text-rose-600">{refreshError}</div>}
+        {supportsOrders && isLoadingCustomerOrders && !customerOrders && <div className="py-16 text-center text-xs text-slate-400">正在读取客户订单...</div>}
+        {supportsOrders && !isLoadingCustomerOrders && (!customerOrders || customerOrders.collection_status === 'not_collected') && (
           <div className="rounded-2xl border border-dashed border-slate-200 bg-white py-12 text-center">
             <PackageSearch size={28} className="mx-auto text-slate-300" />
             <p className="mt-3 text-xs font-semibold text-slate-500">尚未采集客户订单</p>
             <p className="mt-1 text-[10px] text-slate-400">可点击右上角刷新</p>
           </div>
         )}
-        {(customerOrders?.collection_status === 'empty' || customerOrders?.collection_status === 'unavailable') && (
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 text-center text-xs font-semibold text-slate-600">未读取到订单信息</div>
+        {supportsOrders && (customerOrders?.collection_status === 'empty' || customerOrders?.collection_status === 'unavailable') && (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-5 text-center text-xs font-semibold text-slate-600">{customerOrders.collection_status === 'empty' ? (conversation?.platform === 'douyin' ? '本次查询范围内无订单' : '暂无订单') : (conversation?.platform === 'douyin' && customerOrders.orders.length ? '本次读取失败，以下为上次采集的订单，请以原平台当前状态为准' : '订单暂时无法读取')}</div>
         )}
-        {customerOrders?.orders.map((order) => {
-          const product = order.products_json[0] as { title?: string; quantity?: number; image_url?: string } | undefined;
+        {supportsOrders && customerOrders?.conversation_id === conversation?.id && customerOrders?.orders.map((order) => {
+          const products = order.products_json.length ? order.products_json : [{}];
           const statusLabel = order.raw_status || orderStatusLabels[order.status] || order.status;
           return (
             <article key={order.id} className="border border-slate-200 bg-white shadow-sm">
@@ -742,14 +888,14 @@ export default function StatusPanel({
                     {copiedOrderId === order.platform_order_id ? '已复制' : '复制'}
                   </button>
                 </div>
-                <p className="text-slate-600">下单时间：{formatOrderTime(order.ordered_at)}</p>
+                <p className="text-slate-600">下单时间：{formatOrderTime(order.ordered_at, !isPinduoduoConversation)}</p>
               </div>
               {String(order.after_sale_json?.text || '').trim() && (
                 <div className="mx-3 mt-2 inline-block border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[9px] text-amber-700">
                   {String(order.after_sale_json.text)}
                 </div>
               )}
-              <div className="flex gap-3 border-b border-slate-100 p-3">
+              {products.map((product, index) => <div key={product.sub_order_id || index} className="flex gap-3 border-b border-slate-100 p-3">
                 {product?.image_url ? (
                   <img src={product.image_url} alt="商品" className="h-16 w-16 shrink-0 border border-slate-100 object-cover" referrerPolicy="no-referrer" />
                 ) : (
@@ -759,20 +905,22 @@ export default function StatusPanel({
                 )}
                 <div className="min-w-0 flex-1">
                   <p className="line-clamp-2 text-[11px] font-medium leading-5 text-slate-700">{product?.title || '商品信息暂缺'}</p>
+                  {product.sku && <p className="mt-1 break-words text-[10px] text-slate-500">{product.sku}</p>}
                   <div className="mt-2 flex items-center justify-between text-[10px]">
-                    <span className="text-slate-500">x{product?.quantity || 1}</span>
-                    <span className="font-medium text-slate-700">{formatMoney(order.order_amount ?? order.paid_amount)}</span>
+                    <span className="text-slate-500">x{product?.quantity ?? (isPinduoduoConversation ? 1 : '--')}</span>
+                    <span className="font-medium text-slate-700">{formatMoney(isPinduoduoConversation ? order.order_amount ?? order.paid_amount : product.price ?? null)}</span>
                   </div>
                 </div>
-              </div>
+              </div>)}
               <div className="space-y-1 p-3 text-[11px]">
-                <div className="flex justify-between text-slate-500"><span>店铺优惠抵扣</span><span>{formatMoney(order.discount_amount)}</span></div>
-                <div className="flex justify-between font-medium text-slate-700"><span>实付</span><span className="text-rose-500">{formatMoney(order.paid_amount)}</span></div>
+                {!isPinduoduoConversation && order.order_amount !== null && <div className="flex justify-between"><span>订单金额</span><span>{formatMoney(order.order_amount)}</span></div>}
+                {(isPinduoduoConversation || order.discount_amount !== null) && <div className="flex justify-between text-slate-500"><span>店铺优惠抵扣</span><span>{formatMoney(order.discount_amount)}</span></div>}
+                {(isPinduoduoConversation || order.paid_amount !== null) && <div className="flex justify-between font-medium text-slate-700"><span>实付</span><span className="text-rose-500">{formatMoney(order.paid_amount)}</span></div>}
               </div>
             </article>
           );
         })}
-        {customerOrders && customerOrders.outreach.length > 0 && (
+        {isPinduoduoConversation && customerOrders && customerOrders.outreach.length > 0 && (
           <section className="space-y-2">
             <h3 className="text-[10px] font-bold uppercase tracking-widest text-slate-400">主动话术状态</h3>
             {customerOrders.outreach.map((item) => (
@@ -791,7 +939,9 @@ export default function StatusPanel({
             ))}
           </section>
         )}
-        {customerOrders?.observed_at && <p className="text-center text-[9px] text-slate-400">最近采集：{new Date(customerOrders.observed_at).toLocaleString('zh-CN')}</p>}
+        {supportsOrders && customerOrders?.query_coverage === 'first_page_only_unknown_total_and_sort' && <p className="text-center text-xs text-slate-400">仅展示本次查询首页订单，全部订单请在原平台查看。金额暂未提供。</p>}
+        {supportsOrders && customerOrders?.has_more && <p className="text-center text-xs text-slate-400">当前展示部分订单</p>}
+        {supportsOrders && customerOrders?.observed_at && <p className="text-center text-[9px] text-slate-400">最近采集：{parseApiDateTime(customerOrders.observed_at).toLocaleString('zh-CN')}</p>}
       </div>}
 
       <div className="p-4 bg-white border-t border-brand-border">

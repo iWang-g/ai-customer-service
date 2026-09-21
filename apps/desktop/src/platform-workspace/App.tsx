@@ -31,6 +31,8 @@ interface WorkspaceAccount {
   runtimeStatus: RuntimeStatus;
   collectionStatus: CollectionStatus;
   lastCollectedAt: string | null;
+  statusDetail?: string;
+  imReady?: boolean;
 }
 
 function StoreLogoBadge({ logoUrl, runtimeStatus }: { logoUrl: string | null; runtimeStatus: RuntimeStatus }) {
@@ -77,7 +79,7 @@ type ModalState =
     type: 'confirm-detected-name';
     account: WorkspaceAccount;
     detectedName: string;
-    source: 'dom' | 'document_title' | 'pdd_api_latest_conversations' | 'pdd_api_custom_service_info' | 'pdd_api_userinfo_realtime' | 'pdd_api_shop_info';
+    source: 'dom' | 'document_title' | 'pdd_api_latest_conversations' | 'pdd_api_custom_service_info' | 'pdd_api_userinfo_realtime' | 'pdd_api_shop_info' | 'douyin_currentuser';
   }
   | { type: 'remove'; account: WorkspaceAccount }
   | null;
@@ -131,7 +133,9 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': /, '') : '操作失败';
 }
 
-export default function PinduoduoWorkspaceApp() {
+export default function PlatformWorkspaceApp({ platform = 'pinduoduo' }: { platform?: 'pinduoduo' | 'douyin' }) {
+  const platformName = platform === 'douyin' ? '抖店' : '拼多多';
+  const bridge = platform === 'douyin' ? window.douyinWorkspace : window.pddWorkspace;
   const [state, setState] = useState<WorkspaceState>(EMPTY_STATE);
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -143,9 +147,12 @@ export default function PinduoduoWorkspaceApp() {
     () => state.accounts.find((account) => account.id === state.activeAccountId),
     [state.accounts, state.activeAccountId],
   );
+  const activeStatus = !activeAccount ? '未选择店铺'
+    : platform === 'douyin' ? activeAccount.statusDetail
+      : activeAccount.loginStatus === 'account_mismatch' ? '登录店铺不匹配 · 已停止自动化'
+        : `${statusLabels[activeAccount.runtimeStatus]} · ${collectionLabels[activeAccount.collectionStatus]}`;
 
   useEffect(() => {
-    const bridge = window.pddWorkspace;
     if (!bridge) {
       setError('此页面需要在 AI 智能客服桌面应用中打开');
       setReady(true);
@@ -166,12 +173,12 @@ export default function PinduoduoWorkspaceApp() {
         setReady(true);
       });
     return unsubscribe;
-  }, []);
+  }, [bridge]);
 
   const overlayOpen = modal !== null;
   useEffect(() => {
-    void window.pddWorkspace?.setOverlayOpen(overlayOpen);
-  }, [overlayOpen]);
+    void bridge?.setOverlayOpen(overlayOpen);
+  }, [bridge, overlayOpen]);
 
   const perform = async (operation: () => Promise<WorkspaceState>) => {
     setBusy(true);
@@ -191,26 +198,26 @@ export default function PinduoduoWorkspaceApp() {
 
   const addAccount = () => {
     setModal(null);
-    void perform(() => window.pddWorkspace.addAccount());
+    void perform(() => bridge.addAccount());
   };
 
   const openAccountMenu = async (account: WorkspaceAccount) => {
     setError('');
     setStatusMessage('');
     try {
-      const action = await window.pddWorkspace.showAccountMenu(account.id);
+      const action = await bridge.showAccountMenu(account.id);
       if (action === 'rename') {
         setModal({ type: 'rename', account });
       } else if (action === 'reidentify') {
         setBusy(true);
         setStatusMessage('正在通过店铺信息接口识别店铺名称...');
         try {
-          const detection = await window.pddWorkspace.detectAccountName(account.id);
+          const detection = await bridge.detectAccountName(account.id);
           const detectedName = typeof detection?.accountName === 'string' ? detection.accountName.trim() : '';
           const source = detection?.source;
           setStatusMessage('');
           if (!detectedName || !source) {
-            setError('店铺名称识别未返回有效名称，请刷新拼多多客服页面后重试。');
+            setError(`店铺名称识别未返回有效名称，请刷新${platformName}客服页面后重试。`);
             return;
           }
           setModal({
@@ -223,7 +230,7 @@ export default function PinduoduoWorkspaceApp() {
           setBusy(false);
         }
       } else if (action === 'toggle_paused') {
-        void perform(() => window.pddWorkspace.setAccountPaused(account.id, !account.paused));
+        void perform(() => bridge.setAccountPaused(account.id, !account.paused));
       } else if (action === 'remove') {
         setModal({ type: 'remove', account });
       }
@@ -245,19 +252,15 @@ export default function PinduoduoWorkspaceApp() {
             <div className="flex h-9 w-9 items-center justify-center rounded-md bg-rose-600 text-white">
               <Store size={19} />
             </div>
-            <div className="hidden xl:block">
-              <div className="text-sm font-bold">拼多多工作区</div>
-              <div className="text-[11px] text-slate-500">
-                {activeAccount
-                  ? activeAccount.loginStatus === 'account_mismatch'
-                    ? '登录店铺不匹配 · 已停止自动化'
-                    : `${statusLabels[activeAccount.runtimeStatus]} · ${collectionLabels[activeAccount.collectionStatus]}`
-                  : '未选择店铺'}
+            <div className={platform === 'douyin' ? 'block max-w-56' : 'hidden xl:block'}>
+              <div className="text-sm font-bold">{platformName}工作区</div>
+              <div className="truncate text-[11px] text-slate-500" title={activeStatus}>
+                {activeStatus}
               </div>
             </div>
           </div>
 
-          <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-2" aria-label="拼多多店铺">
+          <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-2" aria-label={`${platformName}店铺`}>
             {state.accounts.map((account) => {
               const active = account.id === state.activeAccountId;
               return (
@@ -265,7 +268,7 @@ export default function PinduoduoWorkspaceApp() {
                   <button
                     type="button"
                     onClick={() => {
-                      if (!account.paused) void perform(() => window.pddWorkspace.selectAccount(account.id));
+                      if (!account.paused) void perform(() => bridge.selectAccount(account.id));
                     }}
                     className={`flex h-10 max-w-52 items-center gap-2 rounded-l-md border px-3 text-left text-sm transition-colors ${
                       active
@@ -328,28 +331,28 @@ export default function PinduoduoWorkspaceApp() {
             title={state.rpa.detail || (state.rpa.nodeId ? `节点 ${state.rpa.nodeId}` : rpaLabels[state.rpa.status])}
           >
             <Radio size={14} />
-            {rpaLabels[state.rpa.status]}
+            {platform === 'douyin' ? '消息接收已启用 · 发送请在原平台完成' : rpaLabels[state.rpa.status]}
           </div>
 
           <div className="flex shrink-0 items-center gap-1 border-l border-slate-200 pl-3">
             <ToolbarButton
               label="后退"
               disabled={!state.navigation.canGoBack || !activeAccount}
-              onClick={() => void perform(() => window.pddWorkspace.goBack())}
+              onClick={() => void perform(() => bridge.goBack())}
             >
               <ArrowLeft size={17} />
             </ToolbarButton>
             <ToolbarButton
               label="前进"
               disabled={!state.navigation.canGoForward || !activeAccount}
-              onClick={() => void perform(() => window.pddWorkspace.goForward())}
+              onClick={() => void perform(() => bridge.goForward())}
             >
               <ArrowRight size={17} />
             </ToolbarButton>
             <ToolbarButton
               label="刷新"
               disabled={!activeAccount}
-              onClick={() => void perform(() => window.pddWorkspace.reload())}
+              onClick={() => void perform(() => bridge.reload())}
             >
               <RefreshCw size={17} className={state.navigation.isLoading ? 'animate-spin' : ''} />
             </ToolbarButton>
@@ -390,7 +393,7 @@ export default function PinduoduoWorkspaceApp() {
             </div>
             <div>
               <h1 className="text-base font-bold text-slate-800">暂无运行中的店铺</h1>
-              <p className="mt-1 text-sm text-slate-500">添加或恢复一个拼多多店铺</p>
+              <p className="mt-1 text-sm text-slate-500">添加或恢复一个{platformName}店铺</p>
             </div>
             <button
               type="button"
@@ -422,7 +425,7 @@ export default function PinduoduoWorkspaceApp() {
           archivedAccounts={state.archivedAccounts}
           onClose={() => setModal(null)}
           onRestore={async (accountId) => {
-            const succeeded = await perform(() => window.pddWorkspace.restoreAccount(accountId));
+            const succeeded = await perform(() => bridge.restoreAccount(accountId));
             if (succeeded) setModal(null);
           }}
         />
@@ -434,7 +437,7 @@ export default function PinduoduoWorkspaceApp() {
           busy={busy}
           onClose={() => setModal(null)}
           onRename={async (alias) => {
-            const succeeded = await perform(() => window.pddWorkspace.renameAccount(modal.account.id, alias));
+            const succeeded = await perform(() => bridge.renameAccount(modal.account.id, alias));
             if (succeeded) setModal(null);
           }}
         />
@@ -446,7 +449,7 @@ export default function PinduoduoWorkspaceApp() {
           busy={busy}
           onClose={() => setModal(null)}
           onRemove={async (clearStorage) => {
-            const succeeded = await perform(() => window.pddWorkspace.removeAccount(modal.account.id, clearStorage));
+            const succeeded = await perform(() => bridge.removeAccount(modal.account.id, clearStorage));
             if (succeeded) setModal(null);
           }}
         />
@@ -461,7 +464,7 @@ export default function PinduoduoWorkspaceApp() {
           onClose={() => setModal(null)}
           onConfirm={async () => {
             const succeeded = await perform(() => (
-              window.pddWorkspace.renameAccount(modal.account.id, modal.detectedName)
+              bridge.renameAccount(modal.account.id, modal.detectedName)
             ));
             if (succeeded) setModal(null);
           }}
@@ -584,12 +587,12 @@ function ConfirmDetectedNameModal({
 }: {
   account: WorkspaceAccount;
   detectedName: string;
-  source: 'dom' | 'document_title' | 'pdd_api_latest_conversations' | 'pdd_api_custom_service_info' | 'pdd_api_userinfo_realtime' | 'pdd_api_shop_info';
+  source: 'dom' | 'document_title' | 'pdd_api_latest_conversations' | 'pdd_api_custom_service_info' | 'pdd_api_userinfo_realtime' | 'pdd_api_shop_info' | 'douyin_currentuser';
   busy: boolean;
   onClose: () => void;
   onConfirm: () => Promise<void>;
 }) {
-  const sourceLabel = source === 'pdd_api_custom_service_info'
+  const sourceLabel = (source === 'pdd_api_custom_service_info' || source === 'douyin_currentuser')
     ? '店铺信息接口'
     : source === 'pdd_api_userinfo_realtime'
       ? '客服实时信息接口'

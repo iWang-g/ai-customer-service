@@ -5,7 +5,7 @@ import StatusPanel from '../components/StatusPanel';
 import LogModal from '../components/LogModal';
 import ImportModal from '../components/ImportModal';
 import { useEffect, useState, type MouseEvent as ReactMouseEvent } from 'react';
-import type { Conversation, BotStatus, LogEntry, Message, Shop, StatusEvent } from '../types';
+import type { Conversation, BotStatus, LogEntry, Message, SendMessageResult, Shop, StatusEvent } from '../types';
 import type {
   ApiUser,
   CustomerProduct,
@@ -72,8 +72,9 @@ interface MessageCenterWorkspaceProps {
   selectedConversation?: Conversation;
   isLoadingMessages: boolean;
   dataError: string;
-  onSendMessage: (content: string, options?: { quote?: Message | null }) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | 'api_send_message' | null }>;
+  onSendMessage: (content: string, options?: { quote?: Message | null }) => Promise<SendMessageResult>;
   onSendImage: (imageDataUrl: string, options?: { quote?: Message | null }) => Promise<void>;
+  onSyncRecentMessages?: (conversation: Conversation) => Promise<void>;
   onListTransferCs: (conversation: Conversation) => Promise<{
     status: 'collected';
     cs_list: PddTransferCs[];
@@ -161,6 +162,7 @@ export default function MessageCenterWorkspace({
   dataError,
   onSendMessage,
   onSendImage,
+  onSyncRecentMessages,
   onListTransferCs,
   onTransferConversation,
   quickReplies,
@@ -310,6 +312,7 @@ export default function MessageCenterWorkspace({
         error={dataError}
         onSendMessage={onSendMessage}
         onSendImage={onSendImage}
+        onSyncRecentMessages={onSyncRecentMessages}
         onListTransferCs={onListTransferCs}
         onTransferConversation={onTransferConversation}
         quickReplies={quickReplies}

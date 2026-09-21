@@ -20,14 +20,23 @@ const localPackagedConfig = {
   websocketUrl: 'ws://127.0.0.1:8001',
   allowLoopback: true,
 };
+const defaultQianniuConfig = {
+  enabled: false,
+  appLogPath: 'D:\\AliWorkbenchData\\System\\log\\app.log',
+  bridgeBase: 'http://127.0.0.1:18082/qn-bridge',
+};
 
-assert.deepEqual({ ...validateRuntimeConfig(remoteConfig, { rejectLoopback: true }) }, remoteConfig);
+assert.deepEqual(
+  { ...validateRuntimeConfig(remoteConfig, { rejectLoopback: true }) },
+  { ...remoteConfig, qianniu: defaultQianniuConfig },
+);
 assert.deepEqual(
   { ...validateRuntimeConfig(localPackagedConfig, { rejectLoopback: true }) },
   {
     businessApiUrl: localPackagedConfig.businessApiUrl,
     knowledgeBaseUrl: localPackagedConfig.knowledgeBaseUrl,
     websocketUrl: localPackagedConfig.websocketUrl,
+    qianniu: defaultQianniuConfig,
   },
 );
 assert.equal(serviceProxyBypassRules(remoteConfig), '43.139.142.142');
@@ -57,7 +66,7 @@ try {
     resourcesPath: temporaryDirectory,
     environment: {},
   });
-  assert.deepEqual({ ...loaded }, remoteConfig);
+  assert.deepEqual({ ...loaded }, { ...remoteConfig, qianniu: defaultQianniuConfig });
   assert.deepEqual(rendererRuntimeArguments(loaded), [
     `--acs-business-api-url=${encodeURIComponent(remoteConfig.businessApiUrl)}`,
     `--acs-knowledge-base-url=${encodeURIComponent(remoteConfig.knowledgeBaseUrl)}`,

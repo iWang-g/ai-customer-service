@@ -21,12 +21,12 @@ if (Object.values(runtimeConfig).every(Boolean)) {
 }
 
 contextBridge.exposeInMainWorld('desktopBridge', {
-  notifyHumanRequired: (payload) => ipcRenderer.invoke('desktop:notify-human-required', payload),
-  clearHumanRequiredNotifications: () => ipcRenderer.invoke('desktop:clear-human-required-notifications'),
-  onOpenHumanRequiredConversation: (listener) => {
-    const handler = (_event, conversationId) => listener(conversationId);
-    ipcRenderer.on('desktop:open-human-required-conversation', handler);
-    return () => ipcRenderer.removeListener('desktop:open-human-required-conversation', handler);
+  setMessageNoticeOwner: (userId) => ipcRenderer.invoke('message-notice:owner', userId),
+  publishMessageNotices: (payload) => ipcRenderer.invoke('message-notice:publish', payload),
+  onOpenNoticeConversation: (listener) => {
+    const handler = (_event, conversationId, platformCode) => listener(conversationId, platformCode);
+    ipcRenderer.on('desktop:open-notice-conversation', handler);
+    return () => ipcRenderer.removeListener('desktop:open-notice-conversation', handler);
   },
   showPlatformContextMenu: (payload) => ipcRenderer.invoke('desktop:show-platform-context-menu', payload),
   startRpa: (payload) => ipcRenderer.invoke('desktop:start-rpa', payload),
@@ -40,6 +40,14 @@ contextBridge.exposeInMainWorld('desktopBridge', {
     'pdd-workspace:refresh-customer-orders',
     payload,
   ),
+  refreshQianniuCustomerOrders: (payload) => ipcRenderer.invoke('qianniu-workspace:refresh-customer-orders', payload),
+  refreshQianniuStoreProducts: (payload) => ipcRenderer.invoke('qianniu-workspace:refresh-store-products', payload),
+  refreshDouyinStoreProducts: (payload) => ipcRenderer.invoke('douyin-workspace:refresh-store-products', payload),
+  probeDouyinProductDetail: (payload) => ipcRenderer.invoke('douyin-workspace:probe-product-detail', payload),
+  probeDouyinOrders: (payload) => ipcRenderer.invoke('douyin-workspace:probe-orders', payload),
+  cancelDouyinOrderProbe: (payload) => ipcRenderer.invoke('douyin-workspace:cancel-order-probe', payload),
+  getQianniuProductSyncStatus: (payload) => ipcRenderer.invoke('qianniu-workspace:product-sync-status', payload),
+  syncQianniuRecentMessages: (payload) => ipcRenderer.invoke('qianniu-workspace:sync-recent-messages', payload),
   refreshPddCustomerProducts: (payload) => ipcRenderer.invoke(
     'pdd-workspace:refresh-customer-products',
     payload,
@@ -57,6 +65,11 @@ contextBridge.exposeInMainWorld('desktopBridge', {
     payload,
   ),
   sendPddMessage: (payload) => ipcRenderer.invoke('pdd-workspace:send-message', payload),
+  sendQianniuMessage: (payload) => ipcRenderer.invoke('qianniu-workspace:send-message', payload),
+  listQianniuTransferTargets: (payload) => ipcRenderer.invoke('qianniu-workspace:list-transfer-targets', payload),
+  listDouyinTransferTargets: (payload) => ipcRenderer.invoke('douyin-workspace:list-transfer-targets', payload),
+  transferDouyinConversation: (payload) => ipcRenderer.invoke('douyin-workspace:transfer-conversation', payload),
+  transferQianniuConversation: (payload) => ipcRenderer.invoke('qianniu-workspace:transfer-conversation', payload),
   listPddTransferCs: (payload) => ipcRenderer.invoke('pdd-workspace:list-transfer-cs', payload),
   transferPddConversation: (payload) => ipcRenderer.invoke('pdd-workspace:transfer-conversation', payload),
   sendPddProduct: (payload) => ipcRenderer.invoke('pdd-workspace:send-product', payload),
@@ -89,5 +102,26 @@ contextBridge.exposeInMainWorld('pddWorkspace', {
     const handler = (_event, state) => listener(state);
     ipcRenderer.on('pdd-workspace:state-changed', handler);
     return () => ipcRenderer.removeListener('pdd-workspace:state-changed', handler);
+  },
+});
+
+contextBridge.exposeInMainWorld('douyinWorkspace', {
+  getState: () => ipcRenderer.invoke('douyin-workspace:get-state'),
+  addAccount: () => ipcRenderer.invoke('douyin-workspace:add-account'),
+  selectAccount: (accountId) => ipcRenderer.invoke('douyin-workspace:select-account', { accountId }),
+  showAccountMenu: (accountId) => ipcRenderer.invoke('douyin-workspace:show-account-menu', { accountId }),
+  detectAccountName: (accountId) => ipcRenderer.invoke('douyin-workspace:detect-account-name', { accountId }),
+  renameAccount: (accountId, alias) => ipcRenderer.invoke('douyin-workspace:rename-account', { accountId, alias }),
+  setAccountPaused: (accountId, paused) => ipcRenderer.invoke('douyin-workspace:set-account-paused', { accountId, paused }),
+  removeAccount: (accountId, clearStorage) => ipcRenderer.invoke('douyin-workspace:remove-account', { accountId, clearStorage }),
+  restoreAccount: (accountId) => ipcRenderer.invoke('douyin-workspace:restore-account', { accountId }),
+  setOverlayOpen: (open) => ipcRenderer.invoke('douyin-workspace:set-overlay-open', { open }),
+  goBack: () => ipcRenderer.invoke('douyin-workspace:go-back'),
+  goForward: () => ipcRenderer.invoke('douyin-workspace:go-forward'),
+  reload: () => ipcRenderer.invoke('douyin-workspace:reload'),
+  onStateChanged: (listener) => {
+    const handler = (_event, state) => listener(state);
+    ipcRenderer.on('douyin-workspace:state-changed', handler);
+    return () => ipcRenderer.removeListener('douyin-workspace:state-changed', handler);
   },
 });

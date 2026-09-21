@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { DailyLogFile } from '../daily-log-file.js';
 
 function userDirectoryKey(userId) {
   return createHash('sha256').update(userId).digest('hex').slice(0, 16);
@@ -33,6 +34,13 @@ export class RpaProcessManager extends EventEmitter {
     this.apiBaseUrl = apiBaseUrl.replace(/\/$/, '');
     this.appVersion = appVersion;
     this.logPath = logPath;
+    this.logFile = logPath
+      ? new DailyLogFile({
+        directory: path.dirname(logPath),
+        baseName: path.basename(logPath, path.extname(logPath) || '.log'),
+        extension: path.extname(logPath) || '.log',
+      })
+      : null;
     this.process = null;
     this.secret = null;
     this.userId = null;
@@ -41,6 +49,7 @@ export class RpaProcessManager extends EventEmitter {
     this.accountsByPlatform = new Map();
     this.pendingEvents = new Map();
     this.pendingConversationClears = new Map();
+    this.pendingQianniuSendGuards = new Map();
     this.buffer = '';
     this.stopping = false;
     this.restartTimer = null;
@@ -152,6 +161,11 @@ export class RpaProcessManager extends EventEmitter {
       pending.reject(new Error('RPA process stopped before conversation events were cleared'));
     }
     this.pendingConversationClears.clear();
+    for (const pending of this.pendingQianniuSendGuards.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('RPA process stopped before the Qianniu send guard completed'));
+    }
+    this.pendingQianniuSendGuards.clear();
     this.#setState({ status: 'stopped', nodeId: null, detail: null, lastHeartbeatAt: null });
   }
 
@@ -189,6 +203,11 @@ export class RpaProcessManager extends EventEmitter {
     });
     child.on('exit', (code) => {
       if (this.process === child) this.process = null;
+      for (const pending of this.pendingQianniuSendGuards.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error(`RPA process exited before the Qianniu send guard completed (${code ?? 'unknown'})`));
+      }
+      this.pendingQianniuSendGuards.clear();
       if (this.stopping) return;
       this.#writeLog('process_exited', { code: code ?? null });
       this.#setState({ status: 'offline', detail: `RPA 进程已退出 (${code ?? 'unknown'})` });
@@ -278,6 +297,15 @@ export class RpaProcessManager extends EventEmitter {
       clearTimeout(pending.timer);
       this.pendingConversationClears.delete(message.request_id);
       pending.resolve(Number(message.deleted_count) || 0);
+      return;
+    }
+    if (message.type === 'qianniu_send_guard_result') {
+      const pending = this.pendingQianniuSendGuards.get(message.request_id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pendingQianniuSendGuards.delete(message.request_id);
+      if (message.error) pending.reject(new Error(String(message.error).slice(0, 500)));
+      else pending.resolve(message.result || {});
     }
   }
 
@@ -322,6 +350,35 @@ export class RpaProcessManager extends EventEmitter {
     });
   }
 
+  checkQianniuSendGuard({ taskId, platformAccountId, cid }) {
+    if (!taskId || !platformAccountId || !cid) {
+      return Promise.reject(new Error('Qianniu send guard parameters are incomplete'));
+    }
+    if (!this.process || this.process.killed || !this.secret) {
+      return Promise.reject(new Error('RPA process is not available'));
+    }
+    const requestId = randomBytes(16).toString('hex');
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingQianniuSendGuards.delete(requestId);
+        reject(new Error('Timed out checking the Qianniu send guard'));
+      }, 15000);
+      this.pendingQianniuSendGuards.set(requestId, { resolve, reject, timer });
+      const sent = this.#send({
+        type: 'qianniu_send_guard',
+        request_id: requestId,
+        task_id: taskId,
+        platform_account_id: platformAccountId,
+        cid,
+      });
+      if (!sent) {
+        clearTimeout(timer);
+        this.pendingQianniuSendGuards.delete(requestId);
+        reject(new Error('Failed to request the Qianniu send guard'));
+      }
+    });
+  }
+
   #send(payload) {
     if (!this.process || this.process.killed || !this.secret) return false;
     try {
@@ -343,14 +400,13 @@ export class RpaProcessManager extends EventEmitter {
   }
 
   #writeLog(stage, details = {}) {
-    if (!this.logPath) return;
+    if (!this.logFile) return;
     try {
-      fs.mkdirSync(path.dirname(this.logPath), { recursive: true });
-      fs.appendFileSync(this.logPath, `${JSON.stringify({
+      this.logFile.appendSync(`${JSON.stringify({
         timestamp: new Date().toISOString(),
         stage,
         details,
-      })}\n`, 'utf8');
+      })}\n`);
     } catch {
       // RPA lifecycle must not depend on diagnostic logging.
     }

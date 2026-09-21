@@ -1,3 +1,4 @@
+import { useMessageNotices } from '../../message-notice/useMessageNotices';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   clearStoredSession,
@@ -11,12 +12,14 @@ import {
   getQaImageUrl,
   getConversationMessageSyncIssue,
   getCurrentUser,
+  getConversation,
   getCustomerOrders,
+  refreshDouyinCustomerOrders,
   getCustomerProducts,
   getMonitoringOverview,
   getStoredSession,
   isAuthenticationError,
-  listConversations,
+  listConversations as listConversationPage,
   listPlatformAccounts,
   listMessages,
   listMonitoringEvents,
@@ -47,7 +50,8 @@ import {
   type ShopProductSummary,
 } from '../../shared/api/client';
 import { MOCK_PLATFORMS } from '../types';
-import type { BotStatus, Conversation, LogEntry, Message, Shop, StatusEvent } from '../types';
+import { deliveryStatus, clearAwaitingAfterGeneratedReply } from './message-delivery';
+import type { BotStatus, Conversation, LogEntry, Message, SendMessageResult, Shop, StatusEvent } from '../types';
 
 type AuthMode = 'login';
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
@@ -147,6 +151,7 @@ function isPlatformSystemMessage(message: ApiMessage): boolean {
 }
 
 function mapMessage(message: ApiMessage): Message {
+  const resolveImageUrl = message.platform_code === 'douyin' ? (url: string) => url : getQaImageUrl;
   const platformSystemMessage = isPlatformSystemMessage(message);
   const sender = platformSystemMessage ? 'platform' : senderFromRole(message.sender_role);
   const mediaType = typeof message.raw_payload.media_type === 'string'
@@ -192,12 +197,8 @@ function mapMessage(message: ApiMessage): Message {
     platformMessageId: message.platform_message_id,
     sender,
     content: message.content,
-    timestamp: message.time_label || formatTime(message.collected_at),
-    deliveryStatus: message.message_status === 'queued'
-      ? 'sending'
-      : message.message_status === 'failed'
-        ? 'failed'
-        : 'sent',
+    timestamp: message.time_label || formatTime(['qianniu', 'douyin'].includes(message.platform_code) && message.platform_sent_at ? message.platform_sent_at : message.collected_at),
+    deliveryStatus: deliveryStatus(message),
     timeline: {
       type: (allowedTypes.has(timelineType) ? timelineType : 'unknown') as NonNullable<Message['timeline']>['type'],
       displayMode: (allowedDisplayModes.has(displayMode) ? displayMode : 'bubble') as NonNullable<Message['timeline']>['displayMode'],
@@ -205,7 +206,7 @@ function mapMessage(message: ApiMessage): Message {
         ? { data: {
             ...timelineData,
             ...(typeof timelineData.image_url === 'string'
-              ? { image_url: getQaImageUrl(timelineData.image_url) }
+              ? { image_url: resolveImageUrl(timelineData.image_url) }
               : {}),
           } as NonNullable<Message['timeline']>['data'] }
         : {}),
@@ -216,12 +217,13 @@ function mapMessage(message: ApiMessage): Message {
         sender: senderFromRole(quotePayload.sender_role),
         content: quoteContent || (quoteType === 'image' ? '[图片]' : '[引用消息]'),
         ...(quoteType === 'image' && quoteImageUrl
-          ? { media: { type: 'image' as const, url: getQaImageUrl(quoteImageUrl) } }
+          ? { media: { type: 'image' as const, url: resolveImageUrl(quoteImageUrl) } }
           : {}),
       },
     } : {}),
     ...((mediaType === 'image' || rawImageUrl) && rawImageUrl
-      ? { media: { type: 'image' as const, url: getQaImageUrl(rawImageUrl) } }
+      && (message.platform_code !== 'douyin' || mediaType === 'image')
+      ? { media: { type: 'image' as const, url: resolveImageUrl(rawImageUrl) } }
       : {}),
   };
 }
@@ -246,6 +248,8 @@ function quotePayloadFromMessage(message: Message | null | undefined): Record<st
 }
 
 function mapConversation(conversation: ApiConversation, existingMessages: Message[] = []): Conversation {
+  const transfer = conversation.metadata_json.qianniu_transfer as { status?: unknown; target_nick?: unknown } | undefined;
+  const douyinTransfer = conversation.metadata_json.douyin_transfer as { status?: unknown; target_name?: unknown } | undefined;
   const legacyShopName = typeof conversation.metadata_json.shop_name === 'string'
     ? conversation.metadata_json.shop_name
     : null;
@@ -262,6 +266,13 @@ function mapConversation(conversation: ApiConversation, existingMessages: Messag
       : 'active';
   return {
     id: conversation.id,
+    pddTransfer: conversation.platform_code === 'pinduoduo' && typeof conversation.metadata_json.auto_transfer === 'object' && conversation.metadata_json.auto_transfer
+      ? { status: String((conversation.metadata_json.auto_transfer as Record<string, unknown>).status || ''),
+          targetNick: String((conversation.metadata_json.auto_transfer as Record<string, unknown>).target_cs_username || '') } : null,
+    qianniuTransfer: conversation.platform_code === 'qianniu' && typeof transfer?.status === 'string'
+      ? { status: transfer.status, targetNick: typeof transfer.target_nick === 'string' ? transfer.target_nick : '' } : null,
+    douyinTransfer: conversation.platform_code === 'douyin' && typeof douyinTransfer?.status === 'string'
+      ? { status: douyinTransfer.status, targetNick: typeof douyinTransfer.target_name === 'string' ? douyinTransfer.target_name : '' } : null,
     userName: conversation.customer_name || conversation.title || '未知客户',
     avatarUrl: conversation.avatar_url ? getBusinessAssetUrl(conversation.avatar_url) : null,
     shopLogoUrl: conversation.shop_logo_url ? getBusinessAssetUrl(conversation.shop_logo_url) : null,
@@ -297,7 +308,7 @@ function mapConversation(conversation: ApiConversation, existingMessages: Messag
 }
 
 function productShopCacheKey(conversation: Conversation | undefined | null): string {
-  if (!conversation || conversation.platform !== 'pinduoduo') return '';
+  if (!conversation || !['pinduoduo', 'douyin'].includes(conversation.platform)) return '';
   return [
     conversation.platform,
     conversation.shopId || '',
@@ -351,6 +362,8 @@ export function useMessageCenterController() {
 
   const [authMode, setAuthMode] = useState<AuthMode>('login');
   const [currentView, setCurrentView] = useState<'messages' | 'admin'>('messages');
+  const noticeOpenVersionRef = useRef(0);
+  const noticeConversationRef = useRef('');
   const [lang, setLang] = useState<'zh' | 'en'>('zh');
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const conversationsRef = useRef<Conversation[]>([]);
@@ -358,6 +371,7 @@ export function useMessageCenterController() {
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [dataError, setDataError] = useState('');
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
+  const refreshMessageNotices = useMessageNotices(session?.user.id || null, authReady, connectionStatus);
   const [automaticSendNotice, setAutomaticSendNotice] = useState<{
     kind: 'sending' | 'success' | 'error';
     text: string;
@@ -375,6 +389,19 @@ export function useMessageCenterController() {
   const [importError, setImportError] = useState('');
   const [selectedId, setSelectedId] = useState('');
   const selectedIdRef = useRef('');
+  const listConversations = useCallback(async () => {
+    const response = await listConversationPage();
+    const noticeId = noticeConversationRef.current;
+    if (!noticeId || selectedIdRef.current !== noticeId || response.items.some((item) => item.id === noticeId)) return response;
+    // Keep an opened retained notification visible when newer chats fill page one.
+    try {
+      const { conversation } = await getConversation(noticeId);
+      if (!conversation.deleted_at) return { ...response, items: [...response.items, conversation] };
+    } catch (error) {
+      if (!(error instanceof Error && 'status' in error && error.status === 404)) throw error;
+    }
+    return response;
+  }, []);
   const [selectedPlatform, setSelectedPlatform] = useState('pinduoduo');
   const [selectedCategory, setSelectedCategory] = useState<'all' | 'pending'>('all');
   const [selectedShop, setSelectedShop] = useState('all');
@@ -393,6 +420,8 @@ export function useMessageCenterController() {
   const [isLoadingMonitoring, setIsLoadingMonitoring] = useState(false);
   const [customerOrders, setCustomerOrders] = useState<CustomerOrdersResponse | null>(null);
   const [isLoadingCustomerOrders, setIsLoadingCustomerOrders] = useState(false);
+  const orderLoadSequence = useRef(new Map<string, number>());
+  const refreshingOrders = useRef(new Set<string>());
   const [customerProducts, setCustomerProducts] = useState<CustomerProductsResponse | null>(null);
   const [isLoadingCustomerProducts, setIsLoadingCustomerProducts] = useState(false);
   const [platformAccounts, setPlatformAccounts] = useState<PlatformAccount[]>([]);
@@ -403,25 +432,33 @@ export function useMessageCenterController() {
   const [isGeneratingShopSummary, setIsGeneratingShopSummary] = useState(false);
   const [isSavingShopSummary, setIsSavingShopSummary] = useState(false);
   const shopProductsRef = useRef(new Map<string, CustomerProductsResponse>());
+  const productLoadVersions = useRef(new Map<string, number>());
   const platformQuickRepliesCacheRef = useRef(new Map<string, PlatformQuickRepliesCacheEntry>());
   const platformQuickRepliesRequestsRef = useRef(new Map<string, Promise<void>>());
   const activePlatformQuickRepliesAccountRef = useRef('');
   const monitoringModelRef = useRef('deepseek-v4-flash');
-  const currentViewRef = useRef(currentView);
-  const humanRequiredSnapshotRef = useRef(new Map<string, string>());
 
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
 
-  useEffect(() => {
-    currentViewRef.current = currentView;
-  }, [currentView]);
-
   const platformAccountById = useMemo(
     () => new Map(platformAccounts.map((account) => [account.id, account])),
     [platformAccounts],
   );
+
+  useEffect(() => {
+    setConversations(current => current.map(conversation => {
+      if (conversation.platform !== 'qianniu') return conversation;
+      const account = platformAccountById.get(conversation.shopId);
+      if (!account) return conversation;
+      const shopName = account.account_alias || '待识别店铺';
+      const serviceName = typeof account.metadata_json.service_account_name === 'string'
+        ? account.metadata_json.service_account_name : account.account_name;
+      return conversation.shopName === shopName && conversation.shopServiceUsername === serviceName ? conversation
+        : { ...conversation, shopName, shopServiceUsername: serviceName };
+    }));
+  }, [platformAccountById]);
 
   const mapMonitoringLog = (item: MonitoringLog): LogEntry => ({
     id: item.id,
@@ -548,7 +585,9 @@ export function useMessageCenterController() {
   }, []);
 
   const loadCustomerOrders = useCallback(async (conversationId: string) => {
-    setIsLoadingCustomerOrders(true);
+    const sequence = (orderLoadSequence.current.get(conversationId) || 0) + 1;
+    orderLoadSequence.current.set(conversationId, sequence);
+    if (selectedIdRef.current === conversationId) setIsLoadingCustomerOrders(true);
     try {
       const response = await getCustomerOrders(conversationId);
       console.info('[customer-orders] loaded', {
@@ -560,16 +599,17 @@ export function useMessageCenterController() {
         visibleOrderCount: response.orders.length,
         outreachCount: response.outreach.length,
       });
-      if (selectedIdRef.current === conversationId) setCustomerOrders(response);
+      if (selectedIdRef.current === conversationId && orderLoadSequence.current.get(conversationId) === sequence) setCustomerOrders(response);
       return response;
     } catch (error) {
       console.error('加载客户订单失败:', error);
-      if (selectedIdRef.current === conversationId) {
-        setCustomerOrders(null);
+      if (selectedIdRef.current === conversationId && orderLoadSequence.current.get(conversationId) === sequence) {
+        setCustomerOrders(current => current?.conversation_id === conversationId ? current : null);
       }
       return null;
     } finally {
-      if (selectedIdRef.current === conversationId) setIsLoadingCustomerOrders(false);
+      if (selectedIdRef.current === conversationId && orderLoadSequence.current.get(conversationId) === sequence &&
+          !refreshingOrders.current.has(conversationId)) setIsLoadingCustomerOrders(false);
     }
   }, []);
 
@@ -577,10 +617,18 @@ export function useMessageCenterController() {
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     const cacheKey = productShopCacheKey(conversation);
     const cached = cacheKey ? shopProductsRef.current.get(cacheKey) || null : null;
-    if (selectedIdRef.current === conversationId && cached) setCustomerProducts(cached);
-    setIsLoadingCustomerProducts(true);
+    const version = (productLoadVersions.current.get(conversationId) || 0) + 1;
+    productLoadVersions.current.set(conversationId, version);
+    if (selectedIdRef.current === conversationId && cached) setCustomerProducts({ ...cached, conversation_id: conversationId });
+    if (selectedIdRef.current === conversationId) setIsLoadingCustomerProducts(true);
     try {
-      const response = await getCustomerProducts(conversationId);
+      let response = await getCustomerProducts(conversationId);
+      if (productLoadVersions.current.get(conversationId) !== version) return response;
+      const latest = cacheKey ? shopProductsRef.current.get(cacheKey) : null;
+      if (['qianniu', 'douyin'].includes(conversation?.platform || '') && latest?.observed_at &&
+          (!response.observed_at || Date.parse(latest.observed_at) > Date.parse(response.observed_at))) {
+        response = { ...latest, conversation_id: conversationId };
+      }
       console.info('[customer-products] loaded', {
         conversationId,
         collectionStatus: response.collection_status,
@@ -589,19 +637,20 @@ export function useMessageCenterController() {
         totalCount: response.total_count,
         visibleProductCount: response.products.length,
       });
-      if (cacheKey && response.products.length > 0) {
+      if (cacheKey && (response.products.length > 0 || ['qianniu', 'douyin'].includes(conversation?.platform || ''))) {
         shopProductsRef.current.set(cacheKey, response);
       }
       if (selectedIdRef.current === conversationId) {
-        setCustomerProducts(response.products.length > 0 ? response : cached || response);
+        setCustomerProducts(['qianniu', 'douyin'].includes(conversation?.platform || '') || response.products.length > 0 ? response : cached || response);
       }
       return response;
     } catch (error) {
       console.error('鍔犺浇瀹㈡埛鍟嗗搧澶辫触:', error);
-      if (selectedIdRef.current === conversationId) setCustomerProducts(cached);
+      if (selectedIdRef.current === conversationId && productLoadVersions.current.get(conversationId) === version)
+        setCustomerProducts(cached ? { ...cached, conversation_id: conversationId } : null);
       return null;
     } finally {
-      if (selectedIdRef.current === conversationId) setIsLoadingCustomerProducts(false);
+      if (selectedIdRef.current === conversationId && productLoadVersions.current.get(conversationId) === version) setIsLoadingCustomerProducts(false);
     }
   }, []);
 
@@ -623,15 +672,6 @@ export function useMessageCenterController() {
       const targetId = response.items.some((item) => item.id === selectedIdRef.current)
         ? selectedIdRef.current
         : response.items[0]?.id || '';
-      const previousHumanRequired = humanRequiredSnapshotRef.current;
-      const nextHumanRequired = new Map<string, string>();
-      const newlyHumanRequired = response.items.filter((item) => {
-        if (!item.human_required) return false;
-        const notificationKey = `${item.id}:${item.human_required_at || 'active'}`;
-        nextHumanRequired.set(item.id, notificationKey);
-        return previousHumanRequired.get(item.id) !== notificationKey;
-      });
-      humanRequiredSnapshotRef.current = nextHumanRequired;
       setConversations((current) => {
         const mapped = response.items.map((item) => {
           const existing = current.find((conversation) => conversation.id === item.id);
@@ -639,19 +679,6 @@ export function useMessageCenterController() {
         });
         return mapped;
       });
-      if (newlyHumanRequired.length > 0) {
-        void window.desktopBridge?.notifyHumanRequired({
-          items: newlyHumanRequired.map((item) => ({
-            conversationId: item.id,
-            notificationKey: nextHumanRequired.get(item.id) || `${item.id}:active`,
-            platformName: item.platform_name || item.platform_code,
-            shopName: item.shop_name || '',
-            customerName: item.customer_name || item.title || '',
-          })),
-          messageCenterVisible: currentViewRef.current === 'messages',
-          viewingConversationId: selectedIdRef.current || null,
-        }).catch((error) => console.error('发送待人工桌面通知失败:', error));
-      }
       if (targetId) {
         const refreshes: Promise<unknown>[] = [];
         if (options.refreshMessages !== false) {
@@ -672,7 +699,7 @@ export function useMessageCenterController() {
     } finally {
       if (!background) setIsLoadingConversations(false);
     }
-  }, [loadCustomerOrders, loadCustomerProducts, loadMessagesForConversation]);
+  }, [listConversations, loadCustomerOrders, loadCustomerProducts, loadMessagesForConversation]);
 
   const refreshRpaBatchChanges = useCallback(async (
     affectedConversations: RpaBatchAffectedConversation[],
@@ -742,7 +769,7 @@ export function useMessageCenterController() {
         refreshProducts: options.refreshProducts !== false,
       });
     }
-  }, [loadConversationData, loadCustomerOrders, loadCustomerProducts, loadMessagesForConversation]);
+  }, [listConversations, loadConversationData, loadCustomerOrders, loadCustomerProducts, loadMessagesForConversation]);
 
   const loadImportCandidates = useCallback(async () => {
     setIsLoadingImportCandidates(true);
@@ -848,12 +875,17 @@ export function useMessageCenterController() {
     return connectRealtime(
       session.access_token,
       (event) => {
+        if (/^(rpa\.|message\.|conversation\.|automation\.)/.test(event.type)) refreshMessageNotices();
         if (event.type === 'rpa.platform_accounts.synced') {
           void loadPlatformAccounts();
           return;
         }
         if (event.type === 'message.queued' && event.message) {
           const nextMessage = mapMessage(event.message);
+          if (event.message.platform_code === 'douyin') {
+            void loadMessagesForConversation(event.message.conversation_id, { background: true });
+            return;
+          }
           const pendingIds = pendingAutomaticMessageIdsRef.current.get(event.message.conversation_id)
             || new Set<string>();
           pendingIds.add(event.message.id);
@@ -947,6 +979,7 @@ export function useMessageCenterController() {
         }
         if (event.type === 'automation.reply.completed' && event.message) {
           const nextMessage = mapMessage(event.message);
+          const clearAwaiting = clearAwaitingAfterGeneratedReply(event.message);
           const followUpMessages = Array.isArray(event.follow_up_messages)
             ? event.follow_up_messages.map(mapMessage)
             : event.follow_up_message ? [mapMessage(event.follow_up_message)] : [];
@@ -962,7 +995,7 @@ export function useMessageCenterController() {
                   ...conversation,
                   lastMessage: followUpMessages[followUpMessages.length - 1]?.content || nextMessage.content,
                   time: followUpMessages[followUpMessages.length - 1]?.timestamp || nextMessage.timestamp,
-                  awaitingReply: false,
+                  awaitingReply: clearAwaiting ? false : conversation.awaitingReply,
                   messages: replyMessages.reduce<Message[]>(
                     (messages, item) => (
                       messages.some((message) => message.id === item.id)
@@ -974,10 +1007,12 @@ export function useMessageCenterController() {
                 }
               : conversation
           )));
-          clearAwaitingReplyIfNeeded(event.message.conversation_id);
+          if (clearAwaiting) clearAwaitingReplyIfNeeded(event.message.conversation_id);
           if (event.message.conversation_id === selectedIdRef.current) {
             if (automaticSendNoticeTimerRef.current) clearTimeout(automaticSendNoticeTimerRef.current);
-            setAutomaticSendNotice((current) => ({
+            // Douyin reports durable sending/pending/cancelled status on the
+            // message itself as result events refresh it; generation isn't delivery.
+            setAutomaticSendNotice((current) => event.message?.platform_code === 'douyin' ? null : ({
               kind: 'sending',
               text: '发送中',
               version: (current?.version || 0) + 1,
@@ -986,6 +1021,10 @@ export function useMessageCenterController() {
         }
         let handledSendCompletion = false;
         if (event.type === 'rpa.task.completed' && event.task?.task_type === 'send_message') {
+          if (event.task.platform_code === 'douyin') {
+            void loadConversationData({ background: true, refreshMessages: true, refreshOrders: false });
+            return;
+          }
           handledSendCompletion = true;
           const task = event.task;
           const textSent = task.result_json?.text_sent === true;
@@ -1130,7 +1169,7 @@ export function useMessageCenterController() {
             ? event.event as Record<string, unknown>
             : null;
           const eventType = typeof eventPayload?.event_type === 'string' ? eventPayload.event_type : '';
-          if (eventType === 'message_snapshot') {
+          if (['message_snapshot', 'customer_message', 'message_received', 'agent_message', 'message_sent', 'douyin_send_result'].includes(eventType)) {
             void loadConversationData({
               background: true,
               refreshMessages: true,
@@ -1142,9 +1181,11 @@ export function useMessageCenterController() {
               refreshMessages: false,
               refreshOrders: false,
             });
+          } else if (eventType === 'qianniu_message_snapshot' && selectedIdRef.current) {
+            void loadMessagesForConversation(selectedIdRef.current, { background: true });
           } else if (eventType === 'customer_orders_snapshot' && selectedIdRef.current) {
             void loadCustomerOrders(selectedIdRef.current);
-          } else if (eventType === 'customer_products_snapshot' && selectedIdRef.current) {
+          } else if (['customer_products_snapshot', 'store_products_snapshot'].includes(eventType) && selectedIdRef.current) {
             void loadCustomerProducts(selectedIdRef.current);
           }
         }
@@ -1157,7 +1198,9 @@ export function useMessageCenterController() {
           const affectedConversations = Array.isArray(event.affected_conversations)
             ? event.affected_conversations as RpaBatchAffectedConversation[]
             : [];
-          if (eventTypes.has('message_snapshot')) {
+          const hasMessageEvents = ['message_snapshot', 'qianniu_message_snapshot', 'customer_message', 'message_received', 'agent_message', 'message_sent', 'douyin_send_result']
+            .some((eventType) => eventTypes.has(eventType));
+          if (hasMessageEvents) {
             if (affectedConversations.length > 0) {
               void refreshRpaBatchChanges(affectedConversations, { refreshOrders: false });
             } else {
@@ -1179,7 +1222,7 @@ export function useMessageCenterController() {
           if (eventTypes.has('customer_orders_snapshot') && selectedIdRef.current) {
             void loadCustomerOrders(selectedIdRef.current);
           }
-          if (eventTypes.has('customer_products_snapshot') && selectedIdRef.current) {
+          if ((eventTypes.has('customer_products_snapshot') || eventTypes.has('store_products_snapshot')) && selectedIdRef.current) {
             void loadCustomerProducts(selectedIdRef.current);
           }
         }
@@ -1191,6 +1234,7 @@ export function useMessageCenterController() {
       },
       setConnectionStatus,
       () => {
+        refreshMessageNotices();
         void loadConversationData({ background: true });
       },
     );
@@ -1202,12 +1246,13 @@ export function useMessageCenterController() {
     loadCustomerProducts,
     loadMonitoring,
     refreshRpaBatchChanges,
+    refreshMessageNotices,
+    listConversations,
     session?.access_token,
   ]);
 
   const clearHumanRequiredFlag = useCallback(async (conversationId: string) => {
     const response = await clearConversationHumanRequired(conversationId);
-    humanRequiredSnapshotRef.current.delete(conversationId);
     setConversations((current) => current.map((conversation) => (
       conversation.id === conversationId
         ? mapConversation(response.conversation, conversation.messages)
@@ -1223,21 +1268,33 @@ export function useMessageCenterController() {
     });
   }, [clearHumanRequiredFlag]);
 
-  useEffect(() => window.desktopBridge?.onOpenHumanRequiredConversation((conversationId) => {
-    setCurrentView('messages');
-    setSelectedPlatform('pinduoduo');
-    setSelectedCategory('all');
-    setSelectedShop('all');
-    setConversationSearch('');
-    if (conversationId) {
-      void Promise.all([
+  useEffect(() => window.desktopBridge?.onOpenNoticeConversation?.((conversationId, platformCode) => {
+    const version = ++noticeOpenVersionRef.current;
+    if (!conversationId) { setCurrentView('messages'); return; }
+    void (async () => {
+      let target = conversationsRef.current.find((item) => item.id === conversationId);
+      // A retained notification can outlive the first page of the conversation list.
+      if (!target) {
+        const result = await getConversation(conversationId);
+        if (version !== noticeOpenVersionRef.current) return;
+        target = mapConversation(result.conversation);
+        setConversations((current) => current.some((item) => item.id === conversationId) ? current : [target!, ...current]);
+      }
+      noticeConversationRef.current = conversationId;
+      setCurrentView('messages');
+      setSelectedPlatform(target.platform || platformCode || 'all');
+      setSelectedCategory('all');
+      setSelectedShop('all');
+      setConversationSearch('');
+      await Promise.all([
         loadMessagesForConversation(conversationId),
         loadCustomerOrders(conversationId),
         loadCustomerProducts(conversationId),
       ]);
+      if (version !== noticeOpenVersionRef.current) return;
       clearHumanRequiredIfNeeded(conversationId);
       clearAwaitingReplyIfNeeded(conversationId);
-    }
+    })().catch((error) => setDataError(error instanceof Error ? error.message : '打开通知会话失败'));
   }), [clearAwaitingReplyIfNeeded, clearHumanRequiredIfNeeded, loadCustomerOrders, loadCustomerProducts, loadMessagesForConversation]);
 
   const handleMonitoringModelChange = useCallback((model: string) => {
@@ -1532,8 +1589,10 @@ export function useMessageCenterController() {
   };
 
   const handleLogout = () => {
+    noticeOpenVersionRef.current += 1;
+    noticeConversationRef.current = '';
     void window.desktopBridge?.closePlatformWorkspaces().catch(() => undefined);
-    void window.desktopBridge?.clearHumanRequiredNotifications().catch(() => undefined);
+    void window.desktopBridge?.setMessageNoticeOwner?.(null).catch(() => undefined);
     void logout().catch(() => undefined);
     clearStoredSession();
     setSession(null);
@@ -1541,7 +1600,6 @@ export function useMessageCenterController() {
     setConversations([]);
     pendingAutomaticMessageIdsRef.current.clear();
     setAutomaticSendNotice(null);
-    humanRequiredSnapshotRef.current.clear();
     selectedIdRef.current = '';
     setSelectedId('');
     setConnectionStatus('disconnected');
@@ -1551,9 +1609,26 @@ export function useMessageCenterController() {
     setPlatformQuickReplies(emptyPlatformQuickRepliesState());
   };
 
-  const handleSendMessage = async (content: string, options: { quote?: Message | null } = {}) => {
+  const douyinSubmitKeysRef = useRef(new Map<string, { content: string; key: string }>());
+  const handleSendMessage = async (content: string, options: { quote?: Message | null } = {}): Promise<SendMessageResult> => {
     if (!selectedId) return { draftOnly: false };
     const selectedConversation = conversations.find((conversation) => conversation.id === selectedId);
+    if (selectedConversation?.platform === 'douyin') {
+      if (options.quote) throw new Error('抖店暂不支持引用回复，请直接发送文本');
+      const conversationId = selectedId;
+      const previous = douyinSubmitKeysRef.current.get(conversationId);
+      const key = previous?.content === content ? previous.key : crypto.randomUUID();
+      douyinSubmitKeysRef.current.set(conversationId, { content, key });
+      const response = await sendMessage(conversationId, content, key);
+      douyinSubmitKeysRef.current.delete(conversationId);
+      const nextMessage = mapMessage(response.message);
+      setConversations((current) => current.map((conversation) => conversation.id === conversationId
+        ? { ...conversation, lastMessage: content, time: nextMessage.timestamp,
+            messages: conversation.messages.some((message) => message.id === nextMessage.id)
+              ? conversation.messages : [...conversation.messages, nextMessage] }
+        : conversation));
+      return { draftOnly: false, sendMethod: 'douyin_task' };
+    }
     if (selectedConversation?.platform === 'pinduoduo') {
       if (!window.desktopBridge) throw new Error('当前运行环境不支持拼多多消息发送');
       const clientMessageId = `optimistic:${crypto.randomUUID()}`;
@@ -1666,6 +1741,123 @@ export function useMessageCenterController() {
       clearHumanRequiredIfNeeded(selectedId);
       clearAwaitingReplyIfNeeded(selectedId);
       return { draftOnly: false, sendMethod: platformResult.method };
+    }
+    if (selectedConversation?.platform === 'qianniu') {
+      if (!selectedConversation.shopId || selectedConversation.shopId.startsWith('legacy:')) {
+        throw new Error('当前千牛会话未关联已登录店铺账号');
+      }
+      if (!selectedConversation.externalConversationId) {
+        throw new Error('当前千牛会话缺少 cid，无法发送');
+      }
+      if (!window.desktopBridge?.sendQianniuMessage) {
+        throw new Error('当前运行环境不支持千牛消息发送');
+      }
+      const conversationId = selectedId;
+      const platformAccountId = selectedConversation.shopId;
+      const externalConversationId = selectedConversation.externalConversationId;
+      const sendQianniuMessage = window.desktopBridge.sendQianniuMessage;
+      const platformAccount = platformAccountById.get(platformAccountId);
+      const shopUid = typeof platformAccount?.metadata_json?.shop_uid === 'string'
+        ? platformAccount.metadata_json.shop_uid.trim()
+        : null;
+      const clientMessageId = `optimistic:${crypto.randomUUID()}`;
+      const optimisticMessage: Message = {
+        id: clientMessageId,
+        sender: 'agent',
+        content,
+        timestamp: formatTime(new Date().toISOString()),
+        deliveryStatus: 'sending',
+      };
+      setConversations((current) => current.map((conversation) => (
+        conversation.id === selectedId
+          ? {
+              ...conversation,
+              lastMessage: content,
+              time: optimisticMessage.timestamp,
+              messages: [...conversation.messages, optimisticMessage],
+            }
+          : conversation
+      )));
+      void (async () => {
+        let platformResult: Awaited<ReturnType<typeof sendQianniuMessage>>;
+        try {
+          platformResult = await sendQianniuMessage({
+            platformAccountId,
+            shopUid: shopUid || null,
+            externalConversationId,
+            content,
+          });
+        } catch (error) {
+          console.error('千牛消息发送失败:', error);
+          setConversations((current) => current.map((conversation) => (
+            conversation.id === conversationId
+              ? {
+                  ...conversation,
+                  messages: conversation.messages.map((message) => (
+                    message.id === clientMessageId
+                      ? { ...message, deliveryStatus: 'failed' }
+                      : message
+                  )),
+                }
+              : conversation
+          )));
+          return;
+        }
+        try {
+          const response = await recordSentMessage(
+            conversationId,
+            content,
+            platformResult.msg_id || null,
+            clientMessageId,
+            'text',
+            {
+              rawPayload: {
+                message_type: 'text',
+                send_method: platformResult.method,
+                shop_uid: platformResult.shop_uid,
+                cid: platformResult.conversation_key,
+                client_id: platformResult.client_id,
+                request_id: platformResult.request_id,
+                receipt_status: platformResult.receipt_status,
+              },
+            },
+          );
+          const nextMessage = mapMessage(response.message);
+          setConversations((current) => current.map((conversation) => (
+            conversation.id === conversationId
+              ? {
+                  ...conversation,
+                  lastMessage: nextMessage.content,
+                  time: nextMessage.timestamp,
+                  awaitingReply: false,
+                  messages: conversation.messages.some((message) => message.id === nextMessage.id)
+                    ? conversation.messages.filter((message) => message.id !== clientMessageId)
+                    : conversation.messages.map((message) => (
+                        message.id === clientMessageId ? nextMessage : message
+                      )),
+                }
+              : conversation
+          )));
+        } catch (error) {
+          console.error('千牛消息已发送，但服务端记录失败，将等待平台采集补齐:', error);
+          setConversations((current) => current.map((conversation) => (
+            conversation.id === conversationId
+              ? {
+                  ...conversation,
+                  awaitingReply: false,
+                  messages: conversation.messages.map((message) => (
+                    message.id === clientMessageId
+                      ? { ...message, deliveryStatus: 'sent' }
+                      : message
+                  )),
+                }
+              : conversation
+          )));
+        }
+        clearHumanRequiredIfNeeded(conversationId);
+        clearAwaitingReplyIfNeeded(conversationId);
+      })();
+      return { draftOnly: false, sendMethod: 'qianniu_direct_send' };
     }
     const response = await sendMessage(selectedId, content);
     const nextMessage = mapMessage(response.message);
@@ -1804,7 +1996,15 @@ export function useMessageCenterController() {
   };
 
   const handleListTransferCs = async (conversation: Conversation) => {
-    if (conversation.platform !== 'pinduoduo') throw new Error('当前仅支持拼多多会话转移');
+    if (conversation.platform === 'douyin') {
+      if (!window.desktopBridge?.listDouyinTransferTargets) throw new Error('请重启桌面端加载抖店转接功能');
+      return window.desktopBridge.listDouyinTransferTargets({ conversationId: conversation.id });
+    }
+    if (conversation.platform === 'qianniu') {
+      if (!conversation.shopId || !window.desktopBridge?.listQianniuTransferTargets) throw new Error('当前千牛会话缺少店铺账号');
+      return window.desktopBridge.listQianniuTransferTargets({ conversationId: conversation.id });
+    }
+    if (conversation.platform !== 'pinduoduo') throw new Error('当前平台暂不支持会话转移');
     if (!conversation.shopId || !conversation.externalConversationId) {
       throw new Error('当前会话缺少拼多多店铺或客户 UID，无法转移');
     }
@@ -1822,7 +2022,15 @@ export function useMessageCenterController() {
     targetCsid: string,
     transReason: string,
   ) => {
-    if (conversation.platform !== 'pinduoduo') throw new Error('当前仅支持拼多多会话转移');
+    if (conversation.platform === 'douyin') {
+      if (!window.desktopBridge?.transferDouyinConversation) throw new Error('请重启桌面端加载抖店转接功能');
+      return window.desktopBridge.transferDouyinConversation({ conversationId: conversation.id, targetCsid, reason: transReason });
+    }
+    if (conversation.platform === 'qianniu') {
+      if (!conversation.shopId || !conversation.externalConversationId || !window.desktopBridge?.transferQianniuConversation) throw new Error('当前千牛会话信息不完整');
+      return window.desktopBridge.transferQianniuConversation({ conversationId: conversation.id, targetCsid, reason: transReason });
+    }
+    if (conversation.platform !== 'pinduoduo') throw new Error('当前平台暂不支持会话转移');
     if (!conversation.shopId || !conversation.externalConversationId) {
       throw new Error('当前会话缺少拼多多店铺或客户 UID，无法转移');
     }
@@ -1899,32 +2107,101 @@ export function useMessageCenterController() {
     });
   };
 
+  const handleSyncQianniuMessages = async (conversation: Conversation) => {
+    if (conversation.platform !== 'qianniu' || !window.desktopBridge?.syncQianniuRecentMessages) {
+      throw new Error('当前运行环境不支持千牛消息同步');
+    }
+    await window.desktopBridge.syncQianniuRecentMessages({
+      platformAccountId: conversation.shopId,
+      externalConversationId: conversation.externalConversationId || '',
+    });
+    await loadMessagesForConversation(conversation.id, { background: true });
+  };
+
   const handleRefreshCustomerOrders = useCallback(async () => {
     const conversation = conversations.find((item) => item.id === selectedIdRef.current);
     if (!conversation) return;
-    if (conversation.platform !== 'pinduoduo') {
+    if (refreshingOrders.current.has(conversation.id)) return;
+    if (!['pinduoduo', 'qianniu', 'douyin'].includes(conversation.platform)) {
       throw new Error('当前平台暂不支持自动读取客户订单');
     }
-    if (!window.desktopBridge) throw new Error('当前运行环境不支持拼多多订单采集');
+    if (!window.desktopBridge) throw new Error('当前运行环境不支持订单采集');
     const previousObservedAt = customerOrders?.conversation_id === conversation.id
       ? customerOrders.observed_at
       : null;
     setIsLoadingCustomerOrders(true);
-    await window.desktopBridge.refreshPddCustomerOrders({
-      platformAccountId: conversation.shopId,
-      externalConversationId: conversation.externalConversationId || null,
-      customerName: conversation.userName,
-    });
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      const response = await loadCustomerOrders(conversation.id);
-      if (response?.observed_at && response.observed_at !== previousObservedAt) break;
-      await new Promise((resolve) => setTimeout(resolve, 350));
+    refreshingOrders.current.add(conversation.id);
+    try {
+      if (conversation.platform === 'douyin') {
+        const { task_id } = await refreshDouyinCustomerOrders(conversation.id);
+        const deadline = Date.now() + 30000;
+        while (Date.now() < deadline) {
+          if (selectedIdRef.current !== conversation.id) return;
+          const response = await loadCustomerOrders(conversation.id);
+          if (response?.last_attempt_task_id === task_id) {
+            if (response.collection_status === 'unavailable') throw new Error(response.collection_error || '订单读取失败');
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        throw new Error('订单读取或同步超时，请确认桌面服务在线后重试');
+      }
+      const refresh = conversation.platform === 'qianniu'
+        ? window.desktopBridge.refreshQianniuCustomerOrders
+        : window.desktopBridge.refreshPddCustomerOrders;
+      await refresh({
+        platformAccountId: conversation.shopId,
+        externalConversationId: conversation.externalConversationId || '',
+        customerName: conversation.userName,
+      });
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const response = await loadCustomerOrders(conversation.id);
+        if (response?.observed_at && response.observed_at !== previousObservedAt) return;
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+      throw new Error('订单已读取，等待同步超时，请稍后刷新');
+    } finally {
+      refreshingOrders.current.delete(conversation.id);
+      if (selectedIdRef.current === conversation.id) setIsLoadingCustomerOrders(false);
     }
   }, [conversations, customerOrders, loadCustomerOrders]);
 
   const handleRefreshCustomerProducts = useCallback(async () => {
     const conversation = conversations.find((item) => item.id === selectedIdRef.current);
     if (!conversation) return null;
+    if (conversation.platform === 'qianniu' || conversation.platform === 'douyin') {
+      if (conversation.platform === 'douyin' ? !window.desktopBridge?.refreshDouyinStoreProducts
+        : !window.desktopBridge?.refreshQianniuStoreProducts || !conversation.externalConversationId)
+        throw new Error('店铺商品查询不可用，请重启桌面端');
+      setIsLoadingCustomerProducts(true);
+      try {
+        const collected = conversation.platform === 'douyin'
+          ? await window.desktopBridge!.refreshDouyinStoreProducts({ platformAccountId: conversation.shopId })
+          : await window.desktopBridge!.refreshQianniuStoreProducts({
+            platformAccountId: conversation.shopId, externalConversationId: conversation.externalConversationId!,
+          });
+        for (let attempt = 0; attempt < 25; attempt++) {
+          const saved = await getCustomerProducts(conversation.id);
+          if (saved.observed_at && Date.parse(saved.observed_at) >= Date.parse(collected.observed_at)) {
+            const key = productShopCacheKey(conversation);
+            const cached = key ? shopProductsRef.current.get(key) : null;
+            const latest = cached?.observed_at && Date.parse(cached.observed_at) > Date.parse(saved.observed_at) ? cached : saved;
+            if (key) shopProductsRef.current.set(key, latest);
+            const selected = conversationsRef.current.find(item => item.id === selectedIdRef.current);
+            if (selected && (key ? productShopCacheKey(selected) === key : selected.id === conversation.id)) {
+              productLoadVersions.current.set(selected.id, (productLoadVersions.current.get(selected.id) || 0) + 1);
+              setCustomerProducts({ ...latest, conversation_id: selected.id });
+              setIsLoadingCustomerProducts(false);
+            }
+            return saved;
+          }
+          await new Promise(resolve => setTimeout(resolve, 400));
+        }
+        throw new Error('商品已读取，等待持久化超时，请稍后重试');
+      } finally {
+        if (selectedIdRef.current === conversation.id) setIsLoadingCustomerProducts(false);
+      }
+    }
     if (conversation.platform !== 'pinduoduo') {
       throw new Error('当前平台暂不支持读取商品列表');
     }
@@ -2111,6 +2388,7 @@ export function useMessageCenterController() {
     handleLogout,
     handleSendMessage,
     handleSendImage,
+    handleSyncQianniuMessages,
     handleListTransferCs,
     handleTransferConversation,
     handleClearHumanRequired,
@@ -2135,13 +2413,13 @@ export function useMessageCenterController() {
       }
       const selectedConversation = conversationsRef.current.find((conversation) => conversation.id === id);
       const cachedProducts = shopProductsRef.current.get(productShopCacheKey(selectedConversation)) || null;
-      setCustomerProducts(cachedProducts);
+      setCustomerProducts(cachedProducts ? { ...cachedProducts, conversation_id: id } : null);
       void Promise.all([loadMessagesForConversation(id), loadCustomerOrders(id), loadCustomerProducts(id)]);
       clearAwaitingReplyIfNeeded(id);
       clearHumanRequiredIfNeeded(id);
     },
     setSelectedPlatform: (platform: string) => {
-      if (platform !== 'pinduoduo') return;
+      if (!['all', 'pinduoduo', 'qianniu', 'douyin'].includes(platform)) return;
       setSelectedShop('all');
       setSelectedPlatform(platform);
     },

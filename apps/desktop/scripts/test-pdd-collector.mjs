@@ -237,7 +237,10 @@ try {
   });
   await logger.flush();
 
-  const logPath = path.join(diagnosticDirectory, 'pinduoduo-collector.log');
+  const logFiles = fs.readdirSync(diagnosticDirectory)
+    .filter((name) => /^pinduoduo-collector-\d{4}-\d{2}-\d{2}\.log$/.test(name));
+  assert.equal(logFiles.length, 1, 'diagnostic log must use a local date in the file name');
+  const logPath = path.join(diagnosticDirectory, logFiles[0]);
   assert.equal(fs.existsSync(logPath), true, 'diagnostic log must be created after flush');
   const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n');
   assert.equal(lines.length, 1, 'each diagnostic event must be stored as one JSON line');
@@ -250,6 +253,18 @@ try {
   assert.equal(record.details.nested.cookie_value, '[redacted]');
   assert.equal(record.details.nested.active, true);
   assert.equal(fs.readFileSync(logPath, 'utf8').includes('must-not-be-written'), false);
+
+  const rotatingLogger = new PddDiagnosticLogger(diagnosticDirectory, { maxBytes: 100 });
+  rotatingLogger.write('local-account-100', { stage: 'rotation_one', details: { value: 'x'.repeat(60) } });
+  rotatingLogger.write('local-account-100', { stage: 'rotation_two', details: { value: 'x'.repeat(60) } });
+  await rotatingLogger.flush();
+  const rotatedFiles = fs.readdirSync(diagnosticDirectory)
+    .filter((name) => /^pinduoduo-collector-\d{4}-\d{2}-\d{2}(?:\.\d+)?\.log$/.test(name));
+  assert.equal(
+    rotatedFiles.some((name) => /\.\d+\.log$/.test(name)),
+    true,
+    'size rotation must create a new numbered file instead of overwriting yesterday-sized logs',
+  );
 } finally {
   fs.rmSync(diagnosticDirectory, { recursive: true, force: true });
 }

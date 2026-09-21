@@ -18,8 +18,9 @@ import {
   ArrowRightLeft,
   Search,
   Loader2,
+  RefreshCw,
 } from 'lucide-react';
-import type { Conversation, Message } from '../types';
+import type { Conversation, Message, SendMessageResult } from '../types';
 import CustomerAvatar from './CustomerAvatar';
 import { loadQaImageUrl, type PlatformQuickReply } from '../../shared/api/client';
 
@@ -27,8 +28,9 @@ interface ChatWindowProps {
   conversation?: Conversation;
   isLoading: boolean;
   error: string;
-  onSendMessage: (content: string, options?: { quote?: Message | null }) => Promise<{ draftOnly: boolean; sendMethod?: 'click' | 'enter' | 'api_send_message' | null }>;
+  onSendMessage: (content: string, options?: { quote?: Message | null }) => Promise<SendMessageResult>;
   onSendImage: (imageDataUrl: string, options?: { quote?: Message | null }) => Promise<void>;
+  onSyncRecentMessages?: (conversation: Conversation) => Promise<void>;
   onListTransferCs?: (conversation: Conversation) => Promise<{
     status: 'collected';
     cs_list: PddTransferCs[];
@@ -61,7 +63,19 @@ interface ChatWindowProps {
   } | null;
 }
 
-function ChatImage({ src, onOpen }: { src: string; onOpen: (url: string) => void }) {
+function transferErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error
+    ? error.message.replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '') || fallback
+    : fallback;
+}
+
+function TextBubble({ text, customer, status }: { text: string; customer: boolean; status?: Message['deliveryStatus'] }) {
+  return <div className={`w-fit max-w-full px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm break-words whitespace-pre-wrap ${customer
+    ? 'bg-white text-slate-700 rounded-tl-md border border-slate-100'
+    : `bg-sky-500 text-white rounded-tr-md ${status === 'sending' || status === 'failed' || status === 'cancelled' ? 'opacity-70' : ''}`}`}>{text}</div>;
+}
+
+function ChatImage({ src, onOpen, directUrl = false }: { src: string; onOpen: (url: string) => void; directUrl?: boolean }) {
   const [url, setUrl] = useState('');
   const [failed, setFailed] = useState(false);
 
@@ -70,7 +84,8 @@ function ChatImage({ src, onOpen }: { src: string; onOpen: (url: string) => void
     let objectUrl = '';
     setUrl('');
     setFailed(false);
-    void loadQaImageUrl(src).then((nextUrl) => {
+    // Platform URLs must never enter the knowledge-base authenticated fetch path.
+    void (directUrl ? Promise.resolve(src) : loadQaImageUrl(src)).then((nextUrl) => {
       if (!active) {
         if (nextUrl.startsWith('blob:')) URL.revokeObjectURL(nextUrl);
         return;
@@ -84,7 +99,7 @@ function ChatImage({ src, onOpen }: { src: string; onOpen: (url: string) => void
       active = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [src]);
+  }, [src, directUrl]);
 
   if (failed) {
     return (
@@ -110,11 +125,22 @@ function ChatImage({ src, onOpen }: { src: string; onOpen: (url: string) => void
           alt="聊天图片"
           className="h-full w-full object-contain"
           loading="lazy"
+          referrerPolicy="no-referrer"
           onError={() => setFailed(true)}
         />
       )}
     </button>
   );
+}
+
+function ProductThumbnail({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [src]);
+  return failed ? (
+    <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded bg-slate-100 text-slate-400" title="商品图片加载失败">
+      <ImageOff size={20} />
+    </div>
+  ) : <img src={src} alt="商品" className="h-16 w-16 shrink-0 rounded object-cover" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
 }
 
 function TimelineCard({ message }: { message: Message }) {
@@ -190,7 +216,7 @@ function TimelineCard({ message }: { message: Message }) {
         {heading}
       </div>
       <div className="flex gap-3 p-3">
-        {imageUrl ? <img src={imageUrl} alt="商品" className="h-16 w-16 shrink-0 rounded object-cover" referrerPolicy="no-referrer" /> : null}
+        {imageUrl ? <ProductThumbnail src={imageUrl} /> : null}
         <div className="min-w-0 flex-1">
           {linkUrl ? (
             <a
@@ -268,6 +294,7 @@ export default function ChatWindow({
   error,
   onSendMessage,
   onSendImage,
+  onSyncRecentMessages,
   onListTransferCs,
   onTransferConversation,
   quickReplies,
@@ -279,6 +306,7 @@ export default function ChatWindow({
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState('');
   const [sendNotice, setSendNotice] = useState('');
+  const [historySync, setHistorySync] = useState({ id: '', busy: false, error: '' });
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [pendingImage, setPendingImage] = useState<{ url: string; name: string } | null>(null);
   const [quotedMessage, setQuotedMessage] = useState<Message | null>(null);
@@ -295,6 +323,11 @@ export default function ChatWindow({
   const [transferSuccess, setTransferSuccess] = useState('');
   const [selectedTransferReason, setSelectedTransferReason] = useState('无原因直接转移');
   const [transferringCsid, setTransferringCsid] = useState<string | null>(null);
+  const [confirmTransfer, setConfirmTransfer] = useState<PddTransferCs | null>(null);
+  const transferEpoch = useRef(0);
+  const transferBusy = useRef(false);
+  const transferConversationId = useRef(conversation?.id);
+  transferConversationId.current = conversation?.id;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -305,8 +338,18 @@ export default function ChatWindow({
   const hasSendingMessages = activeMessages.some((message) => message.deliveryStatus === 'sending');
   const activeConversation = conversation ? isActiveConversation(conversation) : false;
   const isPddConversation = conversation?.platform === 'pinduoduo';
+  const isDouyinConversation = conversation?.platform === 'douyin';
+  const supportsTransfer = isPddConversation || isDouyinConversation || conversation?.platform === 'qianniu';
+  const hasPendingConfirmation = activeMessages.some((message) => message.deliveryStatus === 'confirmation_pending');
+  const platformTransfer = isDouyinConversation ? conversation?.douyinTransfer : conversation?.platform === 'qianniu' ? conversation.qianniuTransfer : isPddConversation ? conversation?.pddTransfer : null;
+  const transferBlocked = ['preparing', 'ack_queued', 'ready', 'transferring', 'transferred', 'confirmation_pending'].includes(platformTransfer?.status || '');
+  const transferNotice = platformTransfer?.status === 'unavailable'
+    ? isPddConversation ? '暂无其他可接待客服，本次未转接；新消息仍会自动处理' : '暂无其他在线客服，本次未转接；新消息仍会自动处理'
+    : !transferBlocked ? '' : platformTransfer?.status === 'transferred'
+    ? `已转移给 ${platformTransfer.targetNick}` : platformTransfer?.status !== 'confirmation_pending'
+      ? '转接处理中，已暂停发送' : `转接结果待确认，请在${isDouyinConversation ? '飞鸽' : isPddConversation ? '拼多多原平台' : '千牛'}核对，勿重复转接`;
   const canTransferConversation = Boolean(
-    isPddConversation
+    supportsTransfer
     && conversation?.shopId
     && conversation?.externalConversationId
     && onListTransferCs
@@ -344,16 +387,20 @@ export default function ChatWindow({
   }, [activeMessages.length, conversation?.id]);
 
   useEffect(() => {
+    transferEpoch.current++;
     setPreviewImage(null);
     setPendingImage(null);
     setQuotedMessage(null);
     setContextMenu(null);
     setSendNotice('');
     setIsTransferModalOpen(false);
+    setIsLoadingTransferCs(false);
+    setTransferCsList([]);
     setTransferSearch('');
     setTransferError('');
     setTransferSuccess('');
     setTransferringCsid(null);
+    setConfirmTransfer(null);
     if (sendNoticeTimerRef.current) {
       clearTimeout(sendNoticeTimerRef.current);
       sendNoticeTimerRef.current = null;
@@ -399,7 +446,7 @@ export default function ChatWindow({
   }, [previewImage]);
 
   const handleSend = async () => {
-    if (!conversation) return;
+    if (!conversation || transferBlocked || isDouyinConversation && (hasSendingMessages || hasPendingConfirmation)) return;
 
     const content = inputValue.trim();
     if (!content && !pendingImage) return;
@@ -411,11 +458,23 @@ export default function ChatWindow({
       clearTimeout(sendNoticeTimerRef.current);
       sendNoticeTimerRef.current = null;
     }
+    if (!pendingImage) {
+      setInputValue('');
+      setQuotedMessage(null);
+    }
     try {
       if (pendingImage) await onSendImage(pendingImage.url, { quote: quotedMessage });
       else {
-        await onSendMessage(content, { quote: quotedMessage });
-        setInputValue('');
+        const result = await onSendMessage(content, { quote: quotedMessage });
+        if (result.sendMethod === 'qianniu_direct_send' || result.sendMethod === 'douyin_task') {
+          setPendingImage(null);
+          setSendNotice('已提交');
+          sendNoticeTimerRef.current = setTimeout(() => {
+            setSendNotice('');
+            sendNoticeTimerRef.current = null;
+          }, 1200);
+          return;
+        }
       }
       setPendingImage(null);
       setQuotedMessage(null);
@@ -425,6 +484,10 @@ export default function ChatWindow({
         sendNoticeTimerRef.current = null;
       }, 1800);
     } catch (submitError) {
+      if (!pendingImage) {
+        setInputValue(content);
+        setQuotedMessage(quotedMessage);
+      }
       setSendError(submitError instanceof Error ? submitError.message : '消息发送失败');
     } finally {
       setIsSending(false);
@@ -432,7 +495,8 @@ export default function ChatWindow({
   };
 
   const openTransferModal = async () => {
-    if (!conversation || !onListTransferCs) return;
+    if (!conversation || !onListTransferCs || transferBusy.current) return;
+    const epoch = ++transferEpoch.current, id = conversation.id;
     setIsTransferModalOpen(true);
     setIsLoadingTransferCs(true);
     setTransferCsList([]);
@@ -440,9 +504,11 @@ export default function ChatWindow({
     setTransferSearch('');
     setTransferError('');
     setTransferSuccess('');
+    setConfirmTransfer(null);
     setSelectedTransferReason('无原因直接转移');
     try {
       const result = await onListTransferCs(conversation);
+      if (epoch !== transferEpoch.current || transferConversationId.current !== id) return;
       const reasons = result.trans_reason?.length
         ? result.trans_reason
         : [{ code: null, desc: '无原因直接转移' }];
@@ -454,25 +520,37 @@ export default function ChatWindow({
         || '无原因直接转移',
       );
     } catch (transferListError) {
-      setTransferError(transferListError instanceof Error ? transferListError.message : '客服列表加载失败');
+      if (epoch !== transferEpoch.current || transferConversationId.current !== id) return;
+      setTransferError(transferErrorMessage(transferListError, '客服列表加载失败'));
     } finally {
-      setIsLoadingTransferCs(false);
+      if (epoch === transferEpoch.current && transferConversationId.current === id) setIsLoadingTransferCs(false);
     }
   };
 
   const submitTransfer = async (target: PddTransferCs) => {
-    if (!conversation || !onTransferConversation || transferringCsid) return;
+    if (!conversation || !onTransferConversation || transferBusy.current) return;
+    const epoch = transferEpoch.current, id = conversation.id;
+    transferBusy.current = true;
     setTransferringCsid(target.csid);
     setTransferError('');
     setTransferSuccess('');
     try {
       await onTransferConversation(conversation, target.csid, selectedTransferReason || '无原因直接转移');
+      if (epoch !== transferEpoch.current || transferConversationId.current !== id) return;
       setTransferSuccess(`已转移给 ${target.nickname || target.accountName || target.csid}`);
-      window.setTimeout(() => setIsTransferModalOpen(false), 800);
+      setConfirmTransfer(null);
+      if (conversation.platform === 'qianniu' || isDouyinConversation) setTransferCsList([]);
+      else window.setTimeout(() => {
+        if (epoch === transferEpoch.current && transferConversationId.current === id) setIsTransferModalOpen(false);
+      }, 800);
     } catch (transferErrorResult) {
-      setTransferError(transferErrorResult instanceof Error ? transferErrorResult.message : '会话转移失败');
+      if (epoch !== transferEpoch.current || transferConversationId.current !== id) return;
+      setConfirmTransfer(null);
+      if (conversation.platform === 'qianniu' || isDouyinConversation) setTransferCsList([]);
+      setTransferError(transferErrorMessage(transferErrorResult, '会话转移失败'));
     } finally {
-      setTransferringCsid(null);
+      transferBusy.current = false;
+      if (epoch === transferEpoch.current && transferConversationId.current === id) setTransferringCsid(null);
     }
   };
 
@@ -543,11 +621,27 @@ export default function ChatWindow({
             </div>
           </div>
         </div>
-        {isPddConversation && (
+        {conversation.platform === 'qianniu' && onSyncRecentMessages && (
+          <button type="button" title="同步最近消息" aria-label="同步最近消息"
+            disabled={historySync.id === conversation.id && historySync.busy}
+            className="ml-4 flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-sky-50 hover:text-sky-600 disabled:opacity-50"
+            onClick={() => {
+              const target = conversation;
+              setHistorySync({ id: target.id, busy: true, error: '' });
+              void onSyncRecentMessages(target).then(() => {
+                setHistorySync(current => current.id === target.id ? { id: target.id, busy: false, error: '' } : current);
+              }).catch(error => {
+                setHistorySync(current => current.id === target.id ? { id: target.id, busy: false, error: error instanceof Error ? error.message : '消息同步失败' } : current);
+              });
+            }}>
+            <RefreshCw size={17} className={historySync.id === conversation.id && historySync.busy ? 'animate-spin' : ''} />
+          </button>
+        )}
+        {supportsTransfer && (
           <button
             type="button"
             onClick={openTransferModal}
-            disabled={!canTransferConversation || isLoadingTransferCs || Boolean(transferringCsid)}
+            disabled={!canTransferConversation || transferBlocked || isLoadingTransferCs || Boolean(transferringCsid)}
             className="ml-4 inline-flex h-9 shrink-0 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 shadow-sm transition-colors hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="转移会话"
             title={canTransferConversation ? '转移会话' : '当前会话缺少可转移参数'}
@@ -571,6 +665,7 @@ export default function ChatWindow({
         <div className="absolute inset-0 opacity-[0.02] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#0ea5e9 1px, transparent 1px)', backgroundSize: '32px 32px' }}></div>
         
         {isLoading && activeMessages.length === 0 && <div className="relative z-10 text-center text-xs font-semibold text-slate-400">正在加载消息...</div>}
+        {historySync.id === conversation.id && historySync.error && <div className="relative z-10 rounded-md border border-rose-100 bg-rose-50 p-3 text-xs text-rose-600">{historySync.error}</div>}
         {!isLoading && error && activeMessages.length === 0 && <div className="relative z-10 mx-auto max-w-md p-3 bg-rose-50 border border-rose-100 rounded-xl text-xs font-semibold text-rose-600">{error}</div>}
         <AnimatePresence initial={false}>
           {activeMessages.map((msg, index) => {
@@ -621,18 +716,26 @@ export default function ChatWindow({
                 
                 <div className={`min-w-0 group relative z-10 flex flex-col ${isPlatform ? 'max-w-[80%] items-center' : isCustomer ? 'max-w-[70%] items-start' : 'max-w-[70%] items-end'}`}>
                   {msg.quote ? <QuotePreview quote={msg.quote} /> : null}
-                  {displayMode === 'card' ? (
+                  {conversation.platform === 'qianniu' && msg.timeline?.data?.parts?.length ? (
+                    <div className="flex max-w-full flex-col gap-2">
+                      {msg.timeline.data.parts.map(part => part.kind === 'image' ? (
+                        part.url ? <ChatImage key={part.index} src={part.url} onOpen={setPreviewImage} /> :
+                          <div key={part.index} className="flex h-36 w-48 items-center justify-center rounded-md border border-slate-200 bg-white text-xs text-slate-400"><ImageOff size={18} className="mr-2" />图片暂不可用</div>
+                      ) : part.kind === 'product' ? (
+                        <TimelineCard key={part.index} message={{ ...msg, content: part.title || '商品分享', timeline: {
+                          type: 'product', displayMode: 'card', data: { title: part.title || '商品分享', product_id: part.product_id,
+                            image_url: part.image_url, link_url: part.url, price_label: part.price_label },
+                        } }} />
+                      ) : (
+                        <TextBubble key={part.index} text={part.text || '[暂不支持的消息]'} customer={isCustomer} status={msg.deliveryStatus} />
+                      ))}
+                    </div>
+                  ) : displayMode === 'card' ? (
                     <TimelineCard message={msg} />
                   ) : msg.media?.type === 'image' ? (
-                    <ChatImage src={msg.media.url} onOpen={setPreviewImage} />
+                    <ChatImage src={msg.media.url} onOpen={setPreviewImage} directUrl={conversation.platform === 'douyin'} />
                   ) : (
-                    <div className={`w-fit max-w-full px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm break-words whitespace-pre-wrap ${
-                      isCustomer 
-                        ? 'bg-white text-slate-700 rounded-tl-md border border-slate-100' 
-                        : `bg-sky-500 text-white rounded-tr-md ${msg.deliveryStatus === 'sending' || msg.deliveryStatus === 'failed' ? 'opacity-70' : ''}`
-                    }`}>
-                      {msg.content}
-                    </div>
+                    <TextBubble text={msg.content} customer={isCustomer} status={msg.deliveryStatus} />
                   )}
                   {msg.timestamp && (
                     <div className={`mt-1 text-[10px] text-slate-400 font-medium tracking-tight ${isPlatform ? 'text-center' : isCustomer ? 'text-left' : 'text-right'}`}>
@@ -645,12 +748,18 @@ export default function ChatWindow({
                   {!isCustomer && msg.deliveryStatus === 'failed' && (
                     <div className="mt-1 text-[10px] font-medium text-rose-500">发送失败</div>
                   )}
+                  {!isCustomer && msg.deliveryStatus === 'cancelled' && (
+                    <div className="mt-1 text-[10px] font-medium text-slate-500">已取消发送</div>
+                  )}
+                  {!isCustomer && msg.deliveryStatus === 'confirmation_pending' && (
+                    <div className="mt-1 text-[10px] font-medium text-amber-600">发送结果待确认，请在原平台核对，勿重复发送</div>
+                  )}
                 </div>
               </motion.div>
             );
           })}
         </AnimatePresence>
-        {contextMenu && (
+        {contextMenu && !isDouyinConversation && (
           <div
             className="fixed z-[80] min-w-32 rounded-md border border-slate-200 bg-white p-1 shadow-lg"
             style={{ left: contextMenu.x, top: contextMenu.y }}
@@ -697,6 +806,7 @@ export default function ChatWindow({
               animate={{ opacity: 1, scale: 1 }}
               src={previewImage}
               alt="聊天图片预览"
+              referrerPolicy="no-referrer"
               className="max-h-full max-w-full object-contain"
               onClick={(event) => event.stopPropagation()}
             />
@@ -714,7 +824,7 @@ export default function ChatWindow({
             role="dialog"
             aria-modal="true"
             aria-label="转移会话"
-            onClick={() => !transferringCsid && setIsTransferModalOpen(false)}
+            onClick={() => { if (!transferBusy.current) { transferEpoch.current++; setIsLoadingTransferCs(false); setIsTransferModalOpen(false); } }}
           >
             <motion.div
               initial={{ opacity: 0, y: 12, scale: 0.98 }}
@@ -727,7 +837,7 @@ export default function ChatWindow({
                 <h2 className="text-sm font-semibold text-slate-800">转移会话</h2>
                 <button
                   type="button"
-                  onClick={() => setIsTransferModalOpen(false)}
+                  onClick={() => { transferEpoch.current++; setIsLoadingTransferCs(false); setIsTransferModalOpen(false); }}
                   disabled={Boolean(transferringCsid)}
                   className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
                   aria-label="关闭转移会话弹窗"
@@ -738,7 +848,11 @@ export default function ChatWindow({
               </div>
 
               <div className="flex min-h-0 flex-1 flex-col gap-3 p-5">
+                {conversation.platform === 'qianniu' && <p className="break-words text-xs text-slate-600">{conversation.shopName} / {conversation.userName}</p>}
                 <div className="flex flex-wrap items-center gap-3">
+                  {conversation.platform === 'qianniu' && <button type="button" title="刷新在线客服" aria-label="刷新在线客服"
+                    disabled={transferBlocked || isLoadingTransferCs || Boolean(transferringCsid)} onClick={openTransferModal}
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded border border-slate-200 disabled:opacity-50"><RefreshCw size={16} /></button>}
                   <label className="relative min-w-0 flex-1">
                     <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                     <input
@@ -774,12 +888,22 @@ export default function ChatWindow({
                   </div>
                 )}
 
-                <div className="min-h-[260px] overflow-hidden rounded-md border border-slate-200">
-                  <div className="grid h-10 grid-cols-[1.2fr_1fr_1fr_96px_176px] items-center border-b border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-500">
+                {confirmTransfer && <div className="border-y border-slate-200 py-3 text-sm text-slate-700">
+                  <p className="break-words">将 {conversation.shopName} 的 {conversation.userName} 转移给 {confirmTransfer.nickname}？</p>
+                  <div className="mt-3 flex gap-2">
+                    <button type="button" disabled={Boolean(transferringCsid)} onClick={() => submitTransfer(confirmTransfer)}
+                      className="rounded bg-sky-600 px-3 py-2 text-xs text-white disabled:opacity-50">{transferringCsid ? '转移中…' : '确认转移'}</button>
+                    <button type="button" disabled={Boolean(transferringCsid)} onClick={() => setConfirmTransfer(null)}
+                      className="rounded border border-slate-200 px-3 py-2 text-xs disabled:opacity-50">取消</button>
+                  </div>
+                </div>}
+
+                <div className={`${transferSuccess && !isPddConversation ? 'hidden' : ''} min-h-[260px] overflow-hidden rounded-md border border-slate-200`}>
+                  <div className={`grid h-10 ${isPddConversation ? 'grid-cols-[1.2fr_1fr_1fr_96px_176px]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_80px]'} items-center border-b border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-500`}>
                     <div className="min-w-0">账号名</div>
-                    <div className="min-w-0">昵称</div>
-                    <div className="min-w-0">备注</div>
-                    <div className="text-right">当前未回复</div>
+                    {isPddConversation && <div className="min-w-0">昵称</div>}
+                    <div className="min-w-0">{!isPddConversation ? '在线状态' : '备注'}</div>
+                    {isPddConversation && <div className="text-right">当前未回复</div>}
                     <div className="text-right">操作</div>
                   </div>
                   <div className="max-h-[360px] overflow-y-auto">
@@ -794,22 +918,22 @@ export default function ChatWindow({
                         return (
                           <div
                             key={item.csid}
-                            className="grid min-h-12 grid-cols-[1.2fr_1fr_1fr_96px_176px] items-center border-b border-slate-100 px-3 text-xs text-slate-600 last:border-b-0 hover:bg-slate-50"
+                            className={`grid min-h-12 ${isPddConversation ? 'grid-cols-[1.2fr_1fr_1fr_96px_176px]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_80px]'} items-center border-b border-slate-100 px-3 text-xs text-slate-600 last:border-b-0 hover:bg-slate-50`}
                           >
                             <div className="min-w-0 truncate font-medium text-slate-700" title={item.accountName || item.username || item.csid}>
                               {item.accountName || item.username || item.csid}
                             </div>
-                            <div className="min-w-0 truncate" title={item.nickname || '-'}>
+                            {isPddConversation && <div className="min-w-0 truncate" title={item.nickname || '-'}>
                               {item.nickname || '-'}
+                            </div>}
+                            <div className="min-w-0 truncate text-slate-400" title={item.onlineLabel || item.remark || '-'}>
+                              {!isPddConversation ? item.onlineLabel : item.remark || '-'}
                             </div>
-                            <div className="min-w-0 truncate text-slate-400" title={item.remark || '-'}>
-                              {item.remark || '-'}
-                            </div>
-                            <div className="text-right font-semibold text-slate-700">{item.unreplyNum || 0}</div>
+                            {isPddConversation && <div className="text-right font-semibold text-slate-700">{item.unreplyNum || 0}</div>}
                             <div className="flex justify-end gap-2">
                               <button
                                 type="button"
-                                onClick={() => submitTransfer(item)}
+                                onClick={() => !isPddConversation ? setConfirmTransfer(item) : submitTransfer(item)}
                                 disabled={Boolean(transferringCsid)}
                                 className="inline-flex h-8 items-center justify-center rounded-md bg-sky-500 px-3 text-xs font-semibold text-white transition-colors hover:bg-sky-600 disabled:cursor-not-allowed disabled:bg-slate-300"
                               >
@@ -820,21 +944,21 @@ export default function ChatWindow({
                                   </>
                                 ) : '转移'}
                               </button>
-                              <button
+                              {isPddConversation && <button
                                 type="button"
                                 disabled
                                 className="inline-flex h-8 items-center justify-center rounded-md border border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-300"
                                 title="暂不支持微信通知"
                               >
                                 转移并微信通知
-                              </button>
+                              </button>}
                             </div>
                           </div>
                         );
                       })
                     ) : (
                       <div className="flex h-48 items-center justify-center text-xs font-semibold text-slate-400">
-                        {transferSearch ? '没有匹配的客服账号' : '暂无可转移客服账号'}
+                        {transferError ? '客服列表不可用' : transferSearch ? '没有匹配的客服账号' : '暂无可转移客服账号'}
                       </div>
                     )}
                   </div>
@@ -847,6 +971,7 @@ export default function ChatWindow({
 
       {/* Input Area */}
       <div className="relative shrink-0 p-6 border-top border-brand-border bg-white" id="input-area">
+        {transferNotice && <p className="mx-auto mb-2 max-w-4xl break-words text-xs text-amber-700">{transferNotice}</p>}
         {sendError && <p className="max-w-4xl mx-auto mb-2 text-xs font-semibold text-rose-600">{sendError}</p>}
         {!sendError && (sendNotice || automaticSendNotice || hasSendingMessages) && (
           <p className={`max-w-4xl mx-auto mb-2 text-xs font-semibold ${
@@ -918,8 +1043,9 @@ export default function ChatWindow({
         )}
         <div className="mx-auto flex max-w-4xl min-w-0 items-end gap-3 bg-slate-50 border border-slate-100 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-brand-active/10 focus-within:border-brand-active transition-all">
           <input ref={fileInputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(event) => { selectImage(event.target.files?.[0] || null); event.currentTarget.value = ''; }} />
-          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={isSending || Boolean(pendingImage)} className="rounded-xl p-2.5 text-slate-400 transition-colors hover:bg-white hover:text-brand-active disabled:opacity-40" title="发送图片" aria-label="发送图片"><Paperclip size={18} /></button>
+          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={!isPddConversation || isSending || Boolean(pendingImage)} className="rounded-xl p-2.5 text-slate-400 transition-colors hover:bg-white hover:text-brand-active disabled:opacity-40" title="发送图片" aria-label="发送图片"><Paperclip size={18} /></button>
           <textarea
+            disabled={transferBlocked}
             ref={inputRef}
             rows={1}
             value={inputValue}
@@ -927,7 +1053,7 @@ export default function ChatWindow({
               setInputValue(e.target.value);
               setIsSuggestionDismissed(false);
             }}
-            placeholder="输入消息..."
+            placeholder={isDouyinConversation ? '输入文本消息...' : '输入消息...'}
             className="min-w-0 flex-1 bg-transparent border-none outline-none focus:outline-none focus-visible:outline-none focus:ring-0 focus-visible:ring-0 text-sm py-2.5 resize-none max-h-32 text-slate-700 appearance-none"
             onKeyDown={(e) => {
               if (!isComposing && !isSuggestionDismissed && quickReplySuggestions.length > 0) {
@@ -972,7 +1098,7 @@ export default function ChatWindow({
           />
           <button 
             onClick={handleSend}
-            disabled={(!inputValue.trim() && !pendingImage) || isSending}
+            disabled={transferBlocked || isDouyinConversation && (hasSendingMessages || hasPendingConfirmation) || (!inputValue.trim() && !pendingImage) || isSending}
             className={`p-2.5 rounded-xl transition-all shadow-md ${
               (inputValue.trim() || pendingImage) && !isSending
                 ? 'bg-brand-active text-white scale-100 rotate-0' 
