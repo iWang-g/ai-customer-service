@@ -12,6 +12,9 @@ param(
   [string]$ExpectedCid = '',
   [string]$ExpectedLoginDisplay = '',
   [string]$HookLog = '.\qn-im-bridge-hook-events.ndjson'
+  ,
+  [ValidateSet('Scheduled', 'Direct')]
+  [string]$UiaMode = 'Scheduled'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,28 +37,71 @@ function Read-TextFileTail([string]$Path, [int]$Count) {
   if (-not (Test-Path -LiteralPath $Path)) {
     return @()
   }
-  return @(Get-Content -LiteralPath $Path -Tail $Count)
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    try {
+      return @(Get-Content -LiteralPath $Path -Tail $Count -Encoding UTF8 -ErrorAction Stop)
+    } catch [System.IO.IOException] {
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  return @(Get-Content -LiteralPath $Path -Tail $Count -Encoding UTF8 -ErrorAction Stop)
 }
 
-function Find-SendResult([string]$Path, [string]$Needle) {
+function Get-FileSize([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) {
+    return 0
+  }
+  return ([IO.FileInfo]$Path).Length
+}
+
+function Read-TextAfterOffset([string]$Path, [long]$Offset) {
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return ''
+  }
+
+  $info = [IO.FileInfo]$Path
+  if ($info.Length -lt $Offset) {
+    $Offset = 0
+  }
+  if ($info.Length -eq $Offset) {
+    return ''
+  }
+
+  $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+  try {
+    $stream.Seek($Offset, [IO.SeekOrigin]::Begin) | Out-Null
+    $length = [int]($stream.Length - $stream.Position)
+    $buffer = New-Object byte[] $length
+    $read = $stream.Read($buffer, 0, $length)
+    return [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+  } finally {
+    $stream.Dispose()
+  }
+}
+
+function Find-SendResult([string]$Path, [string]$Needle, [long]$StartOffset) {
+  $text = Read-TextAfterOffset $Path $StartOffset
+  if (-not $text) {
     return $null
   }
 
-  $matches = @(Select-String -LiteralPath $Path -Pattern ([regex]::Escape($Needle)) -Context 4,12)
-  if ($matches.Count -eq 0) {
+  $allLines = @($text -split "`r?`n")
+  $matchIndexes = New-Object System.Collections.Generic.List[int]
+  for ($i = 0; $i -lt $allLines.Count; $i++) {
+    if ($allLines[$i].Contains($Needle)) {
+      $matchIndexes.Add($i)
+    }
+  }
+  if ($matchIndexes.Count -eq 0) {
     return $null
   }
 
   $lines = New-Object System.Collections.Generic.List[string]
-  foreach ($match in $matches) {
-    foreach ($line in $match.Context.PreContext) {
-      $lines.Add($line)
-    }
-    $lines.Add($match.Line)
-    foreach ($line in $match.Context.PostContext) {
-      $lines.Add($line)
-    }
+  $matchIndex = $matchIndexes[$matchIndexes.Count - 1]
+  $from = [Math]::Max(0, $matchIndex - 4)
+  $to = [Math]::Min($allLines.Count - 1, $matchIndex + 12)
+  for ($i = $from; $i -le $to; $i++) {
+    $lines.Add($allLines[$i])
   }
 
   $joined = ($lines.ToArray() -join "`n")
@@ -144,7 +190,7 @@ if ($ExpectedCid -or $ExpectedLoginDisplay) {
 $noSendArg = if ($NoSend) { ' -NoSend' } else { '' }
 $expectedTitleArg = if ($ExpectedTitle) { ' -ExpectedTitleFile "qn-expected-title.txt"' } else { '' }
 $expectedTitleContainsArg = if ($ExpectedTitleContains) { ' -ExpectedTitleContains' } else { '' }
-$taskCmd = 'powershell.exe -NoP -EP Bypass -File "' + $taskEntry + '"' +
+$taskCmd = 'powershell.exe -WindowStyle Hidden -NoP -EP Bypass -File "' + $taskEntry + '"' +
   ' -TextFile "qn-next-send-text.txt"' +
   ' -SendMethod "' + $SendMethod + '"' +
   $expectedTitleArg +
@@ -154,15 +200,43 @@ $taskCmd = 'powershell.exe -NoP -EP Bypass -File "' + $taskEntry + '"' +
 Write-Output "TEXT $Text"
 Write-Output "TASK $TaskName"
 Write-Output "LOG $logPath"
+Write-Output "UIA_MODE $UiaMode"
 
-& schtasks /Create /TN $TaskName /F /SC ONCE /ST 23:59 /IT /RL LIMITED /TR $taskCmd | Write-Output
-if ($LASTEXITCODE -ne 0) {
-  throw "schtasks /Create failed with exit code $LASTEXITCODE"
-}
+$appLogStartOffset = Get-FileSize $AppLog
 
-& schtasks /Run /TN $TaskName | Write-Output
-if ($LASTEXITCODE -ne 0) {
-  throw "schtasks /Run failed with exit code $LASTEXITCODE"
+if ($UiaMode -eq 'Direct') {
+  $directArgs = @(
+    '-WindowStyle', 'Hidden',
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', (Join-Path $repoRoot 'tools\qn-uia-send-current.ps1'),
+    '-Text', $Text,
+    '-SendMethod', $SendMethod
+  )
+  if ($ExpectedTitle) {
+    $directArgs += @('-ExpectedTitleFile', 'qn-expected-title.txt')
+  }
+  if ($ExpectedTitleContains) {
+    $directArgs += '-ExpectedTitleContains'
+  }
+  if ($NoSend) {
+    $directArgs += '-NoSend'
+  }
+
+  $uiaOutput = @(& powershell.exe @directArgs 2>&1)
+  $uiaExit = if ($null -ne $global:LASTEXITCODE) { [int]$global:LASTEXITCODE } else { 0 }
+  $uiaOutput | Add-Content -LiteralPath $logPath -Encoding UTF8
+  Add-Content -LiteralPath $logPath -Value "END $(Get-Date -Format o) exit=$uiaExit" -Encoding UTF8
+} else {
+  & schtasks /Create /TN $TaskName /F /SC ONCE /ST 23:59 /IT /RL LIMITED /TR $taskCmd | Write-Output
+  if ($LASTEXITCODE -ne 0) {
+    throw "schtasks /Create failed with exit code $LASTEXITCODE"
+  }
+
+  & schtasks /Run /TN $TaskName | Write-Output
+  if ($LASTEXITCODE -ne 0) {
+    throw "schtasks /Run failed with exit code $LASTEXITCODE"
+  }
 }
 
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
@@ -195,7 +269,7 @@ $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $result = $null
 while ((Get-Date) -lt $deadline -and $null -eq $result) {
   Start-Sleep -Milliseconds 800
-  $result = Find-SendResult $AppLog $Text
+  $result = Find-SendResult $AppLog $Text $appLogStartOffset
 }
 
 if ($null -eq $result) {

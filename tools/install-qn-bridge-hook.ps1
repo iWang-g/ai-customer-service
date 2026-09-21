@@ -12,7 +12,7 @@ $webuiDir = Join-Path $QnVersionDir 'Resources\newWebui'
 $zipPath = Join-Path $webuiDir 'webui.zip'
 $signPath = Join-Path $webuiDir 'sign.json'
 $entryName = 'web_chat-packer/recent.html'
-$marker = 'codex-qn-bridge-hook-v3'
+$marker = 'codex-qn-bridge-hook-v9'
 
 function New-BackupDir {
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -50,18 +50,22 @@ function Restore-Backup([string]$dir) {
 
 function Get-HookScript([string]$endpoint) {
   $safeEndpoint = $endpoint.Replace('\', '\\').Replace("'", "\'")
+  $readerScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'qn-read-messages-page.js') -Raw -Encoding UTF8
   return @"
     <script>
       // $marker
+      $readerScript
       (function () {
-        if (window.__codexQnBridgeHookV3) return;
-        window.__codexQnBridgeHookV3 = {
+        if (window.__codexQnBridgeHookV8) return;
+        window.__codexQnBridgeHookV8 = {
           installedAt: Date.now(),
           sent: Object.create(null),
           callSeq: 0,
-          installedPosted: false
+          installedPosted: false,
+          clientId: 'qnpage-' + Date.now() + '-' + Math.random().toString(16).slice(2),
+          commandBusy: false
         };
-        var state = window.__codexQnBridgeHookV3;
+        var state = window.__codexQnBridgeHookV8;
         var endpoint = '$safeEndpoint';
         var imsdkAllow = /^(im\.(singlemsg|imbamsg|amptribemsg)\.(GetLocalHisMsg|GetLocalPageMsg|GetRemoteHisMsg|GetNewMsg)|im\.uiutil\.GetCurrentConversationID|im\.login\.GetCurrentLoginID)$/;
         var workbenchCmdAllow = /(Send|send|Msg|Message|message|Typing|typing|Convert|Quote|Chat|chat|Card|Url|MTop|Request|request)/;
@@ -186,7 +190,7 @@ function Get-HookScript([string]$endpoint) {
         }
         function wrapImsdk() {
           if (!window.imsdk || typeof window.imsdk.invoke !== 'function') return false;
-          if (window.imsdk.invoke.__codexQnBridgeHookV3) return true;
+          if (window.imsdk.invoke.__codexQnBridgeHookV8) return true;
           var original = window.imsdk.invoke;
           function wrapped(method, param, timeout) {
             var ret = original.apply(this, arguments);
@@ -232,13 +236,13 @@ function Get-HookScript([string]$endpoint) {
             } catch (e) {}
             return ret;
           }
-          wrapped.__codexQnBridgeHookV3 = true;
+          wrapped.__codexQnBridgeHookV8 = true;
           window.imsdk.invoke = wrapped;
           return true;
         }
         function wrapWorkbenchNamespace(namespaceName, namespace) {
           if (!namespace || typeof namespace.invoke !== 'function') return false;
-          if (namespace.invoke.__codexQnBridgeHookV3) return true;
+          if (namespace.invoke.__codexQnBridgeHookV8) return true;
           var original = namespace.invoke;
           function wrapped() {
             var args = Array.prototype.slice.call(arguments);
@@ -263,7 +267,7 @@ function Get-HookScript([string]$endpoint) {
             } catch (e) {}
             return original.apply(this, arguments);
           }
-          wrapped.__codexQnBridgeHookV3 = true;
+          wrapped.__codexQnBridgeHookV8 = true;
           namespace.invoke = wrapped;
           return true;
         }
@@ -293,6 +297,128 @@ function Get-HookScript([string]$endpoint) {
           state.workbenchWrapped = wrapped;
           return wrapped.length > 0;
         }
+        var abilityAllow = {
+          isSupportApi: 1,
+          getLoginuser: 1,
+          getActiveUser: 1,
+          getRecentContacts: 1,
+          openChat: 1,
+          insertText2Inputbox: 1,
+          isInputboxEmpty: 1
+        };
+        function abilityReady() {
+          var centerReady = window.QNAbilityCenter && window.QNAbilityCenter.ability &&
+            typeof window.QNAbilityCenter.ability.invoke === 'function';
+          var applicationReady = window.imsdk && typeof window.imsdk.invoke === 'function' &&
+            window.workbench && window.workbench.application &&
+            typeof window.workbench.application.invoke === 'function';
+          return !!(centerReady || applicationReady);
+        }
+        function abilityMode() {
+          if (window.QNAbilityCenter && window.QNAbilityCenter.ability &&
+              typeof window.QNAbilityCenter.ability.invoke === 'function') return 'QNAbilityCenter';
+          if (window.imsdk && typeof window.imsdk.invoke === 'function' &&
+              window.workbench && window.workbench.application &&
+              typeof window.workbench.application.invoke === 'function') return 'workbench.application';
+          return '';
+        }
+        function postCommandResult(command, ok, value) {
+          post({
+            kind: 'bridge.command.result',
+            clientId: state.clientId,
+            commandId: command.id,
+            cmd: command.cmd,
+            ok: ok,
+            at: new Date().toISOString(),
+            page: location.href,
+            state: currentState(),
+            value: command.cmd === 'readMessages' ? value : shallow(value, 6)
+          });
+        }
+        function invokeAbility(command) {
+          if (command.cmd === 'readMessages') {
+            window.__codexQnReadMessages(command.param).then(function (value) {
+              postCommandResult(command, true, value);
+            }).catch(function (error) {
+              postCommandResult(command, false, { error: String(error && error.message || error) });
+            });
+            return;
+          }
+          if (!abilityAllow[command.cmd]) {
+            postCommandResult(command, false, { error: 'command not allowed' });
+            return;
+          }
+          if (!abilityReady()) {
+            postCommandResult(command, false, { error: 'QNAbilityCenter is not ready' });
+            return;
+          }
+          var settled = false;
+          var timer = setTimeout(function () {
+            if (settled) return;
+            settled = true;
+            postCommandResult(command, false, { error: 'ability timeout' });
+          }, 15000);
+          function finish(ok, value) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            postCommandResult(command, ok, value);
+          }
+          try {
+            if (abilityMode() === 'QNAbilityCenter') {
+              window.QNAbilityCenter.ability.invoke({
+                cmd: command.cmd,
+                param: command.param || {},
+                success: function (value) { finish(true, value); },
+                error: function (value) { finish(false, value); }
+              });
+            } else {
+              var pending = window.imsdk.invoke(
+                'application.' + command.cmd,
+                command.param || {},
+                15000
+              );
+              if (pending && typeof pending.then === 'function') {
+                pending.then(function (value) { finish(true, value); })
+                  .catch(function (value) { finish(false, value); });
+              } else {
+                finish(false, { error: 'application invoke did not return a Promise' });
+              }
+            }
+          } catch (error) {
+            finish(false, { error: String(error && (error.stack || error.message) || error) });
+          }
+        }
+        function waitCommands() {
+          if (state.commandBusy) return;
+          state.commandBusy = true;
+          fetch(endpoint + '/wait?clientId=' + encodeURIComponent(state.clientId), {
+            method: 'GET',
+            mode: 'cors',
+            cache: 'no-store'
+          }).then(function (response) {
+            return response.json();
+          }).then(function (payload) {
+            var commands = payload && Array.isArray(payload.commands) ? payload.commands : [];
+            for (var i = 0; i < commands.length; i += 1) invokeAbility(commands[i]);
+          }).catch(function () {}).then(function () {
+            state.commandBusy = false;
+            setTimeout(waitCommands, 50);
+          });
+        }
+        function postHeartbeat() {
+          post({
+            kind: 'bridge.page.heartbeat',
+            readMessagesVersion: 1,
+            sendReceiptVersion: 1,
+            clientId: state.clientId,
+            at: new Date().toISOString(),
+            page: location.href,
+            state: currentState(),
+            abilityReady: abilityReady(),
+            abilityMode: abilityMode()
+          });
+        }
         function install() {
           var imsdkReady = wrapImsdk();
           var workbenchReady = wrapWorkbench();
@@ -300,10 +426,15 @@ function Get-HookScript([string]$endpoint) {
             state.installedPosted = true;
             post({
               kind: 'bridge.hook.installed',
-              version: 2,
+              version: 9,
+              readMessagesVersion: 1,
+              sendReceiptVersion: 1,
+              clientId: state.clientId,
               at: new Date().toISOString(),
               page: location.href,
               state: currentState(),
+              abilityReady: abilityReady(),
+              abilityMode: abilityMode(),
               workbenchKeys: window.workbench ? Object.keys(window.workbench).slice(0, 80) : [],
               wrappedNamespaces: state.workbenchWrapped || []
             });
@@ -316,6 +447,9 @@ function Get-HookScript([string]$endpoint) {
           }, 500);
           setTimeout(function () { clearInterval(timer); }, 30000);
         }
+        postHeartbeat();
+        setInterval(postHeartbeat, 5000);
+        waitCommands();
       })();
     </script>
 "@

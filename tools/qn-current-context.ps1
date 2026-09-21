@@ -35,7 +35,7 @@ if (-not (Test-Path -LiteralPath $path)) {
   exit 1
 }
 
-$lines = @(Get-Content -LiteralPath $path -Tail $Tail)
+$lines = @(Get-Content -LiteralPath $path -Tail $Tail -Encoding UTF8)
 $latestAny = $null
 for ($i = $lines.Count - 1; $i -ge 0; $i--) {
   $line = $lines[$i]

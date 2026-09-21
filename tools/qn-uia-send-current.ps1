@@ -3,6 +3,7 @@ param(
   [ValidateSet('Button', 'Enter', 'CtrlEnter')]
   [string]$SendMethod = 'Enter',
   [switch]$NoSend,
+  [switch]$ClearOnly,
   [switch]$KeepExistingDraft,
   [switch]$AllowSendWithoutDraftConfirm,
   [string]$ExpectedTitle = '',
@@ -11,6 +12,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($ClearOnly -and -not $NoSend) {
+  throw '-ClearOnly requires -NoSend.'
+}
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -302,6 +307,17 @@ $clickInputY = [int]($inputRect.Top + [Math]::Min(22, [Math]::Max(8, $inputRect.
 [QnClipboardSta]::Click($clickInputX, $clickInputY)
 Start-Sleep -Milliseconds 150
 Write-Output "InputFocusAfterClick: $($input.Current.HasKeyboardFocus)"
+
+if ($ClearOnly) {
+  [System.Windows.Forms.SendKeys]::SendWait('^a')
+  Start-Sleep -Milliseconds 80
+  [System.Windows.Forms.SendKeys]::SendWait('{BACKSPACE}')
+  Start-Sleep -Milliseconds 250
+  $draftText = Get-ElementText $input
+  Write-Output "DraftAfterClear: length=$($draftText.Length)"
+  Write-Output 'Cleared only. Not sent.'
+  exit 0
+}
 
 Set-ClipboardTextSta $Text
 
